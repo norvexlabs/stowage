@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -165,6 +166,50 @@ func cloudSettings(t *testing.T, userData string) (Settings, cloudConfig) {
 	if err := yaml.Unmarshal([]byte(userData), &cc); err != nil {
 		t.Fatal(err)
 	}
+	// The boot stage begins with the host name, the initramfs stage's again (the recovery system
+	// keeps it): checked here, then dropped, so the tests read the stages after it.
+	ini, boot := cc.Stages["initramfs"], cc.Stages["boot"]
+	if len(ini) == 0 || len(boot) == 0 || ini[0].Hostname == "" || boot[0].Hostname != ini[0].Hostname ||
+		boot[0].Name != "notes: the host name, the recovery system's too" || !strings.HasSuffix(boot[0].If, " && [ -f /run/cos/recovery_mode ]") ||
+		len(boot[0].Files) != 0 || len(boot[0].Commands) != 0 || len(boot[0].Users) != 0 {
+		t.Fatalf("the boot stage does not begin with the initramfs stage's host name, on the recovery system alone: %+v", cc.Stages)
+	}
+	// networkd's DHCP clients take a DUID of the NIC's MAC, written before networkd starts.
+	if f := ini[0].Files; len(f) != 3 || f[0].Path != "/etc/systemd/networkd.conf.d/10-notes-duid.conf" ||
+		f[0].Content != "[DHCPv4]\nDUIDType=link-layer\n\n[DHCPv6]\nDUIDType=link-layer\n" ||
+		f[1].Path != "/etc/systemd/network/20-dhcp.network.d/10-notes-duid.conf" || f[1].Content != "[DHCPv4]\nClientIdentifier=duid\n" ||
+		f[2].Path != "/etc/systemd/network/20-dhcp-legacy.network.d/10-notes-duid.conf" || f[2].Content != "[DHCPv4]\nClientIdentifier=duid\n" {
+		t.Fatalf("the initramfs stage does not set the DHCP clients' DUID: %+v", f)
+	}
+	// yip makes a file's missing parent 0744, which only root can search: a service reading as its
+	// own user (networkd) would skip the file without a word. Each file's directory is made 0755 in
+	// its step, or is one the image ships, or one root alone reads.
+	knownDirs := map[string]string{
+		"/etc/systemd/network":             "the image's",
+		"/etc/ssh/sshd_config.d":           "the image's",
+		"/etc/issue.d":                     "the image's",
+		"/usr/local/share/ca-certificates": "the image's",
+		"/run":                             "the image's",
+		"/etc/notes":                       "the install and its daemon, as root",
+		"/etc/nftables.d":                  "nft, as root",
+		"/etc/systemd/system/kairos-reset.service.d": "systemd",
+	}
+	for stageName, steps := range cc.Stages {
+		for _, s := range steps {
+			for _, d := range s.Directories {
+				if d.Permissions != 0o755 {
+					t.Fatalf("%s step %q makes %s %o, not 0755: a service reading as its own user would skip what it holds", stageName, s.Name, d.Path, d.Permissions)
+				}
+			}
+			for _, f := range s.Files {
+				dir := path.Dir(f.Path)
+				if _, ok := knownDirs[dir]; !ok && !slices.Contains(s.Directories, cloudDir{Path: dir, Permissions: 0o755}) {
+					t.Fatalf("%s step %q writes %s, its directory neither made 0755 in the step nor one the image ships or root alone reads: %+v", stageName, s.Name, f.Path, s.Directories)
+				}
+			}
+		}
+	}
+	cc.Stages["boot"] = boot[1:]
 	var st Settings
 	for _, s := range cc.Stages["boot"] {
 		for _, f := range s.Files {
@@ -211,7 +256,7 @@ func TestVMCreateWritesTheDiskTheSeedAndTheSteps(t *testing.T) {
 	boot := cc.Stages["boot"]
 	u := boot[0].Users["ops"]
 	if ini := cc.Stages["initramfs"]; len(ini) != 2 || ini[0].Hostname != "notes-1" || ini[1].Hostname != "" || boot[0].Hostname != "" {
-		t.Errorf("the host name is not set in the initramfs stage alone: %+v", cc.Stages)
+		t.Errorf("the host name is set in the initramfs stage, and in boot only by the recovery system's step cloudSettings checks: %+v", cc.Stages)
 	}
 	if !slices.Equal(u.Groups, []string{"admin"}) || u.Passwd != "!" || !slices.Equal(u.SSHAuthorizedKeys, []string{v.keyLine}) {
 		t.Errorf("boot stage %+v", boot[0])

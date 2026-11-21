@@ -665,6 +665,35 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
   — so a stopgap the pinned upstream already covers fails the run instead of staying silently. What
   needs judgement stays printed: a later upstream release that would carry the fix (a move of the
   recipe, not a drop), an `apk upgrade`, a module the release does not require.
+- **Stowage's images take the archive's packages, never the cache's**: the images Stowage
+  supplies pin their bases by digest, yet the OS bundle, the front and the backup runner install
+  packages from the distribution's archive (Ubuntu's and Docker's, Alpine's), which moves under
+  that pin. BuildKit keys a cached layer by its instruction and its parent, so a cached
+  install layer would hold the packages of the first build on that machine for good: a kernel
+  security update would never reach a bundle, and the audit gate would refuse every release for
+  a fix the archive already carries. Each recipe installs in its final stage alone, named
+  `image`, which every build of it runs without the cache (`--no-cache-filter image`), and a test
+  holds each recipe to that layout; the stages before it (Go builds of pinned modules) keep the
+  cache; the scanner and the volume helper install nothing, their files their pinned bases'. A
+  project's own images are its Dockerfiles' and keep the cache: a project raises a package by a
+  version constraint, which changes the layer's instruction. The archive's state is the one input
+  no digest holds: the bundle, which embeds the release's version, is built for every release, so
+  each takes the archive as it is then, and a `ship again` of the same release keeps the bundle
+  its first run built; the front and the backup runner, whose inputs are their recipes, are kept
+  from one release to the next, and a package the archive has fixed since reaches them with a
+  `stowage` whose recipe raises it (a version constraint), which rebuilds them whole.
+- **A VM's DHCP identity is its NIC's, not its system's**: a Kairos VM boots two systems, the
+  active (or passive) one and the recovery one, each with a machine-id of its own. networkd's DHCP
+  client names itself by a DUID of the machine-id by default, so the recovery system took a lease
+  of its own, at another address, and Kairos's recovery cloud-config renamed it `cos-recovery`:
+  an operator reaching the VM by its name or address found nothing. The seed sets networkd's DUID
+  to the NIC's MAC (DUID-LL) for DHCPv4 and DHCPv6, and Kairos's DHCP files, which carry the
+  bare MAC, to the DUID too, so every booted system of the VM holds the same lease (the initrd's own
+  DHCP exchange, before any stage, keeps its identity); it names the recovery
+  system again, after Kairos's step. Its drop-ins sit in directories the image does not ship,
+  which yip would make 0744, so the seed makes them 0755: networkd reads its files as its own
+  user and skips one it cannot reach without a word. A VM's seed is kept as it was made: a VM
+  made before keeps the machine-id DUID, as changing it would move its address at an upgrade.
 - **An app's own SBOM documents**: one audit covers the whole stack only if each image's SBOM
   names what the app put in it. syft reads what is self-describing (package databases, lock files,
   Go binaries, Rust binaries built by `cargo auditable`); what it cannot see — scripts a front
@@ -1735,8 +1764,9 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   cdrom datasource), the user-data field for a cloud (each cloud's datasource in Kairos's list;
   the bundle adds Scaleway's, which Kairos leaves out though its datasource library has it, so its
   build fails when that list no longer reads as expected). The cloud-config holds only Kairos stages
-  (applied at every boot, as `/etc` is not kept; the host name in `initramfs`, before networkd
-  sends a DHCP request, the rest in `boot`) and a settings file the boot installs
+  (applied at every boot, as `/etc` is not kept; the host name and networkd's DHCP identity in
+  `initramfs`, before networkd sends a DHCP request, the rest in `boot`, the recovery system's
+  host name again first) and a settings file the boot installs
   from, so the first install is the operator's `install` with no terminal; the VM's boot waits
   for the cloud-config's stages. The administrator logs in by SSH key only and has passwordless
   `sudo` (the cloud images' default): no password ever travels in user-data. Secret inputs are

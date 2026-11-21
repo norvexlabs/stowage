@@ -756,6 +756,31 @@ step "network: the lease kept as a static address, a static IPv6 address beside 
 net() { on_vm notes-stow network >"$WORK/net.txt" 2>&1 || { cat "$WORK/net.txt"; fail "network $1"; }; }
 net_field() { sed -n "s/^$1 *//p" "$WORK/net.txt"; }
 net "on DHCP"
+# The VM's DHCPv4 client names itself by a DUID of the uplink's MAC (RFC 4361: ff, the IAID, then
+# DUID-LL 0003, hardware type 0001, the MAC), as its recovery system does: the lease file says so.
+# Its DHCPv6 DUID is that DUID-LL too. The seed's drop-ins are read by networkd as its own user:
+# their directories, which the image does not ship, are searchable by all. Kairos's DHCP file,
+# which configures the boot's first exchange before the seed's network file takes over, names
+# itself by that DUID too: every DHCPv4 address networkd took on uplink this boot is one (the NIC
+# is named uplink from the initramfs on, by the seed's .link file, so the first exchange is
+# uplink's; the initrd's own, under the kernel's name, is left out).
+duid_dirs=(/etc/systemd/networkd.conf.d /etc/systemd/network/20-dhcp.network.d /etc/systemd/network/20-dhcp-legacy.network.d)
+# shellcheck disable=SC2016 # expanded on the VM
+on_vm 'echo "mac $(tr -d : </sys/class/net/uplink/address)"; sudo stat -c "dir %a %n" '"${duid_dirs[*]}"'; sudo grep -h "^CLIENTID=" /run/systemd/netif/leases/*
+	networkctl status uplink --no-pager | sed -n "s/^ *DHCPv6 Client DUID: /duid6 /p"
+	sudo journalctl -b -u systemd-networkd -o cat --no-pager | sed -n "s|^uplink: DHCPv4 address \([0-9.]*/[0-9]*\).*|addr4 \1|p" | sort -u' >"$WORK/lease.txt" 2>&1 ||
+	{ cat "$WORK/lease.txt"; fail "the VM's lease"; }
+for d in "${duid_dirs[@]}"; do
+	grep -qx "dir 755 $d" "$WORK/lease.txt" || { cat "$WORK/lease.txt"; fail "$d is not 0755: networkd, as its own user, skips the seed's drop-in"; }
+done
+mac=$(sed -n 's/^mac \([0-9a-f]\{12\}\)$/\1/p' "$WORK/lease.txt")
+VM_CLIENTID=$(grep -E "^CLIENTID=ff[0-9a-f]{8}00030001$mac\$" "$WORK/lease.txt") && [[ -n $mac ]] ||
+	{ cat "$WORK/lease.txt"; fail "the VM's DHCPv4 client id is not a DUID of the uplink's MAC"; }
+VM_DUID6="duid6 DUID-LL:0001$mac"
+grep -qxF "$VM_DUID6" "$WORK/lease.txt" || { cat "$WORK/lease.txt"; fail "the VM's DHCPv6 DUID is not a DUID-LL of the uplink's MAC"; }
+addr4s=$(grep -c '^addr4 ' "$WORK/lease.txt" || true)
+((addr4s > 0)) || { cat "$WORK/lease.txt"; fail "no 'uplink: DHCPv4 address' line in networkd's journal this boot: its log format or the NIC's name changed"; }
+((addr4s == 1)) || { cat "$WORK/lease.txt"; fail "networkd took more than one DHCPv4 address on uplink this boot: the boot's first exchange named itself otherwise"; }
 # edge's override, kept through 1.0.0 (which names no edge), rendered again by 1.0.3's boot.
 grep -q "^role       edge: .*192\.0\.2\.11/24; set by \`notes-stow network set --role edge\`: 192\.0\.2\.11/24$" "$WORK/net.txt" ||
 	{ cat "$WORK/net.txt"; fail "edge's override did not come back with a release naming edge"; }
@@ -870,7 +895,12 @@ on_vm notes-stow network set --mode dhcp --revert-secs 3600 >"$WORK/net-set.txt"
 deadline=$((SECONDS + 900))
 # The IPv6 address is shown once duplicate address detection passed: waited for too.
 until [[ $(boot_id 2>/dev/null) != "$boot" ]] && on_vm notes-stow network >"$WORK/net.txt" 2>/dev/null && grep -q "^address    $lease.*$ula" "$WORK/net.txt"; do
-	((SECONDS < deadline)) || { cat "$WORK/net.txt"; fail "the VM did not come back from the reboot with its addresses"; }
+	# net.txt is written only once the boot changed: on a timeout, what the VM answers now.
+	((SECONDS < deadline)) || {
+		echo "boot id now: $(boot_id 2>&1) (before the reboot: $boot)"
+		on_vm notes-stow network 2>&1 || true
+		fail "the VM did not come back from the reboot with its addresses"
+	}
 	sleep 15
 done
 grep -q "^set by     \`notes-stow network set\`: $lease" "$WORK/net.txt" && ! grep -q '^pending' "$WORK/net.txt" ||
@@ -880,8 +910,9 @@ on_vm sudo journalctl -b -u notes-network.service --no-pager | grep -q 'not conf
 step "the recovery system answers over SSH, behind the bundle's firewall, without the project's kernel arguments; nothing but SSH and DHCP listens beyond loopback, no account has a password"
 # The recovery system serves a host key of its own, not the active system's that known_hosts
 # holds: each attempt takes the key it is served into a file of its own (one taken from the active
-# system before it rebooted is never kept), and the recovery mark tells which system answered. Its
-# DHCP lease may not be the active system's: the lease, then the name its DHCP server registers.
+# system before it rebooted is never kept), and the recovery mark tells which system answered. It
+# holds the VM's lease and name, both checked once it answers: the wait tries the address, then
+# the name, so a recovery system that answers elsewhere fails on what it holds, not on a timeout.
 on_recovery() {
 	rm -f "$WORK/known_hosts.recovery"
 	ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$WORK/known_hosts.recovery" \
@@ -923,11 +954,28 @@ until for RECOVERY in "$VM_IP" "$ADDR"; do on_recovery test -e /run/cos/recovery
 	sleep 15
 done
 echo "recovery: answers at $RECOVERY"
-# The name may move between the two NICs' leases: the address that answered is kept from here on.
+# The address that answered is kept from here on.
 recovery_name=$RECOVERY
 # shellcheck disable=SC2016 # expanded on the VM
 RECOVERY=$(on_recovery 'set -- $SSH_CONNECTION; echo "$3"') && [[ -n $RECOVERY ]] || { RECOVERY=$recovery_name; recovery_lost "its address"; }
 echo "recovery: its address is $RECOVERY"
+# It keeps the VM's name (Kairos names a recovery system cos-recovery), which its DHCP request
+# carries: a DHCP server registering names maps the VM's name to it.
+rname=$(on_recovery hostname) || recovery_failed $? hostname
+[[ $rname == "$H" ]] || fail "the recovery system is named '$rname', not the VM's $H"
+# And its leases are the VM's: it holds the VM's address, and networkd's DHCPv4 client id and
+# DHCPv6 DUID are the active system's (a DUID of the uplink's MAC), not the MAC alone nor a DUID of
+# its own machine-id.
+# shellcheck disable=SC2016 # expanded on the VM
+on_recovery 'ip -4 -o addr show; echo "mac $(tr -d : </sys/class/net/uplink/address)"; sudo grep -h "^CLIENTID=" /run/systemd/netif/leases/*; networkctl status uplink --no-pager | sed -n "s/^ *DHCPv6 Client DUID: /duid6 /p"' >"$WORK/lease.recovery.txt" 2>&1 ||
+	{ rc=$?; cat "$WORK/lease.recovery.txt"; recovery_failed $rc "its lease"; }
+grep -qF " $VM_IP/" "$WORK/lease.recovery.txt" || { cat "$WORK/lease.recovery.txt"; fail "the recovery system does not hold the VM's address $VM_IP"; }
+mac=$(sed -n 's/^mac \([0-9a-f]\{12\}\)$/\1/p' "$WORK/lease.recovery.txt")
+[[ -n $mac ]] || { cat "$WORK/lease.recovery.txt"; fail "the recovery system names no NIC uplink"; }
+grep -qxF "$VM_CLIENTID" "$WORK/lease.recovery.txt" ||
+	{ cat "$WORK/lease.recovery.txt"; fail "the recovery system's DHCPv4 client id is not the active system's, $VM_CLIENTID"; }
+grep -qxF "$VM_DUID6" "$WORK/lease.recovery.txt" ||
+	{ cat "$WORK/lease.recovery.txt"; fail "the recovery system's DHCPv6 DUID is not the active system's, $VM_DUID6"; }
 rc=0
 on_recovery sudo nft list table inet notes >"$WORK/nft.recovery.txt" 2>&1 || rc=$?
 [[ $rc != 255 ]] || { cat "$WORK/nft.recovery.txt"; recovery_lost nft; }

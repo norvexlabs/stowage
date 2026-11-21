@@ -3,6 +3,23 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.41.2]
+
+### Fixed
+
+- The OS bundle, the front and the backup runner install their packages from the
+  distribution's archive at every build, never from Docker's build cache: the OS bundle, built
+  for every release, now takes the kernel's and Docker's current security updates though its
+  base stays pinned, where it kept the packages of the publisher's first build and `ship`'s audit
+  refused the release for fixes the archive already carried. The front and the backup runner are
+  still re-tagged while their recipe is unchanged, and take the archive's fixes when a Stowage
+  release changes it.
+- A VM booted into its recovery system keeps its host name and its DHCP leases: it is reached at
+  the VM's address and sends the VM's name with its DHCP requests, where it came up as
+  `cos-recovery` on leases of its own. A VM's DHCP
+  clients name themselves by a DUID of the NIC's MAC rather than of the machine-id. It applies to
+  a VM created with this release (its seed); one created before keeps its own.
+
 ## [0.41.1] - 2026-11-19
 
 ### Fixed

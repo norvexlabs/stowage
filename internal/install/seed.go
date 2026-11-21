@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -641,7 +642,15 @@ type stage struct {
 	Hostname string               `yaml:"hostname,omitempty"`
 	Users    map[string]cloudUser `yaml:"users,omitempty"`
 	Files    []cloudFile          `yaml:"files,omitempty"`
-	Commands []string             `yaml:"commands,omitempty"`
+	// Directories a step's files go in, made before them with their permissions: yip makes a
+	// file's missing parent 0744, which only root can search.
+	Directories []cloudDir `yaml:"directories,omitempty"`
+	Commands    []string   `yaml:"commands,omitempty"`
+}
+
+type cloudDir struct {
+	Path        string `yaml:"path"`
+	Permissions uint32 `yaml:"permissions"`
 }
 
 type cloudUser struct {
@@ -807,6 +816,11 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 	if st.AwaitGiven != "" {
 		boot[0].Files = append(boot[0].Files, cloudFile{Path: AwaitGivenFile(SettingsFile(name)), Permissions: 0o600, Content: st.AwaitGiven + "\n"})
 	}
+	// The host name again on the recovery system, first in the boot stage: Kairos's recovery
+	// cloud-config names it cos-recovery in that stage, before this one. The recovery system keeps
+	// the VM's name, which this stage's network step then sends with its DHCP request, so a DHCP
+	// server registering names maps it to the recovery system as to the VM.
+	boot = append([]stage{{Name: name + ": the host name, the recovery system's too", If: "[ -f /run/cos/recovery_mode ]", Hostname: m.Hostname}}, boot...)
 	if m.HostKey != nil {
 		key, dropIn, retired := seedHostKeyFiles(name)
 		before := "[ ! -e " + VMDir(name) + "/" + envName + " ] && [ ! -e " + retired + " ]"
@@ -830,7 +844,19 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 	}
 	// The host name is set in the initramfs stage, before networkd starts: its DHCP request then
 	// carries it, and a DHCP server registering names registers this one.
-	initramfs := []stage{{Name: name + ": the host name", Hostname: m.Hostname}, {
+	// With it, networkd's DHCP client identity: a DUID of the NIC's MAC, not of the machine-id,
+	// for DHCPv4 and DHCPv6, so the VM keeps its leases on the recovery system, whose machine-id
+	// is its own; Kairos's DHCP file, which configures the boot's first exchange (before the boot
+	// stage writes the seed's network), takes it too rather than the bare MAC, so the booted
+	// system holds one lease (the initrd's own DHCP, before any stage, keeps its identity). networkd reads both when it starts, after this stage, as its own user: their
+	// directories, which the image does not ship, are made searchable by all.
+	initramfs := []stage{{Name: name + ": the host name", Hostname: m.Hostname,
+		Directories: []cloudDir{{Path: path.Dir(DUIDConf(name)), Permissions: 0o755},
+			{Path: path.Dir(KairosDHCPDropIn(name, "20-dhcp")), Permissions: 0o755},
+			{Path: path.Dir(KairosDHCPDropIn(name, "20-dhcp-legacy")), Permissions: 0o755}},
+		Files: []cloudFile{{Path: DUIDConf(name), Permissions: 0o644, Content: duidConf},
+			{Path: KairosDHCPDropIn(name, "20-dhcp"), Permissions: 0o644, Content: kairosDHCPDUID},
+			{Path: KairosDHCPDropIn(name, "20-dhcp-legacy"), Permissions: 0o644, Content: kairosDHCPDUID}}}, {
 		// The disk holds the recovery system alone: its first boot's automatic reset lays the
 		// system out, and reads the partitions udev records. Its unit waits for udev's queue.
 		Name:  name + ": the automatic reset after udev's queue",
@@ -874,6 +900,22 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 	head := fmt.Sprintf("#cloud-config\n# %s's VM %s, written by `%s vm create`. %s\n", name, m.Hostname, ctl, carries)
 	return append([]byte(head), out...), nil
 }
+
+// DUIDConf is the networkd.conf drop-in a VM's seed writes: its DHCP clients' DUID.
+func DUIDConf(name string) string { return "/etc/systemd/networkd.conf.d/10-" + name + "-duid.conf" }
+
+// duidConf makes every DHCP client of the VM name itself by a DUID of its NIC's MAC
+// (systemd.networkd.conf: [DHCPv4] and [DHCPv6] DUIDType=link-layer).
+const duidConf = "[DHCPv4]\nDUIDType=link-layer\n\n[DHCPv6]\nDUIDType=link-layer\n"
+
+// KairosDHCPDropIn is the drop-in a VM's seed writes for one of Kairos's DHCP files (unit:
+// 20-dhcp, for en* names, or 20-dhcp-legacy, for eth*), whose ClientIdentifier=mac it replaces
+// with the DUID's.
+func KairosDHCPDropIn(name, unit string) string {
+	return "/etc/systemd/network/" + unit + ".network.d/10-" + name + "-duid.conf"
+}
+
+const kairosDHCPDUID = "[DHCPv4]\nClientIdentifier=duid\n"
 
 // seedHostKeyFiles are, on the VM, the one-time host key's file, the sshd drop-in naming it, and
 // the mark of its retirement on the OEM partition, which a reset keeps and every system mounts:

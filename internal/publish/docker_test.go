@@ -105,6 +105,9 @@ func TestDockerBuilderPassesTheSpecAndYieldsAnOCIImage(t *testing.T) {
 	}
 
 	raw, _ := os.ReadFile(logf)
+	if strings.Contains(string(raw), "--no-cache") {
+		t.Errorf("a project's image built without its cache:\n%s", raw)
+	}
 	calls := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	if len(calls) != 3 {
 		t.Fatalf("docker calls:\n%s", raw)
@@ -222,6 +225,10 @@ func TestDockerBuilderBuildsARecipe(t *testing.T) {
 	raw, _ := os.ReadFile(logf)
 	if !strings.Contains(string(raw), "--tag stowage-build/"+p.Spec.Name+"-front:0123456789abcdef-") {
 		t.Errorf("build call:\n%s", raw)
+	}
+	// A recipe's final stage is never served from the cache.
+	if !strings.Contains(string(raw), " --no-cache-filter "+RecipeStage+" ") {
+		t.Errorf("a recipe built from the cache:\n%s", raw)
 	}
 }
 

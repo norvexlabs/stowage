@@ -9,7 +9,7 @@ is absent already, and apt refuses a name it does not know. */}}{{define "purge"
 
 FROM {{.KairosInit}} AS kairos-init
 
-FROM {{.Base}}
+FROM {{.Base}} AS image
 
 # The build takes Ubuntu alone: its package names, Docker's repository and the purge below are
 # Ubuntu's. Guest agents: kairos-init only starts them, on the hypervisor its DMI check matches.
@@ -20,8 +20,9 @@ RUN . /etc/os-release && { [ "$ID" = ubuntu ] || { echo "shapes.kairos.base: $PR
         $(apt-cache show tzdata-legacy >/dev/null 2>&1 && echo tzdata-legacy) \
     && rm -rf /var/lib/apt/lists/*
 
-# The install stage writes the version nowhere (the init stage does, below): a fixed one keeps this
-# layer, and Docker's after it, cached from one release to the next.
+# The install stage writes the version nowhere (the init stage does, below). This stage is never
+# served from the build cache: each build installs the packages the archive holds then (the
+# kernel's and Docker's security updates among them).
 COPY --from=kairos-init /kairos-init /kairos-init
 RUN /kairos-init -s install -v 0.0.0
 

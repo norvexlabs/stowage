@@ -16,7 +16,7 @@ RUN go mod init build \
  && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
       -ldflags '-s -w -X github.com/rclone/rclone/fs.Version=v1.76.0' -o /rclone github.com/rclone/rclone
 
-FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS image
 RUN apk add --no-cache 'zlib>=1.4' 'libssl3>=3.5.9-r1' 'libcrypto3>=3.5.9-r1'
 COPY --from=builder /rclone /usr/local/bin/rclone
 ENV XDG_CONFIG_HOME=/config

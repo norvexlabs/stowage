@@ -56,6 +56,11 @@ type BuildRequest struct {
 	Large bool
 }
 
+// RecipeStage names the final stage of every recipe Stowage supplies (BuildRequest.Recipe), the
+// only stage of one that installs from a distribution's archive: the build never takes it from
+// the cache.
+const RecipeStage = "image"
+
 // Builder builds a project image. The cleanup function is always safe to call.
 type Builder interface {
 	Build(ctx context.Context, p *project.Project, r BuildRequest) (v1.Image, func(), error)

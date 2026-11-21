@@ -7,7 +7,9 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -224,6 +226,47 @@ func WriteExecutable(path string, data []byte) error {
 	cmd.Stdin = bytes.NewReader(data)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("write %s: %w: %s", path, err, out)
+	}
+	return nil
+}
+
+// FreshStage reports why a recipe Stowage supplies does not keep its archive's packages in its
+// final stage, named stage, which its build never takes from the cache: its last FROM does not
+// name that stage, or a stage before it runs a package manager (that stage's layers would be
+// served from the cache, holding the packages of the first build). It reads the recipe's own text:
+// a script it copies and runs is not read.
+func FreshStage(recipe []byte, stage string) error {
+	lines := strings.Split(strings.ReplaceAll(string(recipe), "\r\n", "\n"), "\n")
+	last := -1
+	for i, l := range lines {
+		if f := strings.Fields(l); len(f) > 0 && strings.EqualFold(f[0], "FROM") {
+			last = i
+		}
+	}
+	if last < 0 {
+		return fmt.Errorf("no FROM")
+	}
+	f := strings.Fields(lines[last])
+	if len(f) < 4 || !strings.EqualFold(f[len(f)-2], "AS") || f[len(f)-1] != stage {
+		return fmt.Errorf("the last FROM (%q) does not name the stage %s", lines[last], stage)
+	}
+	// Any package manager named before the final stage, whatever it does: a stage there is served
+	// from the cache. FROM lines (stage names) and comments aside.
+	managers := []string{"apk", "dpkg", "dnf", "tdnf", "yum", "microdnf", "rpm", "zypper", "pacman", "emerge", "opkg", "swupd",
+		"install_packages", "debootstrap", "mmdebstrap", "kairos-init"}
+	for i, l := range lines[:last] {
+		t := strings.TrimSpace(l)
+		if fl := strings.Fields(t); len(fl) == 0 || strings.HasPrefix(t, "#") || strings.EqualFold(fl[0], "FROM") {
+			continue
+		}
+		for _, w := range strings.FieldsFunc(t, func(r rune) bool {
+			return strings.ContainsRune(" \t;&|()<>{}!\\\"'`$=", r)
+		}) {
+			b, _, _ := strings.Cut(path.Base(w), ".") // apk.static
+			if slices.Contains(managers, b) || strings.HasPrefix(b, "apt") || strings.HasPrefix(b, "xbps-") {
+				return fmt.Errorf("line %d, before the final stage, runs a package manager (%s): %q", i+1, b, l)
+			}
+		}
 	}
 	return nil
 }

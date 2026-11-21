@@ -100,6 +100,13 @@ Cloud alone proven.
 
 ## Should
 
+- **The recovery system's DHCP IAID pinned**: a VM's DHCP clients name themselves by a DUID of
+  the NIC's MAC, with an IAID networkd derives from udev's naming data, so the recovery system
+  (the install-time image) keeps the VM's leases. A release whose systemd changes that naming
+  scheme gives the active system another IAID than the recovery system's, which then takes
+  another lease. Pinning `IAID=` in the seed's network files (from the NIC's MAC, at the first
+  boot) would hold it whatever systemd names.
+
 - **The installer's binary and its payload as two layers**: each entry of the installer index
   carries the Stowage binary and the release's payload as two layers rather than one file, the
   payload appended at `ship`. The binary layer is then the same in every release a Stowage

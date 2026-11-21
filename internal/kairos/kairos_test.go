@@ -38,7 +38,7 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(df)
-	for _, want := range []string{"FROM " + params.KairosInit + " AS kairos-init", "FROM " + params.Base + "\n",
+	for _, want := range []string{"FROM " + params.KairosInit + " AS kairos-init", "FROM " + params.Base + " AS image\n",
 		"-s install -v 0.0.0\n", `-s init --skip-step cisHardening -v "1.2.0-r2"`, "nftables open-vm-tools qemu-guest-agent tzdata", "apt-cache show tzdata-legacy", "/usr/share/notes-preload/", "/etc/notes/os-version",
 		"notes-preload.service", "chmod 0440 /etc/sudoers.d/10-notes", "notes-health.service", "notes-network.service", "notes-tune.service", "notes-tune-online.service", "notes-route6.service", "notes-tables.service", "ethtool",
 		"mv /usr/share/notes/08_grub.yaml \"$f\"", "sha256sum -c -", "shapes.kairos.kairos_init: its", "grep -qx 'AllowTcpForwarding no' /etc/ssh/sshd_config.d/05-kairos-hardening.conf",
@@ -52,11 +52,6 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 	}
 	if strings.Contains(s, "{{") {
 		t.Error("Dockerfile has an unrendered action")
-	}
-	// The release's version first appears after the slow layers: kairos-init's install stage and
-	// Docker's packages stay cached from one release to the next.
-	if v, d := strings.Index(s, params.OSVersion), strings.Index(s, "docker-compose-plugin"); d < 0 || v < d {
-		t.Errorf("the OS version (at %d) comes before Docker's packages (at %d)", v, d)
 	}
 }
 

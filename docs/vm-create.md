@@ -550,7 +550,19 @@ over SSH from your machine takes its host key with `--known-hosts-line`.
   (`kairos-reset.service`, the first boot's, which lays the system out from the recovery
   system the disk holds) wait for udev's queue before it reads the partitions:
   `/etc/systemd/system/kairos-reset.service.d/10-<name>-udev-settle.conf`, `udevadm settle
-  --timeout=120`, the reset tried after the bound all the same; then, in `boot`, creates the administrator with the SSH key and no password, then, in a step of its own,
+  --timeout=120`, the reset tried after the bound all the same; with the host name, it writes
+  `/etc/systemd/networkd.conf.d/10-<name>-duid.conf` (`[DHCPv4]` and `[DHCPv6]`
+  `DUIDType=link-layer`) and `/etc/systemd/network/20-dhcp.network.d/10-<name>-duid.conf`
+  and `20-dhcp-legacy.network.d/10-<name>-duid.conf` (`[DHCPv4] ClientIdentifier=duid`, over
+  Kairos's `ClientIdentifier=mac` in its DHCP files, `en*` and `eth*`, for the boot's first
+  exchange): the VM's DHCP clients name themselves by a DUID of the NIC's MAC, not of the
+  machine-id (DHCPv4's client id is the IAID and that DUID), so the booted system holds one
+  lease (the initrd's own DHCP exchange, before any stage, keeps its identity) and the recovery
+  system, whose machine-id is its own, takes the VM's. The three directories, which the image does
+  not ship, are made `0755` in that step: networkd reads them as its own user. Then, in `boot`: first, on the
+  recovery system alone, it sets the host name again (Kairos's recovery cloud-config names it
+  `cos-recovery` in that stage: it keeps the VM's name, which its DHCP requests carry, so a DHCP
+  server registering names keeps the VM's name on it, at the VM's address); on every system it creates the administrator with the SSH key and no password, then, in a step of its own,
   puts them in the `admin` group (`usermod`, which also covers a user the base already has:
   passwordless `sudo`, the host daemon's socket), and writes the console's connect line,
   `/etc/issue.d/07-<name>-connect.issue` (`connect: ssh <user>@<address>, then `<short>-stow

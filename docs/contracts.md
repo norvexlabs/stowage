@@ -143,9 +143,10 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   from a Dockerfile embedded in `stowage`: `base` converted by `kairos_init` (`-s install`, then
   `-s init --skip-step cisHardening`) into a Kairos image with no Kubernetes provider, carrying the release's version
   (without its channel) in `/etc/<name>/os-version` and as its Kairos version (given to the init
-  stage only: the slow layers before it — the base's packages, `tzdata` and, where the base has it, `tzdata-legacy` among them, kairos-init's
-  install stage and Docker's packages — are the same from one release to the next, so
-  BuildKit's cache serves them). The base is Ubuntu: the build reads its `/etc/os-release` and
+  stage only). The bundle is never built from BuildKit's cache: every build installs the packages
+  the base's archive and Docker's hold then — the kernel and its modules, `tzdata` and, where the
+  base has it, `tzdata-legacy`, kairos-init's install stage, Docker's — so a release takes their
+  security updates though the base stays pinned. The base is Ubuntu: the build reads its `/etc/os-release` and
   fails on another distribution, naming `shapes.kairos.base`. kairos-init installs one package
   list on every Debian-family image; the build purges what the appliance does without, so none of
   it runs, listens or reports to a vendor: before the init stage (its initrd carries none of them)

@@ -26,7 +26,7 @@ RUN go version -m /usr/bin/caddy | awk 'function n(v, i) { sub(/^v/, "", v); spl
 # -95691 and -95692, which the pinned base does not carry. Its data and
 # configuration directories are that user's (65532, the installer's FrontUID), so a volume made
 # on them is too; the binary carries no file capability.
-FROM caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee
+FROM caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee AS image
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 # No file capability on the binary (the base sets cap_net_bind_service, which the bounding set of a
 # front with every capability dropped cannot grant, so the kernel would refuse its exec): taken off

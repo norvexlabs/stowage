@@ -477,7 +477,13 @@ package's settings, or an account given to `registry.pull`), then `ship again`:
   inputs once they are public carries on and moves the channel.
 
 Publishing builds with `docker buildx build --load` on the local engine, for `linux/amd64` (the
-platform is part of an image's inputs). What `ship` does, in order:
+platform is part of an image's inputs). An image Stowage supplies builds its final stage, the only
+one that installs packages from a distribution's archive, without the build cache
+(`--no-cache-filter image`), so each build takes the packages the archive holds then: the OS
+bundle, built for every release, the front and the backup runner each time they are built (a
+`stowage` with another recipe; until then a release re-tags them as below). The scanner and the
+volume helper install nothing: their files come from their pinned bases. A project's images keep
+the cache. What `ship` does, in order:
 
 1. every image is planned before anything is written: a tag already carrying the same inputs
    digest (annotation `dev.stowage.inputs`) is kept, an image with those inputs under another

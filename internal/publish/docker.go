@@ -107,6 +107,12 @@ func (b *DockerBuilder) Build(ctx context.Context, p *project.Project, r BuildRe
 	if img.Target != "" {
 		args = append(args, "--target", img.Target)
 	}
+	if r.Recipe != nil {
+		// A recipe Stowage supplies installs its final stage's packages from a distribution's
+		// archive, which moves under a pinned base: that stage is never served from the cache, so
+		// each build takes the packages the archive holds then (RecipeStage).
+		args = append(args, "--no-cache-filter", RecipeStage)
+	}
 	keys := make([]string, 0, len(img.Args))
 	for k := range img.Args {
 		keys = append(keys, k)
