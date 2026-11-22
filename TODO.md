@@ -401,7 +401,10 @@ Cloud alone proven.
   today (`host.packages`). A systemd system extension published through the registry beside the
   bundle — by digest, signed, its SBOM audited, enabled per boot entry and rolled back with it —
   would let it ship once; the bundle masks systemd-sysext and systemd-confext until then (DESIGN,
-  "No system extension on the VM").
+  "No system extension on the VM"). Kairos's own tooling covers none of those guarantees on a
+  GRUB install: it checks an extension's signature only under Trusted Boot (UKI), checks nothing
+  when `kairos-agent sysext install` downloads one, and keeps its profiles (`common/` loaded on
+  every boot) across an upgrade and a rollback, so Stowage would verify and enable them itself.
 - **A front route's upstream exposed on Kubernetes past the chart's ingress**: lint warns of a
   guarded route while the chart has routing resources (an Ingress, a Gateway API route, a
   controller's or a mesh's); a chart exposing a guarded route's upstream another way — a Service
@@ -549,8 +552,14 @@ Cloud alone proven.
   6.12 (a modern kernel only from backports). Choosing Docker's repository from
   `/etc/os-release`, and a Debian bundle through e2e-kairos and e2e-vm.
 - **Hadron as the OS bundle's base**: Kairos's own minimal distribution (musl, no package
-  manager). Revisit once it publishes SBOMs (today `audit` would see next to nothing of the OS)
-  and ships nftables and a container runtime; every package is a build from source today.
+  manager). Its way to add software, system extensions built with its musl toolchain, changes how
+  a package ships, not where it comes from: Docker, containerd, runc and nftables would still be
+  builds from source Stowage maintains (no official extension exists for any of them), and
+  `host.packages` would have no meaning. Revisit once Hadron publishes SBOMs (today `audit` would
+  see next to nothing of the OS) and ships nftables and a container runtime — in the image or as
+  official signed extensions, with Kairos enforcing an extension's signature on a GRUB install
+  (today on Trusted Boot alone) and tying an enabled extension to its boot entry, so a rollback
+  takes it back.
 
 - **HSTS `includeSubDomains` opt-out** (security review, Low): the front sends it on every route,
   as the reference deployment does, binding the names under a route's to HTTPS for a year. A spec

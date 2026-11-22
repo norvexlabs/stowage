@@ -688,7 +688,9 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
   rolled back whole — and `host.packages` puts a project's packages in it. An extension would be
   a second path to change the system outside that bundle, one a rollback would not undo (an
   extension enabled for every boot entry stays), and with nothing using it, it is only a place
-  where a root compromise survives the next upgrade. The bundle masks both units. Large optional
+  where a root compromise survives the next upgrade. On a GRUB install, which the bundle is,
+  Kairos does not check an extension's signature at boot (only under Trusted Boot) nor when
+  `kairos-agent sysext install` downloads one. The bundle masks both units. Large optional
   add-ons shipped beside the bundle would be extensions published through the registry, signed
   and audited like it — not Kairos's catalog.
 - **The initrd's network stays in the initrd**: Kairos's initrd runs networkd with dracut's
@@ -2162,7 +2164,9 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   newest kernel (7.0 on 26.04) with long security support; Debian 13 ships 6.12 (a newer one only
   from backports), the RHEL and SUSE families need another package manager and translated names,
   Alpine runs OpenRC, Fedora's lifecycle is short, and Hadron (musl, no package manager, no SBOM)
-  would leave `audit` blind on the OS. Kernel arguments go into the image's own boot script, not
+  would leave `audit` blind on the OS; its system extensions, built with its musl toolchain, only
+  move what would still be Stowage's builds from source (the container runtime, nftables)
+  outside the bundle. Kernel arguments go into the image's own boot script, not
   Kairos's shared GRUB environment (`extra_cmdline`): each system boots with its release's, so a
   release whose arguments fail to boot falls back to the passive system with its own, a rollback
   takes its own back, and the recovery system boots without any. The CPUs' frequency is a posture
