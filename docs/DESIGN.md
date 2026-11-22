@@ -682,6 +682,47 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
   its first run built; the front and the backup runner, whose inputs are their recipes, are kept
   from one release to the next, and a package the archive has fixed since reaches them with a
   `stowage` whose recipe raises it (a version constraint), which rebuilds them whole.
+- **No system extension on the VM**: Kairos enables systemd-sysext and systemd-confext, which
+  merge any extension image found on the disk over `/usr` and `/etc` at boot. Stowage ships the
+  whole system as one OS bundle — by digest from the registry, signed, its SBOM audited, A/B
+  rolled back whole — and `host.packages` puts a project's packages in it. An extension would be
+  a second path to change the system outside that bundle, one a rollback would not undo (an
+  extension enabled for every boot entry stays), and with nothing using it, it is only a place
+  where a root compromise survives the next upgrade. The bundle masks both units. Large optional
+  add-ons shipped beside the bundle would be extensions published through the registry, signed
+  and audited like it — not Kairos's catalog.
+- **The initrd's network stays in the initrd**: Kairos's initrd runs networkd with dracut's
+  default network on every NIC (DHCP, router advertisements), and networkd in an initrd keeps what
+  it set when it stops (`KeepConfiguration=dynamic-on-stop`), handing it to the system. The
+  system's networkd then configures each NIC from Stowage's files but leaves routes the initrd
+  learnt from router advertisements: a secondary NIC on the primary's LAN held the LAN's prefix
+  route for its lifetime (a day), equal to the primary's, and the kernel sent IPv6 replies out of
+  it — only on boots where the router answered within the initrd. The drop-in the bundle puts in
+  the initrd ends that handover (`KeepConfiguration=no`), rather than a per-NIC `disable_ipv6`,
+  which would need one writer per case (the seed, `network attach`, the override, the primary's
+  IPv6 on or off) racing the boot's own: every NIC then starts from the system's files, and what
+  they say is the whole truth. The initrd asks DHCP under its own client identity and drops that
+  lease at switch-root; the system then takes its own, by the seed's DUID, as before.
+- **A NIC no role names carries no address**: once a seed names its NICs by role, a NIC it does
+  not name has no address, DHCP or IPv6, by a networkd file sorting before Kairos's DHCP default.
+  That default configured it: a NIC the root added before `network attach` named it took DHCP
+  and router advertisements on the primary's LAN, its routes equal to the primary's, and a port a
+  cable reached by mistake brought the machine up at an address nobody planned. Unaddressed, the
+  machine is predictable: its network is its roles', the primary pinned by MAC, and a cable in
+  another port reaches nothing until it is moved or the NIC attached — `network` lists those NICs
+  by MAC, and the console banner points to it. The link is left up rather than held down: a NIC the kernel
+  enslaves to another — a failover's standby or virtual function, which a live migration plugs
+  again at any time, a bond's port made outside networkd — carries its master's traffic, and holding every unnamed
+  link down cut such a master off; up and unaddressed, with its master kept (`KeepMaster`), it
+  serves its master and nothing else, which no list computed at boot could keep up with. It is no
+  isolation boundary: up, the link answers ARP for the machine's other addresses (`arp_ignore=0`)
+  and takes IPv4 to them (the loose reverse-path filter), where IPv6's neighbour discovery
+  answers for the link's own addresses alone, none; a port that must reach
+  nothing is unplugged or disabled in firmware. Only
+  while the primary's NIC is named: one its rename missed (a NIC replaced) keeps its kernel's
+  name, and unaddressed with the rest it would cut the machine off, recovery system included, so
+  the boot then removes the file and DHCP takes every NIC, as before. A seed naming no role keeps
+  every NIC the primary's.
 - **A VM's DHCP identity is its NIC's, not its system's**: a Kairos VM boots two systems, the
   active (or passive) one and the recovery one, each with a machine-id of its own. networkd's DHCP
   client names itself by a DUID of the machine-id by default, so the recovery system took a lease

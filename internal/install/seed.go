@@ -412,6 +412,58 @@ func secondarySections(i MachineInterface) string {
 	return b.String()
 }
 
+// unnamedNetwork is the networkd file of the NICs no role names (kairos.UnnamedUnit), on a VM that
+// names its NICs by role: each carries no address — no DHCP, no IPv6 (no router advertisement,
+// no link-local address), so no route — and a NIC added to the machine (or a port a cable
+// reaches by mistake) carries none of the network beside the roles' NICs until `network attach`
+// names it. Kairos's DHCP default would configure it, and a second NIC on the primary's LAN would
+// take its routes. The link stays up, and one the kernel enslaved to another (a failover's standby
+// or virtual function, at boot or plugged later, a port of a bond made outside networkd) keeps its
+// master (KeepMaster: networkd ignores a Bond= of a file sorting after it),
+// which carries it. It matches physical NICs alone (Kind=!*, as dracut's default network); an
+// accelerated networking's virtual function on Azure is the bundle's 00-<name>-sriov.network's,
+// which sorts first and leaves it unmanaged.
+func unnamedNetwork(name, ctl string) string {
+	return fmt.Sprintf("# %s: a NIC no role names carries no address: `%s network` lists it, `%s network attach` names it.\n", name, ctl, ctl) +
+		"[Match]\n" + everyNIC + "\nKind=!*\n\n[Link]\nRequiredForOnline=no\n\n[Network]\nKeepMaster=yes\nDHCP=no\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n"
+}
+
+// unnamedIssue is the console banner's line of the NICs left unaddressed, which unnamedStages writes with
+// their file.
+func unnamedIssue(name string) string { return "/etc/issue.d/07-" + name + "-unnamed.issue" }
+
+// unnamedWaitSecs bounds the boot's wait for udev and for the primary's NIC before unnamedStages
+// decide.
+const unnamedWaitSecs = 30
+
+// unnamedStages leave the NICs no role names unaddressed (unnamedNetwork, and the banner's line), after
+// the renames and the pin, before the network's reload — only while the primary role's NIC is
+// named: a primary its rename missed (its NIC replaced, a MAC no longer matching) keeps its
+// kernel's name, and unaddressed with the rest it would leave the machine unreachable, recovery
+// system included. Then the files go, logged, and Kairos's DHCP default configures every NIC, as
+// on a machine naming none.
+func unnamedStages(name, ctl, primary string) []stage {
+	dev := "/sys/class/net/" + primary
+	unit, issue := "/etc/systemd/network/"+kairos.UnnamedUnit(name), unnamedIssue(name)
+	// Both are written beside their place under names networkd and agetty do not read, then moved
+	// into it, or removed, by one decision.
+	return []stage{{
+		Name: name + ": the NICs no role names left unaddressed while " + primary + " is named",
+		Files: []cloudFile{
+			{Path: unit + ".staged", Permissions: 0o644, Content: unnamedNetwork(name, ctl)},
+			{Path: issue + ".staged", Permissions: 0o644, Content: fmt.Sprintf("NICs no role names carry no address: `%s network` lists any by its MAC\n", ctl)},
+		},
+		// A NIC probed late (firmware a driver loads) is named once udev has handled it: the
+		// decision waits for that, and for the primary up to unnamedWaitSecs, so a slow primary
+		// does not hand every NIC to DHCP for the boot; only a primary never named waits it out.
+		// The console's prompt drawn already shows the banner as it was: agetty reads it again.
+		Commands: []string{fmt.Sprintf(`udevadm settle --timeout=%[1]d || true; i=0; while [ ! -e %[2]s ] && [ $i -lt %[1]d ]; do sleep 1; i=$((i+1)); done; `+
+			`if [ -e %[2]s ]; then mv -f %[3]s.staged %[3]s || echo '%[5]s: %[3]s did not move into place: the DHCP default of Kairos configures the NICs no role names' >&2; mv -f %[4]s.staged %[4]s || true; `+
+			`else rm -f %[3]s %[3]s.staged %[4]s %[4]s.staged; echo '%[5]s: no NIC is named %[6]s: none is left unaddressed, and DHCP configures each' >&2; fi; `+
+			`agetty --reload 2>/dev/null || true`, unnamedWaitSecs, dev, unit, issue, name, primary)},
+	}}
+}
+
 // nicFuncsScript defines the boot's shell functions over the VM's NICs, $c holding their names
 // (deviceNICsScript): mac and drv print a NIC's MAC and driver (nicDriverScript); vf passes for a
 // NIC of a virtual function's driver (vfDrivers); twin for a virtual function beside its NIC —
@@ -762,6 +814,7 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 	// test that it is done: one at most, as a NIC goes without a MAC only as the machine's only
 	// one (machineInterfaces), which a seed of several NICs, each by its MAC, never has.
 	var pin, pinned string
+	var primary string // the primary's role, when the machine names its NICs by role
 	for _, i := range m.Interfaces {
 		links = append(links, cloudFile{Path: "/etc/systemd/network/" + kairos.InterfaceLink(name, i.Role), Permissions: 0o644, Content: interfaceLink(name, i)})
 		rename, err := renameScript(name, i)
@@ -781,7 +834,7 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 			}
 		}
 		if i.Primary {
-			match = "Name=" + i.Role
+			match, primary = "Name="+i.Role, i.Role
 			continue
 		}
 		secondaries = append(secondaries, cloudFile{Path: "/etc/systemd/network/" + kairos.InterfaceUnit(name, i.Role), Permissions: 0o644,
@@ -801,6 +854,9 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 			Name:     name + ": the interface named by its original name pinned to its MAC",
 			Commands: []string{pin},
 		})
+	}
+	if primary != "" {
+		boot = append(boot, unnamedStages(name, ctl, primary)...)
 	}
 	boot = append(boot, stage{
 		Name: name + ": the network",

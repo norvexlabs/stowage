@@ -29,7 +29,7 @@ import (
 )
 
 var params = Params{Name: "notes", Ctl: "notes-stow", Base: "ubuntu:26.04@sha256:" + strings.Repeat("a", 64),
-	KairosInit: "quay.io/kairos/kairos-init:v4.4.0@sha256:" + strings.Repeat("b", 64), OSVersion: "1.2.0-r2"}
+	KairosInit: "quay.io/kairos/kairos-init:v4.6.0@sha256:" + strings.Repeat("b", 64), OSVersion: "1.2.0-r2"}
 
 func TestDockerfileRendersTheParams(t *testing.T) {
 	t.Parallel()

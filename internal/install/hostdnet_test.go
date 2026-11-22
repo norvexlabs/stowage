@@ -46,7 +46,9 @@ type fakeLink struct {
 	// nics are the secondary links by name, with the address each has without an override ("":
 	// none); nicAddr what each runs, from its override in run, the secondaries' networkd directory.
 	nics, nicAddr map[string]string
-	run           string
+	// addrGarbled has `ip -j address show` print what does not decode.
+	addrGarbled bool
+	run         string
 	// dev is the default route's interface; empty is ens3.
 	dev string
 }
@@ -99,6 +101,9 @@ func (f *fakeLink) Run(ctx context.Context, c Cmd) ([]byte, error) {
 		}
 		return []byte("[" + strings.Join(rs, ",") + "]"), nil
 	case "ip -j address show":
+		if f.addrGarbled {
+			return []byte("[{"), nil
+		}
 		local, prefix, _ := strings.Cut(f.addr, "/")
 		v6 := `{"family":"inet6","local":"fe80::5054:ff:fe12:3456","prefixlen":64,"scope":"link"}`
 		if f.ra && !f.raOff {

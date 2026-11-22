@@ -271,7 +271,7 @@ the loop to try before your operators do.
   `examples/minimal/deploy/chart` is a working one). Operators run `sh <name>.sh k8s install`.
 - **Kairos VM**: add `kairos` with a `base` distribution (Ubuntu: the bundle installs Docker from
   its Ubuntu repository; `examples/minimal` pins 26.04 LTS, the release the suites prove) and the
-  `kairos_init` image, both pinned by digest (`kairos_init` the release `examples/minimal` pins, v4.4.0: the bundle's build
+  `kairos_init` image, both pinned by digest (`kairos_init` the release `examples/minimal` pins, v4.6.0: the bundle's build
   checks kairos-init's boot assessment file against the copy Stowage carries, so another release
   fails it), and the `disk_formats` to publish. `ship` then also builds the OS bundle (about
   3 GB, several minutes) and the disks. Operators run `sh <name>.sh vm create`, boot the disk with

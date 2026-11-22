@@ -3,6 +3,42 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.42.0]
+
+### Changed
+
+- The OS bundle is built on Kairos 4.6.0 (kairos-init
+  `quay.io/kairos/kairos-init:v4.6.0@sha256:9c013af11b66189ad8d5a0a73c995eae53b65a2f5a620cc592bd5d0b01ed7915`,
+  was v4.4.0); a project pinning another kairos-init is warned by `lint`. An install from the
+  installer ISO on bare metal writes a UEFI boot entry of the disk it installed, first in the
+  firmware's boot order, so a machine whose list names an earlier system boots the new one. Upgrades
+  made from a 4.6 system refresh GRUB's configuration with GRUB itself; the first upgrade, from an
+  earlier bundle, is made by that system's Kairos. A VM on an earlier bundle upgrades to a 4.6
+  one, and rolls back to it.
+- The OS bundle masks `systemd-sysext` and `systemd-confext`: no extension image found on the
+  disk is merged over `/usr` or `/etc`, so what runs is the bundle the release signed, rolled back
+  whole.
+
+### Fixed
+
+- A VM's secondary NIC kept, from the boot's first seconds, IPv6 routes of the LAN its primary NIC
+  is on, so replies to an IPv6 client could leave by the secondary and never arrive (now and then,
+  as the router answered in time or not). The OS bundle's boot now drops that early network as
+  the system starts, on every VM running a release of this bundle: each NIC carries only what
+  Stowage's files give it, so a secondary NIC, or a primary one with IPv6 off, has no IPv6.
+- A NIC no role names, on a VM or a machine seeded by this release whose seed names its NICs by
+  role, carries no address — no DHCP, no IPv6, no route — its link up, and one another link
+  carries (a failover's standby or virtual function, a bond made outside networkd) left to it (one seeded
+  earlier keeps its seed's network until it is seeded again):
+  Kairos's DHCP default configured it, so a NIC added before `network attach` named it, on the
+  primary's LAN, took the primary's routes, and a cable in a port no role names brought the
+  machine up there. Only while the primary's NIC is named: one its boot cannot name (a NIC
+  replaced) leaves every NIC to DHCP, so the machine stays reachable. `network` lists each such NIC
+  with its MAC and the `network attach` command that names it (`unnamed` in
+  `--json`), and the console's login screen says where to look.
+- `network` on a VM without a default route shows the primary role's NIC, and `network set`
+  reconfigures it, where both took the first NIC of a kernel's name.
+
 ## [0.41.2] - 2026-11-21
 
 ### Fixed

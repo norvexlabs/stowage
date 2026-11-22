@@ -263,7 +263,7 @@ vm_cleanup() {
 	if [[ -z ${E2E_KEEP_VM:-} ]]; then
 		CLEANUP=("[[ ! -e $STATE/terraform.tfstate ]] || tofu -chdir=$STATE destroy -input=false -auto-approve -no-color >>$STATE/destroy.log 2>&1 || { tail -30 $STATE/destroy.log; echo 'the VM $VMNAME is left on TrueNAS: tofu destroy failed'; } >&2" "${CLEANUP[@]}")
 	else
-		CLEANUP=("echo 'keeping the VM $VMNAME: TRUENAS_ENDPOINT=… TRUENAS_API_KEY=… tofu -chdir=$STATE destroy'" "${CLEANUP[@]}")
+		CLEANUP=("[[ ! -e $STATE/terraform.tfstate ]] || echo 'keeping the VM $VMNAME: TRUENAS_ENDPOINT=$TRUENAS_ENDPOINT TRUENAS_API_KEY=<TRUENAS_API_KEY of $STOWAGE_VM_ENV> tofu -chdir=$STATE destroy'" "${CLEANUP[@]}")
 	fi
 }
 
@@ -275,6 +275,15 @@ not_on_vm() {
 	local rc=0
 	on_vm sudo grep -rqF -- "'$1'" "$2" || rc=$?
 	[[ $rc == 1 ]] || fail "the search of $2 on the VM exited $rc (0: what goes over SSH is there)"
+}
+# drained <grep args…>: grep's answer on its input, read to its end. `<command> | grep -q` under
+# pipefail fails when grep, done at its first match, closes the pipe while the command (ssh among
+# them) still writes: the command dies of SIGPIPE, whatever grep found.
+drained() {
+	local rc=0
+	grep "$@" || rc=$?
+	cat >/dev/null
+	return "$rc"
 }
 # boot_id: the VM's current boot; a reboot changes it.
 boot_id() { on_vm cat /proc/sys/kernel/random/boot_id; }

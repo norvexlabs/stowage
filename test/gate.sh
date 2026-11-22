@@ -313,6 +313,16 @@ if [[ -n ${cloud_why:-} && -z ${STOWAGE_CLOUD_ENV:-} ]]; then
 	echo "gate: e2e-kairos registers the clouds' images ($cloud_why): give STOWAGE_CLOUD_ENV=<file>" >&2
 	exit 1
 fi
+# A gate runs every step of the VM suites: E2E_VM_STEPS runs part of e2e-vm, and E2E_KEEP_VM
+# leaves out a suite's destroy.
+if [[ -n ${why[e2e-vm]:-} && -n ${E2E_VM_STEPS:-} ]]; then
+	echo "gate: e2e-vm runs every step in a gate: unset E2E_VM_STEPS" >&2
+	exit 1
+fi
+if [[ -n ${why[e2e-vm]:-}${why[e2e-full-vm]:-} && -n ${E2E_KEEP_VM:-} ]]; then
+	echo "gate: a VM suite destroys its VM in a gate: unset E2E_KEEP_VM" >&2
+	exit 1
+fi
 for s in e2e-vm e2e-full-vm; do
 	if [[ -n ${why[$s]:-} && -z ${STOWAGE_VM_ENV:-} ]]; then
 		echo "gate: $s is needed (${why[$s]}): give STOWAGE_VM_ENV=<file>" >&2

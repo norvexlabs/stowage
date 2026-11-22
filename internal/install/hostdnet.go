@@ -102,8 +102,11 @@ type Network struct {
 	// or the record does not read (logged).
 	Install *NetConfig `json:"install,omitempty"`
 	// Roles are the release's secondary NICs, in role order.
-	Roles   []RoleNetwork `json:"roles,omitempty"`
-	Pending *NetPending   `json:"pending,omitempty"`
+	Roles []RoleNetwork `json:"roles,omitempty"`
+	// Unnamed are the NICs no role names, which the cloud-config leaves unaddressed (kairos.UnnamedUnit),
+	// by their kernel's name: none when the VM does not name its NICs by role.
+	Unnamed []UnnamedNIC `json:"unnamed,omitempty"`
+	Pending *NetPending  `json:"pending,omitempty"`
 	// Hosts are the VM's host records (`vm create --add-host`), NAME:IP.
 	Hosts []string `json:"hosts,omitempty"`
 }
@@ -116,6 +119,15 @@ type RoleNetwork struct {
 	Override  *NetConfig `json:"override"` // nil: the cloud-config's or `network attach`'s settings
 	// Error is why its record does not read, which then sets nothing.
 	Error string `json:"error,omitempty"`
+}
+
+// UnnamedNIC is a NIC no role names, unaddressed: `network attach --role <role> --mac <MAC>` names it.
+type UnnamedNIC struct {
+	Name string `json:"name"`
+	MAC  string `json:"mac"`
+	// Addresses are its global addresses: none while the file leaves it unaddressed (one an
+	// earlier file or lease gave it shows here).
+	Addresses []string `json:"addresses"`
 }
 
 // NetLive is the network the VM runs, as the kernel and the resolver report it.
@@ -527,6 +539,52 @@ func renderNetwork(name, ctl, match string, c NetConfig) string {
 // everyNIC is the [Match] setting of a VM whose release named no NIC: whatever it has.
 const everyNIC = "Name=en* eth*"
 
+// kernelNICName reports whether a link's name is one everyNIC matches (en*, eth*): a NIC's
+// kernel name, never a role's (lint refuses those prefixes).
+func kernelNICName(n string) bool { return strings.HasPrefix(n, "en") || strings.HasPrefix(n, "eth") }
+
+// logUnnamed logs why the NICs no role names are not listed, once per error until they are listed
+// again: `network` is polled. Polls overlapping as the error comes and goes may log it twice.
+func (h *Hostd) logUnnamed(err error) {
+	if h.unnamedLogged.Swap(err.Error()) != any(err.Error()) {
+		h.O.logf("the NICs no role names are not listed: %v", err)
+	}
+}
+
+// unnamedNICs are the links the unnamed NICs' file leaves unaddressed: a physical NIC (deviceNICs:
+// the file's Kind=!*, a NIC enslaved to another link left out, its master's), a kernel's name, and
+// a MAC no role claims — the seed's .link files and `network attach`'s record name a NIC
+// whose rename failed or awaits its reboot, which `network attach` would refuse or repeat (the
+// role's line tells it). A claim that does not read lists none, logged.
+func (h *Hostd) unnamedNICs(f netFiles, links []ipLink) []UnnamedNIC {
+	claimed := map[string]bool{}
+	seeded, err := seedLinks(f.etc, f.name)
+	attached, aerr := readAttached(h.O.Dir)
+	nics, nerr := deviceNICs(cmp.Or(h.SysNet, sysNetDir))
+	if err = errors.Join(err, aerr, nerr); err != nil {
+		h.logUnnamed(err)
+		return nil
+	}
+	h.unnamedLogged.Store("") // listed: the next error is logged, even one logged before
+	for _, l := range seeded {
+		claimed[strings.ToLower(l.MAC)] = true
+	}
+	for _, a := range attached {
+		claimed[strings.ToLower(a.MAC)] = true
+	}
+	physical := map[string]bool{}
+	for _, n := range nics {
+		physical[n.Name] = true
+	}
+	var out []UnnamedNIC
+	for _, l := range links {
+		if physical[l.Name] && kernelNICName(l.Name) && !claimed[strings.ToLower(l.MAC)] {
+			out = append(out, UnnamedNIC{Name: l.Name, MAC: l.MAC, Addresses: append([]string{}, l.global()...)})
+		}
+	}
+	return out
+}
+
 // seedMatch is the [Match] setting of the primary interface's networkd files: the one the VM's
 // cloud-config wrote for its network (staticUnit), which names the NIC as the seed named it — the
 // primary's role, or every NIC's for a VM whose release named none when it was made — whatever the
@@ -893,8 +951,9 @@ func (f netFiles) boot(log io.Writer) error {
 	return f.render(st.Config)
 }
 
-// netLive reads the network the VM runs: the interface of the default route (else the first
-// wired one), its addresses, the gateway, the DNS servers.
+// netLive reads the network the VM runs: the interface of the default route (else the primary
+// role's NIC on a VM naming its NICs by role, else the first wired one), its addresses, the
+// gateway, the DNS servers.
 func (h *Hostd) netLive(ctx context.Context) (NetLive, error) { return h.netLiveOn(ctx, "") }
 
 // netLiveOn is netLive on the interface iface (empty: the default route's), whose Interface is
@@ -922,9 +981,18 @@ func (h *Hostd) netLiveOn(ctx context.Context, iface string) (NetLive, error) {
 	if iface != "" && slices.ContainsFunc(ls, func(l ipLink) bool { return l.Name == iface }) {
 		live.Interface = iface
 	}
+	// Without a default route: the primary role's NIC, on a VM naming its NICs by role (the
+	// others of a kernel's name carry no address), else the first wired one.
+	if live.Interface == "" && iface == "" {
+		// A seed's file that does not read names no role here: networkd's view of it is the
+		// boot's (rendering refuses it, logged there).
+		if role, ok := strings.CutPrefix(h.netFiles().primaryMatch, "Name="); ok && slices.ContainsFunc(ls, func(l ipLink) bool { return l.Name == role }) {
+			live.Interface = role
+		}
+	}
 	if live.Interface == "" && iface == "" {
 		for _, l := range ls {
-			if strings.HasPrefix(l.Name, "en") || strings.HasPrefix(l.Name, "eth") {
+			if kernelNICName(l.Name) {
 				live.Interface = l.Name
 				break
 			}
@@ -1305,10 +1373,19 @@ func (h *Hostd) network(w http.ResponseWriter, r *http.Request) {
 	}
 	n.Pending = h.pending(f, st)
 	var links []ipLink
-	if len(f.roles) > 0 {
-		if links, err = h.links(r.Context()); err != nil {
+	_, err = os.Stat(filepath.Join(f.etc, kairos.UnnamedUnit(f.name)))
+	unnamed := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		h.logUnnamed(err) // it may leave NICs unaddressed: say why none is listed
+	}
+	if len(f.roles) > 0 || unnamed {
+		if links, err = h.links(r.Context()); err != nil && len(f.roles) > 0 {
 			replyErr(w, err)
 			return
+		} else if err != nil {
+			// The unnamed NICs alone need them: the rest of the network answers.
+			h.logUnnamed(err)
+			unnamed = false
 		}
 	}
 	for _, role := range f.roles {
@@ -1328,6 +1405,9 @@ func (h *Hostd) network(w http.ResponseWriter, r *http.Request) {
 		if p := h.pending(g, rst); err == nil && p != nil {
 			n.Pending = p
 		}
+	}
+	if unnamed {
+		n.Unnamed = h.unnamedNICs(f, links)
 	}
 	reply(w, http.StatusOK, n)
 }

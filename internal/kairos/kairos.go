@@ -188,7 +188,7 @@ const placeholder = "NAME"
 
 // KairosInitRelease is the kairos-init release whose 08_grub.yaml the bundle's boot assessment is
 // derived from: the bundle's build refuses another (the Dockerfile names it too).
-const KairosInitRelease = "v4.4.0"
+const KairosInitRelease = "v4.6.0"
 
 // PreloadDir is the directory of the context the image archives go to, and CtlDir the one
 // <short>-stow goes to.
@@ -267,6 +267,11 @@ func InterfaceUnit(name, role string) string { return "10-" + name + "-" + role 
 func InterfaceUnits(name, role string) []string {
 	return []string{"09-" + name + "-" + role + "-override.network", InterfaceUnit(name, role)}
 }
+
+// UnnamedUnit is the networkd file the cloud-config writes when the VM names its NICs by role:
+// it leaves every NIC no role names (the kernel's en* and eth* names) unaddressed. It sorts after
+// the roles' files and before Kairos's DHCP default, which would otherwise configure such a NIC.
+func UnnamedUnit(name string) string { return "15-" + name + "-unnamed.network" }
 
 // InterfaceLink is the udev .link file the cloud-config names a NIC role's NIC with (by its MAC).
 func InterfaceLink(name, role string) string { return "10-" + name + "-" + role + ".link" }

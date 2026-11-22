@@ -89,8 +89,9 @@ The Serena MCP server is this repository's code tool; use it for every code task
   round is narrowed to the files its fixes touched.
   Rounds that find only minor findings end the loop: those are fixed, with no new round.
 - **Overlap.** While a review runs, read and design the next slice; never edit a file under review.
-- **One gate run.** `make gate` (`STOWAGE_VM_ENV=<file> make gate` when it needs e2e-vm), once per
-  settled tree: check, build and lint, then only the suites gate 1 lists for the changed paths —
+- **One gate run.** `make gate` (`STOWAGE_VM_ENV=<file> make gate` when it needs e2e-vm; it refuses
+  `E2E_VM_STEPS` when it runs e2e-vm and `E2E_KEEP_VM` when it runs a VM suite), once per settled
+  tree: check, build and lint, then only the suites gate 1 lists for the changed paths —
   `test/gate.sh` encodes that list, and a change to the list changes both. The long suites
   (e2e-kairos ~25 min, e2e-vm ~105 min) run only for the code they exercise. The end-to-end suites run **in parallel**: each has its own zot, ports, network
   and work directory. A suite that fails only in parallel is re-run alone, and the clash is fixed

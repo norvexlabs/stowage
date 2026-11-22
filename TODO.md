@@ -100,6 +100,27 @@ Cloud alone proven.
 
 ## Should
 
+- **Encrypted data on the Kairos shape**: `COS_PERSISTENT` (the app's data, its volumes, the
+  install's secrets) encrypted by Kairos's kcrypt — a spec key carried to the install's config,
+  the installer ISO's install and the disks' first boot (`kcrypt.encrypt_on_boot`, to prove),
+  the recovery system unlocking, the health gate's and the upgrade's unattended reboots kept. The
+  key source decides what it protects: the TPM (unattended; without Trusted Boot a stolen machine
+  unlocks itself), a passphrase at boot (Kairos 4.5; every reboot needs the console), a key
+  server (kcrypt-challenger), or the TPM with a passphrase fallback. Needs a test machine with a
+  TPM (TrueNAS's virtual TPM to check, else libvirt with swtpm).
+- **Trusted Boot on bare metal**: signed UKIs booted by systemd-boot, the encryption key sealed to
+  the measured boot. Replaces what the VM shape builds on GRUB — the health gate's boot assessment
+  (systemd-boot's boot counting), `host.kernel_args` (in the signed command line), the recovery
+  switch and `rollback` — and adds the publisher's Secure Boot keys (signing at `ship`, enrolment,
+  rotation, revocation), AuroraBoot's UKI installer ISO, and a test machine with Secure Boot and
+  a TPM. A variant beside GRUB (a project's choice; one release builds both): a UKI install
+  encrypts `COS_OEM` and `COS_PERSISTENT` with a key sealed in the TPM, and without a TPM only a
+  passphrase typed at every boot unlocks it (the key server attests with the TPM too), so a
+  machine without a TPM 2.0 stays on GRUB. A GRUB machine never becomes UKI in place (Kairos
+  upgrades by the boot mode it runs): it moves by `backup run`, `secrets export`, a new UKI
+  machine made with `--secrets`, and `restore` — an e2e suite proving that move (data, secrets,
+  the address kept by the MAC or DNS, the old machine frozen from its last backup), then an
+  upgrade and a rollback on UKI.
 - **The recovery system's DHCP IAID pinned**: a VM's DHCP clients name themselves by a DUID of
   the NIC's MAC, with an IAID networkd derives from udev's naming data, so the recovery system
   (the install-time image) keeps the VM's leases. A release whose systemd changes that naming
@@ -375,6 +396,12 @@ Cloud alone proven.
 
 ## Could
 
+- **Optional OS add-ons as signed extensions**: a large add-on only some machines need (a GPU
+  driver stack, a vendor's firmware tools on bare metal) rebuilds and ships with every OS bundle
+  today (`host.packages`). A systemd system extension published through the registry beside the
+  bundle — by digest, signed, its SBOM audited, enabled per boot entry and rolled back with it —
+  would let it ship once; the bundle masks systemd-sysext and systemd-confext until then (DESIGN,
+  "No system extension on the VM").
 - **A front route's upstream exposed on Kubernetes past the chart's ingress**: lint warns of a
   guarded route while the chart has routing resources (an Ingress, a Gateway API route, a
   controller's or a mesh's); a chart exposing a guarded route's upstream another way — a Service
@@ -428,13 +455,6 @@ Cloud alone proven.
   re-run that changes that input, and Docker then creates a root-owned directory at the missing
   path. Rare (a re-run changing a file input during a probe); a lock the sweep and the command's
   mount share, or a mount from a per-run copy, would close it.
-
-- **e2e-vm's SSH over IPv6 times out now and then**: the VM has its global address and its IPv6
-  default route, yet this host's SSH to it times out (`no SSH over IPv6 to …`); 2 runs of 4 on
-  2026-11-11 with no code change between them, the address the firewall admits unchanged, and
-  once on 2026-11-12. The step now tries for 90 s, saying each try, and on failure prints both
-  sides' neighbour tables, the VM's addresses and its ip6 rules: read them, and a capture on both
-  sides if they say nothing.
 
 - **Cloud resume without a second transfer**: a run stopped once its snapshot was imported
   (Scaleway, AWS) downloads and uploads the disk again to make the image, which never reads that

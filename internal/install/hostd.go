@@ -184,6 +184,8 @@ type Hostd struct {
 	// installNetLogged is the last bad install network record's error logged: the network is
 	// polled, and the record is rewritten the same at every boot, so each error is logged once.
 	installNetLogged atomic.Value // a string
+	// unnamedLogged is the last error that left the NICs no role names unlisted, logged once.
+	unnamedLogged atomic.Value // a string
 	// backupMu orders the backup settings' reads and changes; backingUp is set while an upgrade
 	// takes its backup first.
 	backupMu  sync.Mutex

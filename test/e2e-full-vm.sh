@@ -159,13 +159,56 @@ on_vm sudo test -e /oem/95_userdata && on_vm sudo test ! -e /oem/90_custom.yaml 
 on_vm test ! -e /run/.userdata_load || fail "the installed system pulled the seed again"
 [[ $(on_vm cat /proc/cmdline | tr ' ' '\n' | grep '^console=' | tail -n1) == console=tty1 ]] || { on_vm cat /proc/cmdline; fail "console=tty1 is not the last console"; }
 state=$(on_vm lsblk -bno SIZE,LABEL | awk '$2 == "COS_STATE" {print int($1 / 1048576)}')
-want=$(on_vm sudo cat /oem/95_userdata/userdata.yaml | awk '/state:/ {s = 1} s && /size:/ {print $2; exit}')
+want=$(on_vm sudo cat /oem/95_userdata/userdata.yaml | awk '/state:/ {s = 1} s && !w && /size:/ {print $2; w = 1}') || fail "the installer's config on the machine"
 [[ -n $want && $state -ge $want ]] || fail "the state partition is ${state:-?} MiB, the installer's config asked $want"
+# The install wrote a UEFI boot entry of the disk it installed, first in BootOrder, so a firmware
+# whose list names another system boots this one: the first entry's device path is a partition of
+# the EFI partition's GUID (Kairos labels it COS_GRUB) and the loader \EFI\BOOT\BOOTX64.EFI on
+# it, which Kairos's writer alone makes on the suite's firmware (OVMF): its own entries name the
+# whole disk, with no partition, and shim's fallback names its own loader. A firmware making
+# removable-media entries of its own (much real hardware) would pass it without Kairos's. EFI_GLOBAL_VARIABLE is the variables' vendor.
+EFI_GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
+esp=$(on_vm lsblk -no PARTUUID,LABEL | awk '$2 == "COS_GRUB" {print $1}') || fail "lsblk on the machine"
+[[ $esp =~ ^[0-9a-f-]{36}$ ]] || { on_vm lsblk -o NAME,LABEL,PARTUUID || true; fail "not one EFI partition (COS_GRUB) on the machine: ${esp//$'\n'/, }"; }
+mkdir -p "$WORK/efivars"
+on_vm "cd /sys/firmware/efi/efivars && sudo tar -cf - BootOrder-$EFI_GLOBAL Boot[0-9A-F][0-9A-F][0-9A-F][0-9A-F]-$EFI_GLOBAL" | tar -xf - -C "$WORK/efivars" ||
+	{ on_vm ls /sys/firmware/efi/efivars || true; fail "the machine's UEFI boot variables"; }
+# first_boot_entry <dir> <vendor GUID>: BootOrder's first entry, tab-separated: its name, its
+# description, the partition GUIDs and the files of its device path (- for none).
+first_boot_entry() {
+	python3 -I -c '
+import os, sys, uuid
+d, g = sys.argv[1], "-" + sys.argv[2]
+order = open(os.path.join(d, "BootOrder" + g), "rb").read()[4:]
+if len(order) < 2:
+    sys.exit("BootOrder is empty")
+name = "Boot%04X" % int.from_bytes(order[0:2], "little")
+v = open(os.path.join(d, name + g), "rb").read()[4:]
+plen, rest = int.from_bytes(v[4:6], "little"), v[6:]
+end = next(i for i in range(0, len(rest) - 1, 2) if rest[i:i + 2] == b"\0\0")
+dp, parts, files, i = rest[end + 2:end + 2 + plen], [], [], 0
+while i + 4 <= len(dp):
+    t, st, ln = dp[i], dp[i + 1], int.from_bytes(dp[i + 2:i + 4], "little")
+    if ln < 4:
+        break
+    if t == 4 and st == 1 and ln >= 42 and dp[i + 41] == 2:
+        parts.append(str(uuid.UUID(bytes_le=bytes(dp[i + 24:i + 40]))))
+    if t == 4 and st == 4:
+        files.append(dp[i + 4:i + ln].decode("utf-16-le").rstrip("\0"))
+    i += ln
+print("\t".join([name, rest[:end].decode("utf-16-le") or "-", ",".join(parts) or "-", ",".join(files) or "-"]))
+' "$1" "$2"
+}
+first=$(first_boot_entry "$WORK/efivars" "$EFI_GLOBAL") || fail "the machine's BootOrder cannot be read"
+IFS=$'\t' read -r _ _ parts files <<<"$first"
+[[ $parts == "$esp" && ${files^^} == '\EFI\BOOT\BOOTX64.EFI' ]] ||
+	fail "the first UEFI boot entry ($first) is not the install's: the EFI partition $esp, \\EFI\\BOOT\\BOOTX64.EFI"
+echo "UEFI: $first"
 
 step "on the VM: the api reaches the host daemon's app socket; an event goes through ingest"
 api=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
 on_vm sudo docker inspect --format "'{{range .Mounts}}{{.Source}}:{{.Destination}}:{{.RW}}{{println}}{{end}}'" "$api" |
-	grep -qx '/run/atlas/app:/run/stowage-host:false' || fail "the api service does not mount the app directory read-only"
+	drained -qx '/run/atlas/app:/run/stowage-host:false' || fail "the api service does not mount the app directory read-only"
 # The front's local CA reaches the api (front.publish_ca): a client trusting it alone reaches the
 # api route.
 on_vm sudo at-stow exec api -- cat /etc/atlas/ca/ca.crt >"$WORK/vm-ca.crt" && grep -q 'BEGIN CERTIFICATE' "$WORK/vm-ca.crt" || fail "the api reads no CA (exec through the host daemon)"
@@ -251,13 +294,13 @@ for r in uplink:$MAC_UPLINK edge:$MAC_EDGE; do
 	[[ $(on_vm cat "/sys/class/net/${r%%:*}/address") == "${r#*:}" ]] || { on_vm ip -o link; fail "no NIC ${r%%:*} of MAC ${r#*:}"; }
 done
 [[ $(on_vm ip -o route show default | awk '{for (n = 1; n < NF; n++) if ($n == "dev") print $(n+1)}' | sort -u) == uplink ]] || { on_vm ip route; fail "the default route is not uplink's alone"; }
-on_vm ip -4 -o addr show dev edge | grep -q ' inet ' || { on_vm networkctl status edge --no-pager; fail "edge took no lease"; }
+on_vm ip -4 -o addr show dev edge | drained -q ' inet ' || { on_vm networkctl status edge --no-pager; fail "edge took no lease"; }
 [[ $(on_vm cat /sys/class/net/edge/mtu) == 1500 ]] || fail "edge's MTU is not 1500"
-on_vm ip rule | grep -q 'fwmark 0x1 lookup 100' || { on_vm ip rule; fail "no rule of fwmark 0x1 to table 100"; }
-on_vm ip route show table 100 | grep -q '^local default dev edge' || { on_vm ip route show table 100; fail "no local route in table 100 on edge"; }
+on_vm ip rule | drained -q 'fwmark 0x1 lookup 100' || { on_vm ip rule; fail "no rule of fwmark 0x1 to table 100"; }
+on_vm ip route show table 100 | drained -q '^local default dev edge' || { on_vm ip route show table 100; fail "no local route in table 100 on edge"; }
 on_vm sudo ip tuntap add vpn0 mode tun && on_vm sudo ip link set vpn0 up || fail "a tun device vpn0 could not be opened"
 deadline=$((SECONDS + 30))
-until on_vm ip route show 10.99.0.0/24 | grep -q 'dev vpn0'; do
+until on_vm ip route show 10.99.0.0/24 | drained -q 'dev vpn0'; do
 	((SECONDS < deadline)) || { on_vm networkctl status vpn0 --no-pager; fail "networkd gave vpn0 no route to 10.99.0.0/24"; }
 	sleep 2
 done
@@ -269,7 +312,7 @@ grep -q 'iifname "uplink" tcp dport { 80, 443 } accept' "$WORK/ruleset.txt" && g
 # so the edge NIC's address, which this host reaches on the same bridge, gets no answer.
 grep -q 'ct original proto-dst { 80, 443 } oifname "br-\*" iifname != "uplink" drop' "$WORK/ruleset.txt" ||
 	{ grep -n 'proto-dst' "$WORK/ruleset.txt"; fail "the forward chain does not hold the front's ports to the uplink"; }
-edge_ip=$(on_vm ip -4 -o addr show dev edge | awk '{print $4}' | cut -d/ -f1 | head -1)
+edge_ip=$(on_vm ip -4 -o addr show dev edge | awk 'NR == 1 {split($4, a, "/"); print a[1]}') || fail "ip addr of edge on the VM"
 [[ -n $edge_ip ]] || fail "edge has no IPv4 address"
 # The controls: the edge address is reachable (ICMP, which the input chain accepts) through the
 # edge NIC itself — both NICs are on one bridge, so the VM answers ARP for an address on the NIC
@@ -346,7 +389,7 @@ grep -q 'loaded the nftables table inet vpn, before the containers start' "$WORK
 tables=$(on_vm systemctl show -p ExecMainExitTimestampMonotonic --value atlas-tables.service)
 docker=$(on_vm systemctl show -p ExecMainStartTimestampMonotonic --value docker.service)
 ((tables > 0 && tables <= docker)) || fail "the tables loaded at $tables µs, after Docker started at $docker µs (since boot)"
-on_vm sudo nft list table inet vpn | grep -q 'tproxy to :17008' || fail "the vpn table is not loaded after the reboot"
+on_vm sudo nft list table inet vpn | drained -q 'tproxy to :17008' || fail "the vpn table is not loaded after the reboot"
 
 step "on the VM: what the project asks of its host (host): kernel modules, packages, kernel arguments, settings, power"
 on_vm test -d /sys/module/tcp_diag || fail "tcp_diag is not loaded at boot"
@@ -359,7 +402,7 @@ for m in tcp_diag pcspkr "overlay redirect_always_follow"; do
 done
 on_vm tcpdump --version >/dev/null 2>&1 || fail "tcpdump (host.packages) is not on the VM"
 grep -qE "^ok +package tcpdump " "$WORK/tune.txt" || { cat "$WORK/tune.txt"; fail "tune does not report package tcpdump as installed"; }
-on_vm cat /proc/cmdline | grep -qw 'iommu=pt' || fail "the VM booted without its kernel argument iommu=pt (host.kernel_args)"
+on_vm cat /proc/cmdline | drained -qw 'iommu=pt' || fail "the VM booted without its kernel argument iommu=pt (host.kernel_args)"
 [[ $(on_vm cat /proc/sys/vm/swappiness) == 10 ]] || fail "vm.swappiness is not the project's 10 (host.sysctls)"
 grep -qE "^ok +kernel iommu=pt " "$WORK/tune.txt" && grep -qE "^ok +sysctl vm.swappiness " "$WORK/tune.txt" ||
 	{ cat "$WORK/tune.txt"; fail "tune does not report the kernel argument and the setting as asked"; }

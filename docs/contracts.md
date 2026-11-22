@@ -199,6 +199,20 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     RAM, and without its enable of `iscsid` when `open-iscsi` is purged (host.packages bringing
     it back keeps it); its other settings stay. The build fails when either line is no longer
     there;
+  - Kairos's `/system/oem/99_sysext.yaml` without its steps enabling `systemd-sysext` and
+    `systemd-confext`, and every unit of theirs the booted system has (services, sockets,
+    templates; the initrd's own left to the initrd) masked in `/usr`, so the masks leave with the
+    bundle on a rollback: no extension image on the disk is merged over `/usr` or `/etc`, so the
+    system is the bundle's alone and rolls back whole. The build fails when the file no longer
+    ends with those steps (naming `shapes.kairos.kairos_init`) or a unit is not masked;
+  - the initrd's network left in the initrd: Kairos's initrd brings every NIC up with dracut's
+    default network (`zzzz-dracut-default.network`: DHCP and router advertisements), and a drop-in
+    the initrd carries (`/usr/lib/systemd/network/zzzz-dracut-default.network.d/50-<name>-initrd.conf`,
+    `KeepConfiguration=no`) has its networkd drop what it set as it stops at switch-root, where
+    it would keep it. The system's networkd then starts each NIC from its own files alone: a
+    secondary NIC, or a primary one with IPv6 off, holds no IPv6 address or route the initrd
+    learnt, and the primary's DHCP lease is taken again by the system. The build fails when
+    dracut no longer names its default network so, or the initrd lacks the drop-in;
   - dracut's crypt generator in the initrd exiting cleanly when no disk is encrypted (its
     `return` outside a function, which `sh` refuses with status 2, becomes `exit`; the build fails
     when the script is no longer that one), and `/etc/default/locale` reading `LANG=C.UTF-8`

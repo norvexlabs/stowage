@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/norvexlabs/stowage/internal/kairos"
 )
 
 // roleDaemon is a host daemon of a release whose primary NIC is uplink, its secondaries edge and
@@ -532,6 +534,135 @@ func TestNetworkPrintsTheSecondaries(t *testing.T) {
 		if !strings.Contains(b.String(), want) {
 			t.Errorf("no %q in:\n%s", want, b.String())
 		}
+	}
+}
+
+// The NICs no role names are listed by their kernel's name and MAC once the cloud-config leaves
+// them unaddressed (its file there): a physical NIC with a kernel's name whose MAC no role claims —
+// not one `network attach` recorded (awaiting its reboot), nor a role's, nor a virtual link, nor
+// a NIC enslaved to another (its master's); without that file, none is.
+func TestNetworkListsTheUnnamedNICs(t *testing.T) {
+	t.Parallel()
+	link, h := roleDaemon(t)
+	for _, n := range []string{"ens5", "enp0s9", "enp0s10", "eth77", "enP1s11"} {
+		link.nicAddr[n] = ""
+	}
+	// enp0s10 holds an address another file or an earlier lease gave it: shown, not denied.
+	link.nicAddr["enp0s10"] = "203.0.113.9/24"
+	// eth77 is a virtual link (no device), enP1s11 a virtual function under ens5.
+	fakeSys(t, h.SysNet, h.UdevData, map[string]fakeNIC{
+		"ens5": {"02:00:00:00:00:04", "virtio_net", ""}, "enp0s9": {"02:00:00:00:00:06", "virtio_net", ""},
+		"enp0s10": {"02:00:00:00:00:07", "virtio_net", ""}, "eth77": {"02:00:00:00:00:05", "", ""},
+		"enP1s11": {"02:00:00:00:00:07", "mlx5_core", "ens5"},
+	})
+	api := h.Handler()
+	var n Network
+	call(t, api, http.MethodGet, "/v1/network", nil, &n)
+	if len(n.Unnamed) != 0 {
+		t.Fatalf("NICs listed without the cloud-config's file: %+v", n.Unnamed)
+	}
+	if err := os.WriteFile(filepath.Join(link.dir, kairos.UnnamedUnit("notes")), []byte(unnamedNetwork("notes", "notes-stow")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// enp0s9's MAC is recorded by `network attach`, for a reboot to name it.
+	if err := os.WriteFile(filepath.Join(h.O.Dir, interfacesFile), []byte("- role: lan\n  mac: 02:00:00:00:00:06\n  mode: none\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	n = Network{}
+	call(t, api, http.MethodGet, "/v1/network", nil, &n)
+	if want := []UnnamedNIC{{Name: "enp0s10", MAC: "02:00:00:00:00:07", Addresses: []string{"203.0.113.9/24"}}, {Name: "ens5", MAC: "02:00:00:00:00:04", Addresses: []string{}}}; !reflect.DeepEqual(n.Unnamed, want) {
+		t.Fatalf("%+v, want %+v", n.Unnamed, want)
+	}
+	var b strings.Builder
+	printNetwork(&b, "notes-stow", n)
+	for _, want := range []string{
+		"unnamed    ens5 02:00:00:00:00:04: no address, as no role names it; `sudo notes-stow network attach --role <role> --mac 02:00:00:00:00:04` names it\n",
+		"unnamed    enp0s10 02:00:00:00:00:07: 203.0.113.9/24, as no role names it;",
+	} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("no %q in:\n%s", want, b.String())
+		}
+	}
+	// A claim that does not read lists none, and the rest of the network answers: `network
+	// attach`'s record, then a seed's .link file.
+	for _, broken := range []func() error{
+		func() error { return os.WriteFile(filepath.Join(h.O.Dir, interfacesFile), []byte("{"), 0o644) },
+		func() error {
+			if err := os.Remove(filepath.Join(h.O.Dir, interfacesFile)); err != nil {
+				return err
+			}
+			return os.Mkdir(filepath.Join(link.dir, kairos.InterfaceLink("notes", "lan")), 0o755)
+		},
+	} {
+		if err := broken(); err != nil {
+			t.Fatal(err)
+		}
+		n = Network{}
+		if code := call(t, api, http.MethodGet, "/v1/network", nil, &n); code != http.StatusOK || len(n.Unnamed) != 0 || len(n.Roles) == 0 {
+			t.Fatalf("%d %+v", code, n)
+		}
+	}
+}
+
+// A claim that does not read is logged once while it lasts, and again when it returns after a
+// listing: `network` is polled.
+func TestTheUnnamedNICsErrorIsLoggedOncePerOutage(t *testing.T) {
+	t.Parallel()
+	link, h := roleDaemon(t)
+	var log bytes.Buffer
+	h.O.Log = &log
+	if err := os.WriteFile(filepath.Join(link.dir, kairos.UnnamedUnit("notes")), []byte(unnamedNetwork("notes", "notes-stow")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(h.O.Dir, interfacesFile)
+	api := h.Handler()
+	get := func() {
+		t.Helper()
+		var n Network
+		if code := call(t, api, http.MethodGet, "/v1/network", nil, &n); code != http.StatusOK {
+			t.Fatalf("%d %+v", code, n)
+		}
+	}
+	for _, step := range []string{"{", "{", "- role: lan\n  mac: 02:00:00:00:00:05\n", "{"} {
+		if err := os.WriteFile(record, []byte(step), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		get()
+	}
+	if got := strings.Count(log.String(), "the NICs no role names are not listed"); got != 2 {
+		t.Errorf("logged %d times, want 2 (once, then again after a listing):\n%s", got, log.String())
+	}
+}
+
+// Without a default route, `network` shows the primary role's NIC on a VM naming its NICs by role,
+// not the first of a kernel's name (one left unaddressed).
+func TestNetworkShowsThePrimaryRoleWithoutADefaultRoute(t *testing.T) {
+	t.Parallel()
+	link, h := roleDaemon(t)
+	link.gw = ""
+	link.nicAddr["uplink"] = "192.0.2.50/24"
+	if err := os.WriteFile(filepath.Join(link.dir, staticUnit("notes")), []byte("[Match]\nName=uplink\n\n[Network]\nDHCP=ipv4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var n Network
+	if code := call(t, h.Handler(), http.MethodGet, "/v1/network", nil, &n); code != http.StatusOK || n.Live.Interface != "uplink" {
+		t.Fatalf("%d %+v", code, n.Live)
+	}
+}
+
+// On a VM whose release names no secondary NIC, links `ip` prints in a form that does not decode
+// leave the NICs no role names unlisted, and the rest of the network answers.
+func TestNetworkAnswersWhenTheUnnamedNICsCannotBeRead(t *testing.T) {
+	t.Parallel()
+	link := newLink(t)
+	h := netDaemon(t, link)
+	if err := os.WriteFile(filepath.Join(link.dir, kairos.UnnamedUnit("notes")), []byte(unnamedNetwork("notes", "notes-stow")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link.addrGarbled = true
+	var n Network
+	if code := call(t, h.Handler(), http.MethodGet, "/v1/network", nil, &n); code != http.StatusOK || len(n.Unnamed) != 0 || n.Live.Interface == "" {
+		t.Fatalf("%d %+v", code, n)
 	}
 }
 

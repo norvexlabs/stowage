@@ -319,7 +319,36 @@ over SSH from your machine takes its host key with `--known-hosts-line`.
   hypervisor, `attach=` (the platform's network or bridge, default the primary's); an `optional`
   role's NIC is made only when `--interface` names it (`--interface <role>=none` for the default
   addressing), else the machine has none and no MAC is drawn for it; no NIC waits
-  for the boot (`RequiredForOnline=no`). On a hypervisor, a VM of several NIC roles has each
+  for the boot (`RequiredForOnline=no`). Once the system runs, a NIC no role names — one added
+  to the machine before `network attach` names it, or a port the machine has beyond its roles —
+  **carries no address**: no DHCP, no IPv6 (no router advertisement, no link-local address), so
+  no route. `/etc/systemd/network/15-<name>-unnamed.network` matches the kernel's names (`en*`,
+  `eth*`; a role is never one) of physical NICs (`Kind=!*`), after the roles' files and before
+  Kairos's DHCP default, which would configure it, so a NIC no role names is configured by no file
+  sorting after it (a bond's port file of networkd's own sorts before it, or the port is left
+  unaddressed, out of the bond); a NIC whose name is neither (one a udev rule names) is not
+  covered, nor listed. The link stays up, and one the kernel or another program enslaved to another
+  link — a failover's standby or virtual function, at boot or plugged later, a bond made outside
+  networkd — keeps its master, which carries it (`KeepMaster=yes`); an accelerated networking's
+  virtual function on Azure is the bundle's `00-<name>-sriov.network`'s, which leaves it
+  unmanaged. A cable in the wrong port gets no address and no route; the link, up, is no isolation
+  boundary (it answers ARP for the machine's other addresses, `arp_ignore=0`, and takes IPv4 to them,
+  the loose reverse-path filter; IPv6's neighbour discovery answers for the link's own addresses
+  alone, none), so a port that must reach nothing is unplugged or disabled in the
+  firmware. `network` lists the NIC with its MAC, and
+  the console's login screen says so (`/etc/issue.d/07-<name>-unnamed.issue`). The initrd still
+  asks DHCP on every NIC for its few seconds (Kairos's, dropped at switch-root), and the first
+  boot until its `boot` stage writes the file. Both are written at each boot only while the
+  primary role's NIC is named, once udev has settled and the primary is there (each awaited up to
+  30 s, so a NIC probed late is named first): a primary its rename missed (its NIC replaced, so
+  its MAC no longer matches) keeps its kernel's name, and the boot then removes them, logging
+  `<name>: no NIC is named <role>: none is left unaddressed, and DHCP configures each`, so the
+  machine stays reachable on DHCP, recovery system included — at each boot about a minute later
+  than before (the file an earlier boot left keeps the NIC unaddressed until that stage, past its
+  waits), until the role is named again (a pinned primary's NIC replaced is pinned in its place by
+  that same boot, below; one the seed names by its MAC needs a NIC of that MAC). A machine whose
+  seed names no NIC role has no such file: every
+  NIC is the primary's. On a hypervisor, a VM of several NIC roles has each
   named by its MAC: given, else generated (`02:` and 5 random bytes, drawn by each run and
   written into its seed, `vm seed`'s `interfaces` and `vm create`'s steps: the NICs take the MACs
   the run that wrote their seed printed). A VM of one NIC role (a hypervisor's, its MAC not

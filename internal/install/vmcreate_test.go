@@ -1352,6 +1352,9 @@ func TestTheSeedNamesAndAddressesTheNICs(t *testing.T) {
 		"initramfs:/etc/systemd/system/kairos-reset.service.d/10-atlas-udev-settle.conf": "[Service]\nExecStartPre=-/usr/bin/udevadm settle --timeout=120\n",
 		"boot:/etc/systemd/network/05-atlas-static.network":                              "[Match]\nName=uplink\n\n[Network]\nDHCP=ipv4\n",
 		"boot:/etc/systemd/network/10-atlas-edge.network":                                "[Match]\nName=edge\n\n[Network]\nDHCP=ipv4\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n\n[DHCPv4]\nUseGateway=no\nUseRoutes=no\nUseDNS=no\nSendHostname=no\n\n[Link]\nRequiredForOnline=no\n",
+		// A NIC no role names is left up and unaddressed, its master kept, by a file sorting after
+		// the roles' and before Kairos's 20-dhcp.network (staged, moved into place below).
+		"boot:/etc/systemd/network/15-atlas-unnamed.network.staged": "`at-stow network` lists it, `at-stow network attach` names it.\n[Match]\nName=en* eth*\nKind=!*\n\n[Link]\nRequiredForOnline=no\n\n[Network]\nKeepMaster=yes\nDHCP=no\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n",
 	} {
 		if !strings.Contains(files[path], want) {
 			t.Errorf("%s:\n%s\nwant it to hold\n%s", path, files[path], want)
@@ -1361,6 +1364,67 @@ func TestTheSeedNamesAndAddressesTheNICs(t *testing.T) {
 		return strings.Contains(c, `[ "$(mac "$d")" = 02:00:00:00:00:0b ] && ! twin "$d"`) && strings.Contains(c, `ip link set dev "$i" name edge`)
 	}) {
 		t.Errorf("no rename of edge in %q", cmds)
+	}
+	// The NICs no role names are left unaddressed only while the primary's NIC is named, decided
+	// once, after the renames and before the network's reload; else their files go, and DHCP
+	// configures each.
+	var order []string
+	var decide stage
+	for _, st := range cc.Stages["boot"] {
+		order = append(order, st.Name)
+		if st.Name == "atlas: the NICs no role names left unaddressed while uplink is named" {
+			decide = st
+		}
+	}
+	if len(decide.Files) != 2 || decide.Files[1].Path != "/etc/issue.d/07-atlas-unnamed.issue.staged" ||
+		!strings.Contains(decide.Files[1].Content, "NICs no role names carry no address: `at-stow network` lists any by its MAC") || len(decide.Commands) != 1 {
+		t.Errorf("%+v", decide)
+	}
+	renamed, decided, reload := slices.Index(order, "atlas: the interfaces named by their roles"),
+		slices.Index(order, "atlas: the NICs no role names left unaddressed while uplink is named"), slices.Index(order, "atlas: the network")
+	if renamed < 0 || decided <= renamed || reload <= decided {
+		t.Errorf("boot stages out of order: %q", order)
+	}
+	// The decision, run: the primary there moves both into place; absent, it removes them (an
+	// earlier boot's too) and says so.
+	for _, named := range []bool{true, false} {
+		sys, networkd, issued := t.TempDir(), t.TempDir(), t.TempDir()
+		if named {
+			if err := os.Mkdir(filepath.Join(sys, "uplink"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// An earlier boot's files, and this boot's staged ones.
+		for _, f := range []string{filepath.Join(networkd, "15-atlas-unnamed.network"), filepath.Join(issued, "07-atlas-unnamed.issue")} {
+			for _, p := range []string{f, f + ".staged"} {
+				if err := os.WriteFile(p, []byte(filepath.Ext(p)), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		script := strings.ReplaceAll(bootPaths(t, decide.Commands[0], "", networkd, sys, t.TempDir()), "/etc/issue.d/", issued+"/")
+		reloads := filepath.Join(t.TempDir(), "reloads")
+		// agetty's reload records the files there as it runs: after the decision.
+		script = strings.NewReplacer("udevadm settle", "true", "sleep 1", "true",
+			"agetty --reload", "ls "+networkd+" "+issued+" >>"+reloads+"; echo reload >>"+reloads).Replace(script)
+		stderr, ok := runSh(t, script)
+		if got, _ := os.ReadFile(reloads); strings.Count(string(got), "reload\n") != 1 || strings.Contains(string(got), ".staged") {
+			t.Errorf("named %t: agetty reloads once, after the files moved:\n%s", named, got)
+		}
+		unit, uerr := os.ReadFile(filepath.Join(networkd, "15-atlas-unnamed.network"))
+		issue, ierr := os.ReadFile(filepath.Join(issued, "07-atlas-unnamed.issue"))
+		_, serr := os.Stat(filepath.Join(networkd, "15-atlas-unnamed.network.staged"))
+		_, sierr := os.Stat(filepath.Join(issued, "07-atlas-unnamed.issue.staged"))
+		staged := errors.Is(serr, os.ErrNotExist) && errors.Is(sierr, os.ErrNotExist) // none left
+		switch {
+		case !ok:
+			t.Errorf("named %t: %s", named, stderr)
+		case named && (uerr != nil || string(unit) != ".staged" || ierr != nil || string(issue) != ".staged" || !staged || stderr != ""):
+			t.Errorf("named: %q %v %q %v %v %v %q", unit, uerr, issue, ierr, serr, sierr, stderr)
+		case !named && (!errors.Is(uerr, os.ErrNotExist) || !errors.Is(ierr, os.ErrNotExist) || !staged ||
+			stderr != "atlas: no NIC is named uplink: none is left unaddressed, and DHCP configures each\n"):
+			t.Errorf("not named: %v %v %v %v %q", uerr, ierr, serr, sierr, stderr)
+		}
 	}
 	one := m
 	one.Interfaces = []MachineInterface{{Role: "uplink", Primary: true}}
@@ -1375,8 +1439,8 @@ func TestTheSeedNamesAndAddressesTheNICs(t *testing.T) {
 	none := m
 	none.Interfaces = nil
 	raw, _ = UserData("atlas", "at-stow", none, Settings{}, nil)
-	if strings.Contains(string(raw), ".link") || !strings.Contains(string(raw), "Name=en* eth*") {
-		t.Errorf("no interfaces:\n%s", raw)
+	if strings.Contains(string(raw), ".link") || !strings.Contains(string(raw), "Name=en* eth*") || strings.Contains(string(raw), "unnamed.network") {
+		t.Errorf("no interfaces (every NIC the primary's, none left unaddressed):\n%s", raw)
 	}
 }
 
@@ -1561,5 +1625,35 @@ func TestVMCreatePlatformQuestionStopsAtAnUnreadableSource(t *testing.T) {
 	p = answers("truenas")
 	if err := v.create(VMCreate{}, func(o *Options) { o.Prompt = p }); err == nil || !strings.Contains(err.Error(), "invalid character") || len(p.forms) != 0 {
 		t.Errorf("%v, %d forms", err, len(p.forms))
+	}
+}
+
+// The NICs no role names' file that cannot move into place is said, and the banner still moves.
+// (Root writes a read-only directory: the case needs another user.)
+func TestTheUnnamedNICsFileThatDoesNotMoveIsSaid(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only directory")
+	}
+	sys, networkd, issued := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.Mkdir(filepath.Join(sys, "uplink"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{filepath.Join(networkd, "15-atlas-unnamed.network.staged"), filepath.Join(issued, "07-atlas-unnamed.issue.staged")} {
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(networkd, 0o555); err != nil { // a directory
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(networkd, 0o755) }) // a directory
+	cmd := unnamedStages("atlas", "at-stow", "uplink")[0].Commands[0]
+	script := strings.ReplaceAll(bootPaths(t, cmd, "", networkd, sys, t.TempDir()), "/etc/issue.d/", issued+"/")
+	script = strings.NewReplacer("udevadm settle", "true", "sleep 1", "true", "agetty --reload", "true").Replace(script)
+	stderr, ok := runSh(t, script)
+	if _, err := os.Stat(filepath.Join(issued, "07-atlas-unnamed.issue")); !ok || err != nil ||
+		!strings.Contains(stderr, "atlas: "+networkd+"/15-atlas-unnamed.network did not move into place: the DHCP default of Kairos configures the NICs no role names") {
+		t.Errorf("%t %v %q", ok, err, stderr)
 	}
 }

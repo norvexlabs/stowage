@@ -81,7 +81,7 @@ RUN set -e; f=/usr/lib/dracut/modules.d/70crypt/crypt-generator.sh; \
     grep -qxF '[ -e /etc/crypttab ] || return 0' "$f"; \
     [ "$(grep -cw return "$f")" = 3 ]; \
     sed -i 's/\breturn \([0-9]\)$/exit \1/' "$f"; \
-    ! grep -qw return "$f"; \
+    if grep -qw return "$f"; then echo "shapes.kairos.kairos_init: its $f keeps a return outside a function: use kairos-init v4.6.0" >&2; exit 1; fi; \
     sh -n "$f"
 
 # kairos-init's init stage strips the kernel modules; without them netfilter, and so nftables and
@@ -121,6 +121,18 @@ RUN set -e; fail() { echo "os bundle: $*" >&2; exit 1; }; \
     rm -rf /var/lib/apt/lists/*; \
     n=$(find /lib/modules/ -name '*.ko*' | wc -l); \
     [ "$n" -ge 100 ] || fail "only $n kernel modules after the reinstall"
+
+# The initrd's network is dropped at switch-root (files/usr/lib/systemd/network): the build fails
+# when the initrd the init stage built does not carry dracut's default network, the hook that
+# installs it as zzzz-dracut-default.network (which the drop-in extends), or the drop-in.
+RUN set -e; fail() { echo "os bundle: $*" >&2; exit 1; }; \
+    [ -f /boot/initrd ] || fail "no initrd at /boot/initrd"; \
+    lsinitrd /boot/initrd > /tmp/initrd.lst || fail "lsinitrd /boot/initrd"; \
+    for f in usr/lib/dracut/dracut-default.network var/lib/dracut/hooks/cmdline/99-networkd-config.sh usr/lib/systemd/network/zzzz-dracut-default.network.d/50-{{.Name}}-initrd.conf; do \
+        awk -v f="$f" '{sub(/ -> .*$/, "")} $NF == f {found = 1} END {exit !found}' /tmp/initrd.lst || fail "the initrd does not carry $f: the drop-in dropping the initrd's network at switch-root extends nothing"; done; \
+    lsinitrd -f var/lib/dracut/hooks/cmdline/99-networkd-config.sh /boot/initrd | grep -q '/run/systemd/network/zzzz-dracut-default\.network' \
+        || fail "the initrd's network hook no longer installs its default network as zzzz-dracut-default.network, which the drop-in extends"; \
+    rm /tmp/initrd.lst
 
 # What goes after the init stage: the packages it enables unconditionally, and the timers that
 # would upgrade an image-based system in place or fetch Canonical's news (masked). The build fails
@@ -231,7 +243,7 @@ RUN set -e; f=/etc/cos/bootargs.cfg; \
 RUN set -e; f=/system/oem/09_systemd_services.yaml; \
     grep -qxF '        net.core.rmem_max: 7500000' "$f"; \
     sed -i '/^        net\.core\.rmem_max: 7500000$/d' "$f"; \
-    ! grep -q 'rmem_max' "$f"; \
+    if grep -q 'rmem_max' "$f"; then echo "shapes.kairos.kairos_init: its $f sets rmem_max elsewhere: use kairos-init v4.6.0" >&2; exit 1; fi; \
     grep -qF 'vm.max_map_count: 262144' "$f"
 
 # The same stage enables iscsid, which the purge of open-iscsi removed (unless host.packages
@@ -248,9 +260,36 @@ RUN set -e; f=/system/oem/09_systemd_services.yaml; \
 # last, probed beside the other clouds'. The build fails when the list no longer reads as expected.
 RUN set -e; f=/system/oem/00_datasource.yaml; \
     [ "$(grep -cE '^ +providers: \[.*\]$' "$f")" = 1 ]; \
-    ! grep -q scaleway "$f"; \
+    if grep -q scaleway "$f"; then echo "shapes.kairos.kairos_init: its $f names scaleway already: use kairos-init v4.6.0" >&2; exit 1; fi; \
     sed -i -E 's/^( +providers: \[.*)\]$/\1, "scaleway"]/' "$f"; \
     grep -qE '^ +providers: \[.*"maas", "scaleway"\]$' "$f"
+
+# Kairos's sysext stage enables systemd-sysext and systemd-confext at every boot, which merge any
+# extension image found on the disk over /usr and /etc: a way to change the system outside the OS
+# bundle, its digest and its A/B rollback, which the bundle never uses. Its enabling steps (the
+# file's last 18 lines in kairos-init v4.6.0, by their sha256) go, and the booted system's units
+# (every systemd-sysext and systemd-confext unit of its systemd, and systemd-sysext and
+# systemd-confext's .service, .socket and @.service whether or not this systemd ships them) are
+# masked in /usr, which leaves with the image: a
+# mask in /etc would outlive a rollback in Kairos's persistent /etc/systemd, where an earlier
+# bundle's boot enables them. The initrd's own units (systemd-sysext-initrd, systemd-confext-initrd)
+# are left to the initrd, whose merge reaches the initrd alone.
+# The build fails when the file no longer ends with those lines, or a unit is left unmasked.
+RUN set -e; f=/system/oem/99_sysext.yaml; \
+    n="$(grep -n '^    # systemd ships systemd-sysext.service from v248 and$' "$f" | cut -d: -f1)"; \
+    [ "$(printf '%s\n' "$n" | wc -l)" = 1 ] && [ -n "$n" ] && [ "$(($(wc -l < "$f") - n + 1))" = 18 ] && \
+        [ "$(tail -n +"$n" "$f" | sha256sum | cut -d' ' -f1)" = 6e0d2e85158d5235cf3163f525fa333f3cf613abf32236aaa12091863bbc77ce ] || \
+        { echo "shapes.kairos.kairos_init: its $f does not end with the steps enabling systemd-sysext and systemd-confext the bundle removes: use kairos-init v4.6.0" >&2; exit 1; }; \
+    head -n "$((n - 1))" "$f" > "$f.new"; cat "$f.new" > "$f"; rm "$f.new"; \
+    if grep -qE '^ +(systemctl|enable):' "$f"; then echo "shapes.kairos.kairos_init: its $f enables a unit before the steps the bundle removes: use kairos-init v4.6.0" >&2; exit 1; fi; \
+    units="systemd-sysext.service systemd-sysext.socket systemd-sysext@.service systemd-confext.service systemd-confext.socket systemd-confext@.service"; \
+    for p in /usr/lib/systemd/system/systemd-sysext* /usr/lib/systemd/system/systemd-confext*; do \
+        [ -e "$p" ] || [ -L "$p" ] || continue; [ ! -d "$p" ] || continue; u="${p##*/}"; \
+        case "$u" in *-initrd.service) ;; *) case " $units " in *" $u "*) ;; *) units="$units $u";; esac;; esac; done; \
+    for u in $units; do ln -sfn /dev/null "/usr/lib/systemd/system/$u"; done; \
+    for u in $units; do [ "$(systemctl is-enabled "$u" 2>/dev/null || true)" = masked ] || \
+        { o="$(ls -d /etc/systemd/system/"$u" /etc/systemd/system.control/"$u" /run/systemd/system/"$u" /usr/local/lib/systemd/system/"$u" 2>/dev/null | tr '\n' ' ')"; \
+          echo "$u is not masked ($(systemctl is-enabled "$u" 2>&1)): ${o:-no file }overrides /usr/lib's mask, of the package(s) $(for x in $o; do dpkg -S "$x" 2>/dev/null | cut -d: -f1; done | sort -u | tr '\n' ' ')(none: written by a build step); host.packages, the base or a kairos-init other than v4.6.0 brings it" >&2; exit 1; }; done
 
 # The locale every login's PAM reads: Ubuntu's /etc/default/locale is a link to /etc/locale.conf,
 # which the base image lacks, so each SSH session and sudo would log the missing file. The build
@@ -274,7 +313,7 @@ RUN set -e; c="$(systemd-tmpfiles --cat-config | grep -E '^[^#]*[[:space:]]/etc/
 # release it is derived from.
 RUN set -e; f=/system/oem/08_grub.yaml; \
     echo "a8d0b7ba11e554651ffaa7ec1cf132b217679be3bc387675ea1ad4ca40d104e5  $f" | sha256sum -c - || \
-        { echo "shapes.kairos.kairos_init: its $f is not the one this stowage's boot assessment is derived from: use kairos-init v4.4.0" >&2; exit 1; }; \
+        { echo "shapes.kairos.kairos_init: its $f is not the one this stowage's boot assessment is derived from: use kairos-init v4.6.0" >&2; exit 1; }; \
     mv /usr/share/{{.Name}}/08_grub.yaml "$f"; \
     rmdir /usr/share/{{.Name}}; \
     ! grep -q 'Remove GRUB sentinels' "$f"

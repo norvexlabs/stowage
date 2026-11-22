@@ -204,6 +204,10 @@ func printNetwork(w io.Writer, ctl string, n Network) {
 		}
 		fmt.Fprintf(w, "role       %s: %s; set by %s\n", r.Role, nic, set)
 	}
+	for _, u := range n.Unnamed {
+		fmt.Fprintf(w, "unnamed    %s %s: %s, as no role names it; `sudo %s network attach --role <role> --mac %s` names it\n",
+			u.Name, u.MAC, cmp.Or(strings.Join(u.Addresses, ", "), "no address"), ctl, u.MAC)
+	}
 	if p := n.Pending; p != nil {
 		prev := describeNet(p.Previous)
 		if p.Role != "" {

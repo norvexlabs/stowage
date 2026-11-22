@@ -697,7 +697,8 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   release it finds is under a `command` scheme and is not the release the install runs). A later OS
   boots as an upgrade like any. The plan resolves what that boot would wipe (both releases' `data.reset`) before the OS
   is written, and refuses one it cannot tell.
-- `network` shows the interface (that of the default route, else the first `en*`/`eth*`), its
+- `network` shows the interface (that of the default route, else the primary role's NIC on a
+  VM naming its NICs by role, else the first `en*`/`eth*`), its
   MAC, its global IPv4 and IPv6 addresses (static, leased or from router advertisements; an IPv6
   one once duplicate address detection passed), the default gateways (IPv4's, then each IPv6
   default route's on that interface, static or advertised) and the DNS servers in use
@@ -710,8 +711,16 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   Then a `role` line for each of the release's secondary NICs (`role       <role>: <MAC>
   <addresses, or no address>; set by …` — `no NIC is named so` when the VM names none — set by
   `` `<short>-stow network set --role <role>`: `` and the override's settings, or by `the
-  cloud-config or \`network attach\``), and the change awaiting confirmation, a secondary's
-  named with its role (`roles` and `pending.role` in `--json`).
+  cloud-config or \`network attach\``), an `unnamed` line for each NIC no role names, which the
+  cloud-config leaves unaddressed (`unnamed    <kernel name> <MAC>: <its global addresses, or no
+  address — one an earlier file or lease gave it shows>, as no role names it; \`sudo
+  <short>-stow network attach --role <role> --mac <MAC>\` names it` — a physical NIC (no
+  virtual link, no NIC enslaved to another link, its master's) with a kernel's name whose MAC
+  neither the seed nor `network attach` claims: a role's NIC whose rename
+  failed or awaits its reboot is its role's line; none on a VM whose seed names no NIC role,
+  while the primary role's NIC is not named (the boot removed the file, and DHCP configures those
+  NICs), or when the links or the claims do not read, logged), and the change awaiting confirmation, a secondary's named with its role
+  (`roles`, `unnamed` — each NIC's `name`, `mac` and `addresses` — and `pending.role` in `--json`).
 - `network attach` (as root; then add the NIC on the VM's platform and restart the VM, or
   `sudo <short>-stow reboot` when the NIC is there already, in either order:
   [vm-create's](vm-create.md#creating-the-vm-with-opentofu)) names and addresses a NIC the VM's
@@ -866,7 +875,8 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   a reboot is scheduled. The override is recorded in `/usr/local/<name>/network.yaml` (0600, on
   the persistent partition, strictly read), rendered as
   `/etc/systemd/network/01-<name>-override.network` (`Name=en* eth*`; sorted first, so networkd
-  takes it), then `networkctl reload` and `networkctl reconfigure` of the interface; with static
+  takes it), then `networkctl reload` and `networkctl reconfigure` of the interface (the one `network`
+  shows); with static
   addresses, each address (an IPv6 one past duplicate address detection: one another host has
   never does) and the default routes via the gateways must reach the interface within 10 s. A change that fails is undone at once and reported (the settings before it rendered and
   applied again).
@@ -989,7 +999,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   address)"), each secondary NIC's override (`<role>: <its settings>; set with \`<short>-stow
   network set --role <role>\``) and, while a change awaits confirmation, when it goes back
   (`06-<name>-network.issue`, written at boot and at each change, then `agetty --reload`); the
-  cloud-config adds the connect line.
+  cloud-config adds the connect line and, on a VM whose seed names its NICs by role while its
+  primary is named, `NICs no role names carry no address: \`<short>-stow network\` lists any by
+  its MAC`.
 - Disk pressure (`hooks.maintenance.disk_pressure`; the VM only): the daemon reads the use of the
   persistent partition (the filesystem of `/usr/local`, which holds the install and Docker's
   volumes: used of used and available, as `df` counts it, the blocks reserved for root in
