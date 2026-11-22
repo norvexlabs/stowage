@@ -403,7 +403,7 @@ func (g *Gate) check(ctx context.Context) error {
 		return err
 	}
 	if st == "failed" {
-		return fmt.Errorf("%w: %s failed (journalctl -u %s -b tells why)", errBootFailed, unit, unit)
+		return fmt.Errorf("%w: %s", errBootFailed, bootFailure(ctx, g.Host, unit, in.R.Ctl()))
 	}
 	env, err := in.open()
 	if err != nil {
@@ -414,6 +414,53 @@ func (g *Gate) check(ctx context.Context) error {
 	}
 	return in.ready(ctx, env, g.Probe, &g.ps)
 }
+
+// bootFailure says why the boot unit failed in this boot: its run's error — the `error:` line its
+// installer printed last, with the lines a multi-line error goes on with, among its last
+// bootErrorLines lines (systemd's own lines left out), and, when it is an installer the run ran
+// that exited, that installer's own error just before it, read the same way — so the verdict, the
+// event journal and the failed boot's diagnostics carry it. Where the journal ends on no such line
+// (the run killed, or unread), where to read it.
+func bootFailure(ctx context.Context, host Tool, unit, ctl string) string {
+	out, _ := host.Run(ctx, Cmd{Args: []string{"journalctl", "--unit", unit, "--boot", "--identifier", ctl, "--no-pager", "--output", "cat", "--lines", strconv.Itoa(diagBootLines)}})
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	// errorBefore is the error that ends lines[:end]: its `error:` line among the last
+	// bootErrorLines, then the lines it goes on with; at its index, -1 for none.
+	errorBefore := func(end int) (at int, why string) {
+		for i := end - 1; i >= 0 && end-i <= bootErrorLines; i-- {
+			if w, ok := strings.CutPrefix(strings.TrimSpace(lines[i]), "error: "); ok && w != "" {
+				// Its lines go on to the next note or warning the run printed, no part of it.
+				for _, l := range lines[i+1 : end] {
+					if l = strings.TrimSpace(l); strings.HasPrefix(l, "warning: ") || strings.HasPrefix(l, "note: ") {
+						break
+					} else if l != "" {
+						w += " " + l
+					}
+				}
+				return i, w
+			}
+		}
+		return -1, ""
+	}
+	at, why := errorBefore(len(lines))
+	if at < 0 {
+		return fmt.Sprintf("%s failed (its journal, in the failed boot's diagnostics as boot.log, tells why)", unit)
+	}
+	if childExited.MatchString(why) {
+		if j, child := errorBefore(at); j >= 0 {
+			why += " (" + child + ")"
+		}
+	}
+	return fmt.Sprintf("%s failed: %s", unit, why)
+}
+
+// bootErrorLines bounds how far from the end of the boot unit's journal its run's error is read:
+// the lines a multi-line error spans.
+const bootErrorLines = 8
+
+// childExited is the error of a run whose installer it ran exited (childFailed), which printed its
+// own error before.
+var childExited = regexp.MustCompile(`exited with status \d+$`)
 
 // ready reports why the install is not ready, nil when it is: every service of the stack runs —
 // healthy when it has a healthcheck — or exited 0, and the health provider answers ready. ps, when

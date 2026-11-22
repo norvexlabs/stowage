@@ -31,6 +31,12 @@ import (
 // release, and the file carrying it.
 func bundledInstaller(t *testing.T, version string, revision int, mod func(*spec.Spec)) (*Release, string) {
 	t.Helper()
+	return bundledBy(t, version, revision, mod, "")
+}
+
+// bundledBy is bundledInstaller published by Stowage stowage ("": none recorded).
+func bundledBy(t *testing.T, version string, revision int, mod func(*spec.Spec), stowage string) (*Release, string) {
+	t.Helper()
 	root := testutil.CopyExample(t, "minimal")
 	p, err := project.Open(root, "")
 	if err != nil {
@@ -46,7 +52,7 @@ func bundledInstaller(t *testing.T, version string, revision int, mod func(*spec
 		images[k], configs[k], manifests[k] = digest, config, manifest
 	}
 	m := &release.Manifest{SchemaVersion: release.SchemaVersion, Name: "notes", ShortName: "notes", ProjectVersion: version, Revision: revision, Inputs: "sha256:os",
-		Scheme: release.Scheme{Provider: "semver"}, Artifacts: release.Artifacts{Images: images, Configs: configs, Manifests: manifests}}
+		Scheme: release.Scheme{Provider: "semver"}, Artifacts: release.Artifacts{Images: images, Configs: configs, Manifests: manifests}, StowageVersion: stowage}
 	man, err := m.EncodeBundled()
 	if err != nil {
 		t.Fatal(err)
@@ -352,6 +358,124 @@ func TestBootOnANewerOSUpgradesTheInstall(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(e.dir, PrevDir, prevState)); err != nil {
 		t.Errorf("the replaced release is not kept: %v", err)
+	}
+}
+
+// bootAdding boots, on an OS carrying 2.0.0, which adds the required SMTP_HOST, a VM installed at
+// 1.0.0 by an OS that Stowage built (its kept installer's), with stage written first as the upgrade
+// stages it (nothing when empty).
+func bootAdding(t *testing.T, stage, built string) (*env, error) {
+	t.Helper()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	_, keptExe := bundledBy(t, "1.0.0", 1, nil, built)
+	if err := testutil.WriteExecutable(filepath.Join(e.dir, "notes-stow"), []byte(read(t, keptExe))); err != nil {
+		t.Fatal(err)
+	}
+	old := e.r
+	e.r, e.self = bundledInstaller(t, "2.0.0", 1, func(s *spec.Spec) {
+		s.Inputs = append(s.Inputs, spec.Input{Key: "SMTP_HOST", Prompt: "Mail host", Required: true})
+	})
+	if stage != "" {
+		if err := os.WriteFile(stagedInputsFile(e.dir), []byte(stage), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	in := e.installer(vm)
+	// The install's own installer, run to bring 1.0.0 up first, ends its boot as every boot does.
+	in.O.Exec = func(context.Context, string, []string) error {
+		(&Installer{R: old, O: in.O}).dropStagedInputs()
+		return nil
+	}
+	return e, in.Boot(context.Background())
+}
+
+// The boot into a release takes the inputs the upgrade staged for it, then removes them.
+func TestBootGivesTheUpgradeTheInputsStagedForIt(t *testing.T) {
+	t.Parallel()
+	e, err := bootAdding(t, `{"release":"2.0.0 1","inputs":{"SMTP_HOST":"mail.example.org"}}`, stagedInputsSince)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if env := e.readEnv(); get(env, "STOWAGE_PROJECT_VERSION") != "2.0.0" || get(env, "SMTP_HOST") != "mail.example.org" {
+		t.Errorf("the install runs %s, SMTP_HOST %q", get(env, "STOWAGE_PROJECT_VERSION"), get(env, "SMTP_HOST"))
+	}
+	if _, err := os.Stat(stagedInputsFile(e.dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the staged inputs are left: %v", err)
+	}
+}
+
+// Without them its refusal names the upgrade's flags, on the VM. What was staged for another
+// release (left out, logged) is that release's boot's, and a file it cannot read is reported: both
+// stay, for the next upgrade to replace.
+func TestBootRefusesAnAddedInputTheUpgradeDidNotGive(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		stage, want, log string
+		stays            bool
+	}{
+		"none": {"", "missing required input(s) the release adds, which the upgrade did not give: SMTP_HOST (Mail host): " + vmGivesAdded(" --version 2.0.0"), "", false},
+		// The channel the upgrade was asked on, staged for its boot, is named again.
+		"its channel":     {`{"release":"2.0.0 1","channel":"beta"}`, "which the upgrade did not give: SMTP_HOST (Mail host): " + vmGivesAdded(" --channel beta --version 2.0.0"), "", false},
+		"another release": {`{"release":"3.0.0 1","inputs":{"SMTP_HOST":"mail"}}`, "which the upgrade did not give: SMTP_HOST", "holds what an upgrade gave release 3.0.0 1, not this OS's 2.0.0 1: left out", true},
+		"unreadable":      {`{"release":"2.0.0 1","given":{}}`, `unknown field "given"`, "", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e, err := bootAdding(t, c.stage, stagedInputsSince)
+			if err == nil || !strings.Contains(err.Error(), c.want) || !strings.Contains(e.log.String(), c.log) {
+				t.Fatalf("%v\n%s", err, e.log)
+			}
+			if v := get(e.readEnv(), "STOWAGE_PROJECT_VERSION"); v != "1.0.0" {
+				t.Errorf("the install runs %s", v)
+			}
+			if _, err := os.Stat(stagedInputsFile(e.dir)); (err == nil) != c.stays {
+				t.Errorf("the staged inputs: %v, want them kept %v", err, c.stays)
+			}
+		})
+	}
+}
+
+// On a VM whose OS (the one it goes back to) an earlier Stowage built, that OS's upgrade takes no
+// input: the boot's refusal says so, and names no flag it does not have.
+func TestTheBootsRefusalOnAnOldOSNamesNoFlag(t *testing.T) {
+	t.Parallel()
+	for built, old := range map[string]bool{"0.42.9": true, "": true, stagedInputsSince: false} {
+		_, err := bootAdding(t, "", built)
+		r, _ := Refusal(errors.Unwrap(err))
+		if err == nil || strings.Contains(err.Error(), "upgrade --version 2.0.0 --set") == old ||
+			strings.Contains(err.Error(), "whose upgrade gives no input: upgrade it first to a release built with Stowage 0.43.0 or later that requires none") != old {
+			t.Errorf("an OS built by %q: %v (fix %q)", built, err, r.Fix)
+		}
+	}
+}
+
+// A crossing (reset-db --new-baseline) takes no input on the VM: its refusal of one the release
+// adds names no fix, where the VM's upgrade names itself.
+func TestTheVMsMissingInputFixIsTheUpgradesAlone(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := bundledInstaller(t, "2.0.0", 1, func(s *spec.Spec) {
+		s.Inputs = append(s.Inputs, spec.Input{Key: "SMTP_HOST", Prompt: "Mail host", Required: true})
+	})
+	env, err := ReadEnvFile(filepath.Join(e.dir, envName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for vmUpgrade, c := range map[bool]struct{ why, fix string }{
+		true:  {"which the upgrade did not give: SMTP_HOST (Mail host): " + vmGivesAdded(""), vmGivesAdded("")},
+		false: {"missing required input(s) the release adds, which reset-db --new-baseline cannot give on the VM: SMTP_HOST (Mail host)", ""},
+	} {
+		in := &Installer{R: r2, O: e.installer(vm).O, vmUpgrade: vmUpgrade}
+		err := in.upgradeCheck(context.Background(), env, nil)
+		if r, ok := Refusal(err); !ok || r.Fix != c.fix || !strings.HasSuffix(err.Error(), c.why) {
+			t.Errorf("vmUpgrade %v: %v (fix %q)", vmUpgrade, err, r.Fix)
+		}
 	}
 }
 

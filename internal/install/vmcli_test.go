@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -791,6 +792,13 @@ func TestTheAppSocketRefusesTheOperatorsRoutes(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	if h.AppHandler().ServeHTTP(w, req); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "skip_backup is the operator's") {
 		t.Errorf("an app's upgrade without its backup: %d %s", w.Code, w.Body.String())
+	}
+	// So are the inputs an upgrade gives its boot: secrets the install records.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/v1/upgrade", strings.NewReader(`{"inputs": {"SMTP_HOST": "mail"}}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	if h.AppHandler().ServeHTTP(w, req); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "inputs are the operator's") {
+		t.Errorf("an app's upgrade giving inputs: %d %s", w.Code, w.Body.String())
 	}
 	// So is vouching for the order of a version the daemon cannot order: a refusal whose fix is the
 	// operator's command over SSH, with the request's version and channel. Without a version it is
@@ -1793,5 +1801,71 @@ func TestTheClientRefusesANeedsUnorderedVersionBeforeTheQuestion(t *testing.T) {
 	if asked, out, err := run("upgrade", "--version", "3.0.0"); err == nil || !strings.Contains(err.Error(), "is not one this VM, which runs 1.0.0 (revision 1), can be upgraded to") ||
 		strings.Contains(err.Error()+out, "--unordered added") || len(asked) != 0 || got != nil {
 		t.Errorf("not offered: %v, asked %q\n%s", err, asked, out)
+	}
+}
+
+// The upgrade sends the inputs --answers, --set and --set-file give (--set over --answers), for
+// the daemon to stage for the boot; an answers file's tls section is refused, as on Docker.
+func TestTheClientSendsTheInputsTheUpgradeGives(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	var got *UpgradeRequest
+	available, takes, installed := true, true, &Version{"1.0.0", 1}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/updates", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"2.0.0", 1}, Available: available, TakesInputs: takes, Installed: installed})
+	})
+	mux.HandleFunc("POST /v1/upgrade", func(w http.ResponseWriter, r *http.Request) {
+		got = &UpgradeRequest{}
+		_ = json.NewDecoder(r.Body).Decode(got)
+		reply(w, 200, UpgradePlan{To: Version{"2.0.0", 1}, Slot: "passive", Does: "upgrades the install"})
+	})
+	sock := servedHandler(t, mux)
+	run := func(args ...string) error {
+		var out bytes.Buffer
+		cmd := vmCommand(e.r, e.self, &out, &out, func(bool) Prompter { return nil }, clientTimes{unit: time.Millisecond})
+		cmd.SetArgs(append(append([]string{"upgrade", "--dry-run"}, args...), "--socket", sock))
+		return cmd.Execute()
+	}
+	dir := t.TempDir()
+	answers, cert, tls := filepath.Join(dir, "answers.yaml"), filepath.Join(dir, "ca.pem"), filepath.Join(dir, "tls.yaml")
+	for path, content := range map[string]string{answers: "SMTP_HOST: from-answers\nSMTP_PASSWORD: pw\n", cert: "PEM", tls: "SMTP_HOST: x\ntls:\n  mode: byo\n"} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := run(); err != nil || got == nil || got.Inputs != nil {
+		t.Fatalf("none: %v, sent %+v", err, got)
+	}
+	want := map[string]string{"SMTP_HOST": "from-set", "SMTP_PASSWORD": "pw", "CA_FILE": encodeFileInput([]byte("PEM"))}
+	if err := run("--answers", answers, "--set", "SMTP_HOST=from-set", "--set-file", "CA_FILE="+cert); err != nil || got == nil || !maps.Equal(got.Inputs, want) {
+		t.Fatalf("given: %v, sent %+v", err, got)
+	}
+	got = nil
+	if err := run("--answers", tls); err == nil || !strings.Contains(err.Error(), "its tls section gives the front's TLS settings") || got != nil {
+		t.Fatalf("a tls section: %v, sent %+v", err, got)
+	}
+	// An upgrade that takes no input: refused before the question, nothing sent.
+	got, takes = nil, false
+	if err := run("--set", "SMTP_HOST=x"); err == nil || !strings.Contains(err.Error(), "an upgrade to 2.0.0 (revision 1) takes no input") || got != nil {
+		t.Fatalf("takes no input: %v, sent %+v", err, got)
+	}
+	if err := run(); err != nil || got == nil {
+		t.Fatalf("takes no input, none given: %v, sent %+v", err, got)
+	}
+	// Before the first install, the settings give them: said as the daemon says it.
+	got, installed = nil, nil
+	if err := run("--set", "SMTP_HOST=x"); err == nil || !strings.Contains(err.Error(), "adds no input to the install: the first install takes its inputs from its settings") || got != nil {
+		t.Fatalf("before the first install: %v, sent %+v", err, got)
+	}
+	installed = &Version{"1.0.0", 1}
+	got, takes = nil, true
+	// Nothing to upgrade to: inputs given are refused, never taken as recorded; none, nothing to do.
+	available = false
+	if err := run("--set", "SMTP_HOST=x"); err == nil || !strings.Contains(err.Error(), "there is nothing to upgrade to, so no release takes the inputs given") || got != nil {
+		t.Fatalf("nothing to upgrade to: %v, sent %+v", err, got)
+	}
+	if err := run(); err != nil || got != nil {
+		t.Fatalf("nothing to upgrade to, no input: %v, sent %+v", err, got)
 	}
 }

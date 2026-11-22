@@ -476,6 +476,10 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			if unordered && version == "" {
 				return unorderedAlone("upgrade")
 			}
+			inputs, err := upgradeInputs(sets, setFiles, answers)
+			if err != nil {
+				return err
+			}
 			u, err := c.updates(ctx, channel, version)
 			if err != nil {
 				return err
@@ -496,11 +500,24 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 				return refused
 			}
 			if !u.Available {
+				// The inputs given would go nowhere: refused, so a script never takes them as recorded.
+				if inputs != nil {
+					return refuse("leave out --set, --set-file and --answers: a re-run of `install` changes a recorded input", "there is nothing to upgrade to, so no release takes the inputs given")
+				}
 				nothing = true
 				return nil
 			}
+			// The daemon would refuse them once asked: told before the question, as it tells it.
+			if inputs != nil && !u.TakesInputs {
+				if u.Installed == nil || u.Rewrite {
+					why := inputsNotTaken(u.Installed == nil)
+					return refuse("leave out the inputs: "+why, "an upgrade to %s adds no input to the install: %s", u.Target, why)
+				}
+				return refuse("upgrade without them, then give them by a re-run of `install` once it runs: an input it requires with no default fails the boot into it",
+					"an upgrade to %s takes no input: its boot takes none an upgrade gives (published by a Stowage before %s, or one it does not record)", u.Target, stagedInputsSince)
+			}
 			reboot := !noReboot
-			req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup, Unordered: unordered}
+			req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup, Unordered: unordered, Inputs: inputs}
 			// The daemon downloads the release's installer whole before it answers, when updates says
 			// it checks it.
 			checking := func() {
@@ -558,6 +575,9 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	uf := upgrade.Flags()
 	uf.StringVar(&channel, "channel", "", "the channel to upgrade on (default: the install's; before the first install, its settings')")
 	uf.StringVar(&version, "version", "", "this version's latest revision, not the channel's latest release")
+	uf.StringArrayVar(&sets, "set", nil, "an input the release adds, KEY=VALUE (repeatable): given to the boot into it")
+	uf.StringArrayVar(&setFiles, "set-file", nil, "a file input the release adds, KEY=PATH (repeatable): given to the boot into it")
+	uf.StringVar(&answers, "answers", "", "a YAML file of the inputs the release adds, KEY: value: given to the boot into it")
 	uf.BoolVarP(&yes, "yes", "y", false, "upgrade without asking")
 	uf.BoolVar(&noReboot, "no-reboot", false, "write the new OS but do not reboot (the next boot runs it)")
 	uf.BoolVar(&skipBackup, "skip-backup", false, "no backup first, though one is configured")

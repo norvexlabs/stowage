@@ -3,6 +3,31 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.43.0]
+
+### Added
+
+- The VM's `upgrade` gives the inputs the new release adds, as Docker's does: `--set`,
+  `--set-file` and `--answers`. The host daemon checks them as the boot into that release will
+  take them, stages them root-only for that boot, and the boot gives them to its upgrade, then
+  removes them. A release adding a required input with no default can now be upgraded to on a VM,
+  where its boot used to refuse and the health gate went back. A VM on an OS built with an earlier
+  Stowage first upgrades to a release built with this one that adds no required input.
+- A dry run of an upgrade to a release another Stowage published names what this host daemon's
+  rules would refuse in it, such as a required input the upgrade does not give.
+- The VM's `updates --json` says whether an upgrade to the release it offers takes the inputs that
+  release adds (`takes_inputs`): not when the VM's OS or that release was built with an earlier
+  Stowage, whose upgrade or boot takes none.
+
+### Fixed
+
+- A VM boot whose install failed carries the installer's own error in the health gate's verdict,
+  `status` and the failed boot's diagnostics (`<name>.service failed: <error>`), where it said only
+  that the unit failed, with a `journalctl -b` hint that no longer pointed at that boot once the
+  VM went back.
+- A VM boot refusing an upgrade for a required input the release adds names the fix that works
+  there (`upgrade --set`), not flags and an environment the boot does not take.
+
 ## [0.42.1] - 2026-11-22
 
 ### Fixed

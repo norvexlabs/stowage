@@ -1,7 +1,12 @@
 package install
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -41,7 +46,7 @@ func TestUpgradeRefusesWhatTheBootWouldBeforeWritingTheOS(t *testing.T) {
 	for name, c := range map[string]struct {
 		mod  func(*spec.Spec)
 		want string
-		fix  string // the VM's: none where the fix would be a flag of the upgrade, which takes none
+		fix  string // the VM's: none where the fix would be a flag the VM's upgrade does not take
 	}{
 		"a route on another's port": {docsRoute(8080), "notes 2.0.0 adds the route docs on port 8080, which app has", ""},
 		"a recorded input it declares as a file": {func(s *spec.Spec) {
@@ -50,7 +55,7 @@ func TestUpgradeRefusesWhatTheBootWouldBeforeWritingTheOS(t *testing.T) {
 		}, "ADMIN_EMAIL: notes 2.0.0 declares it as a file", "stay on the installed release: the project declares a changed input under a new key"},
 		"an input nothing gives": {func(s *spec.Spec) {
 			s.Inputs = append(s.Inputs, spec.Input{Key: "SMTP_HOST", Prompt: "Mail host", Required: true})
-		}, "missing required input(s), set by --set KEY=VALUE, the environment or --answers: SMTP_HOST (Mail host)", ""},
+		}, "missing required input(s) the release adds, which the upgrade did not give: SMTP_HOST (Mail host)", vmGivesAdded(onStable)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -85,15 +90,17 @@ func TestUpgradeOfAnotherStowagesReleaseLeavesItsValuesToTheBoot(t *testing.T) {
 	host := &fakeHost{}
 	hh := daemon(p.env, host).Handler()
 	const note = "2.0.0-1 was published by Stowage 9.9.9, and the host daemon is Stowage " + testStowage + "'s: the boot into it judges whether it takes the install's values, with its own rules, and on a refusal falls back to the release the install runs"
+	// The daemon's own rules, which would refuse the route, are said beside it.
+	const rules = "; the host daemon's rules would refuse it: notes 2.0.0 adds the route docs on port 8080, which app has"
 	var plan UpgradePlan
-	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true}, &plan); code != 200 || plan.Unchecked != note {
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true}, &plan); code != 200 || !strings.HasPrefix(plan.Unchecked, note+rules) {
 		t.Fatalf("%d %+v", code, plan)
 	}
 	no := false
 	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Reboot: &no}, nil); code != 202 {
 		t.Fatalf("%d", code)
 	}
-	if j := waitJob(t, hh); j.State != "done" || !slices.Contains(j.Log, note) || !strings.Contains(fmt.Sprint(host.calls()), "kairos-agent upgrade") {
+	if j := waitJob(t, hh); j.State != "done" || !slices.Contains(j.Log, plan.Unchecked) || !strings.Contains(fmt.Sprint(host.calls()), "kairos-agent upgrade") {
 		t.Fatalf("%+v %v", j, host.calls())
 	}
 }
@@ -119,6 +126,128 @@ func TestUpgradeWritesTheOSOfARouteTheBootAdds(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(filepath.Join(p.env.dir, NextDir+"-*")); len(left) > 0 {
 		t.Errorf("the fetched installer is left: %v", left)
+	}
+}
+
+// vmGivesAdded is the fix of a VM upgrade missing an input the release adds: the upgrade given
+// args (upgradeArgs).
+func vmGivesAdded(args string) string {
+	return "`sudo notes-stow upgrade" + args + " --set KEY=VALUE` (or --set-file KEY=PATH, --answers FILE) gives each to the boot into the release"
+}
+
+// onStable is the arguments of an upgrade to 2.0.0 asked on stable.
+const onStable = " --channel stable --version 2.0.0"
+
+// The inputs a release adds are given to the upgrade: judged as the boot takes them, then staged
+// root-only for that boot, never logged; a dry run stages nothing.
+func TestUpgradeStagesTheInputsTheReleaseAddsForItsBoot(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.releaseOf("2.0.0", func(s *spec.Spec) {
+		s.Inputs = append(s.Inputs, spec.Input{Key: "SMTP_HOST", Prompt: "Mail host", Required: true},
+			spec.Input{Key: "SMTP_PASSWORD", Prompt: "Mail password", Secret: true, Required: true})
+	})
+	host := &fakeHost{}
+	hh := daemon(p.env, host).Handler()
+	stagedAt := stagedInputsFile(p.env.dir)
+	const secret = "s3cret-mail-password"
+	for name, c := range map[string]struct {
+		inputs    map[string]string
+		want, fix string
+	}{
+		"one missing":      {map[string]string{"SMTP_HOST": "mail"}, "which the upgrade did not give: SMTP_PASSWORD (Mail password)", vmGivesAdded(onStable)},
+		"a recorded input": {map[string]string{"SMTP_HOST": "mail", "SMTP_PASSWORD": secret, "ADMIN_EMAIL": "x@example.org"}, "ADMIN_EMAIL: recorded at the install, and an upgrade keeps it", ""},
+		"an unknown input": {map[string]string{"SMTP_HOST": "mail", "SMTP_PASSWORD": secret, "NOPE": "x"}, "no input this release adds is named NOPE (it adds: SMTP_HOST, SMTP_PASSWORD)", "leave out NOPE"},
+	} {
+		var e errOf
+		if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true, Inputs: c.inputs}, &e); code != 409 || !e.Refused ||
+			!strings.Contains(e.Error, c.want) || !strings.Contains(e.Error, "(it is given only the inputs this upgrade gives)") || (c.fix != "" && e.Fix != c.fix) {
+			t.Errorf("%s: %d %s (fix %q)", name, code, e.Error, e.Fix)
+		}
+	}
+	given := map[string]string{"SMTP_HOST": "mail", "SMTP_PASSWORD": secret}
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true, Inputs: given}, nil); code != 200 {
+		t.Fatalf("dry run: %d", code)
+	}
+	if _, err := os.Stat(stagedAt); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a dry run staged the inputs: %v", err)
+	}
+	no := false
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Reboot: &no, Inputs: given}, nil); code != 202 {
+		t.Fatalf("%d", code)
+	}
+	j := waitJob(t, hh)
+	if j.State != "done" || strings.Contains(strings.Join(j.Log, "\n"), secret) {
+		t.Fatalf("%+v", j)
+	}
+	fi, err := os.Stat(stagedAt)
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("staged: %v %v", fi, err)
+	}
+	var st staged
+	if raw, err := os.ReadFile(stagedAt); err != nil || json.Unmarshal(raw, &st) != nil || st.Release != "2.0.0 1" || !maps.Equal(st.Inputs, given) {
+		t.Fatalf("staged %+v: %v", st, err)
+	}
+}
+
+// Inputs for a release whose boot does not read what an upgrade stages (published by a Stowage
+// before 0.43.0, other than the daemon's) are refused, nothing staged; from 0.43.0 they are taken.
+func TestUpgradeInputsNeedABootThatTakesThem(t *testing.T) {
+	t.Parallel()
+	for stowage, refused := range map[string]bool{"0.42.9": true, "": true, "0.43.0": false} {
+		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+		p.releaseOf("2.0.0", func(s *spec.Spec) {
+			s.Inputs = append(s.Inputs, spec.Input{Key: "SMTP_HOST", Prompt: "Mail host", Required: true})
+		}, func(m *release.Manifest) { m.StowageVersion = stowage })
+		hh := daemon(p.env, &fakeHost{}).Handler()
+		// updates says so first, for a program to tell before it gives any.
+		var u Update
+		if code := call(t, hh, "GET", "/v1/updates?channel=stable", nil, &u); code != 200 || u.TakesInputs == refused {
+			t.Errorf("published by Stowage %q: updates %d %+v", stowage, code, u)
+		}
+		// Without the input, the daemon's own rules name the way that works: the upgrade's flag where
+		// that release takes it, none where it does not.
+		if stowage != "" {
+			var plan UpgradePlan
+			call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true}, &plan)
+			if strings.Contains(plan.Unchecked, "upgrade --channel stable --version 2.0.0 --set") == refused ||
+				strings.Contains(plan.Unchecked, "whose boot takes no input an upgrade gives: it is reached only by a release that requires none") != refused {
+				t.Errorf("published by Stowage %q, no input: %q", stowage, plan.Unchecked)
+			}
+		}
+		var e errOf
+		code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true, Inputs: map[string]string{"SMTP_HOST": "mail"}}, &e)
+		if got := code == 409 && e.Refused && strings.Contains(e.Error, "whose boot takes no input an upgrade gives: nothing is staged"); got != refused || (!refused && code != 200) {
+			t.Errorf("published by Stowage %q: %d %s", stowage, code, e.Error)
+		}
+	}
+}
+
+// The upgrade's body may carry a file input's content: up to maxSecretsFile and 64 KiB, and a
+// byte over it is a 413.
+func TestTheUpgradesBodyIsBounded(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	hh := daemon(p.env, &fakeHost{}).Handler()
+	const limit = maxSecretsFile + 64<<10
+	body := func(n int) string {
+		head, tail := `{"dry_run":true,"inputs":{"K":"`, `"}}`
+		return head + strings.Repeat("x", n-len(head)-len(tail)) + tail
+	}
+	// The client refuses inputs past what one request carries, before it asks.
+	// Measured as sent: JSON escapes "<" to 6 bytes.
+	if _, err := upgradeInputs([]string{"K=" + strings.Repeat("<", maxSecretsFile/6+1)}, nil, ""); err == nil || !strings.Contains(err.Error(), "over the 1048576 an upgrade carries") {
+		t.Errorf("inputs past the cap: %v", err)
+	}
+	if _, err := upgradeInputs([]string{"K=" + strings.Repeat("x", maxSecretsFile-len(`{"K":""}`))}, nil, ""); err != nil {
+		t.Errorf("inputs at the cap: %v", err)
+	}
+	for n, over := range map[int]bool{limit: false, limit + 1: true} {
+		w := httptest.NewRecorder()
+		hh.ServeHTTP(w, httptest.NewRequest("POST", "/v1/upgrade", strings.NewReader(body(n))))
+		if (w.Code == http.StatusRequestEntityTooLarge) != over {
+			t.Errorf("a body of %d bytes: %d %s", n, w.Code, w.Body.String())
+		}
 	}
 }
 
@@ -162,6 +291,21 @@ func TestUpgradeAcrossABaselineHintsUnorderedUnderACommandScheme(t *testing.T) {
 	var e errOf
 	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Version: "2.0.0", Unordered: true}, &e); code != 409 ||
 		!strings.Contains(e.Error, "`sudo notes-stow reset-db --new-baseline --channel stable --version 2.0.0 --unordered` wipes it and installs 2.0.0") {
+		t.Fatalf("%d %s (fix %q)", code, e.Error, e.Fix)
+	}
+}
+
+// Under a `command` scheme the upgrade's fix for an input the release adds names --unordered, as
+// its --version needs it, though the upgrade was the channel's.
+func TestTheAddedInputFixIsUnorderedUnderACommandScheme(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.releaseOf("2.0.0", func(s *spec.Spec) {
+		s.Inputs = append(s.Inputs, spec.Input{Key: "SMTP_HOST", Prompt: "Mail host", Required: true})
+	}, commandScheme)
+	var e errOf
+	if code := call(t, daemon(p.env, &fakeHost{}).Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true}, &e); code != 409 ||
+		e.Fix != vmGivesAdded(onStable+" --unordered") {
 		t.Fatalf("%d %s (fix %q)", code, e.Error, e.Fix)
 	}
 }
@@ -279,6 +423,10 @@ func TestTheDaemonResetsToANewBaselineByItsOS(t *testing.T) {
 	if planned == 0 {
 		t.Fatal("the plan read no installer")
 	}
+	// What an earlier upgrade staged was for the OS the crossing's replaces: removed.
+	if err := os.WriteFile(stagedInputsFile(p.env.dir), []byte(`{"release":"1.5.0 1","inputs":{"K":"v"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if code := call(t, hh, "POST", "/v1/reset-db", ResetRequest{Confirm: &plan.Target, Token: plan.Token, NewBaseline: true, Channel: "stable"}, &e); code != 202 {
 		t.Fatalf("%d %s", code, e.Error)
 	}
@@ -293,6 +441,9 @@ func TestTheDaemonResetsToANewBaselineByItsOS(t *testing.T) {
 	mark := newBaselineFile(p.env.dir)
 	if raw, err := os.ReadFile(mark); err != nil || strings.TrimSpace(string(raw)) != "2.0.0 1" {
 		t.Fatalf("mark %q %v (job %+v)", raw, err, j)
+	}
+	if _, err := os.Stat(stagedInputsFile(p.env.dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("an upgrade's staged inputs outlive the crossing: %v", err)
 	}
 	if n := len(p.env.docker.ran("volume rm")); n != 0 {
 		t.Errorf("wiped before the boot into the new release")
@@ -411,6 +562,12 @@ func TestAnUpgradeToTheReleaseTheInstallRunsIsNoCrossing(t *testing.T) {
 	hh := daemon(p.env, host).Handler()
 	no := false
 	var e errOf
+	// It adds no input: a re-run changes one.
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Reboot: &no, Inputs: map[string]string{"SMTP_HOST": "mail"}}, &e); code != 409 || !e.Refused ||
+		!strings.Contains(e.Error, "adds no input to the install: the install runs it already") {
+		t.Fatalf("inputs: %d %+v", code, e)
+	}
+	e = errOf{}
 	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Reboot: &no}, &e); code != 202 {
 		t.Fatalf("%d %s", code, e.Error)
 	}

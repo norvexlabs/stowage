@@ -298,9 +298,17 @@ type Installer struct {
 	nothing, delegated bool
 	// crossing makes Upgrade cross a schema baseline, wiping the data (reset-db --new-baseline).
 	crossing *crossing
-	// givenNothing: the run takes no flag, input or answer — the VM's upgrade, which its daemon
-	// checks (upgradeCheck) and its boot runs (Upgrade) — so a refusal's fix names none (flagFix).
+	// givenNothing: the run takes no flag, input or answer of its own — the VM's upgrade, which its
+	// daemon checks (upgradeCheck) and its boot runs (Upgrade), and the VM's crossing (reset-db
+	// --new-baseline) — so a refusal's fix names none (flagFix), but an input's on vmUpgrade.
 	givenNothing bool
+	// vmUpgrade: the run is the VM's upgrade, whose `upgrade` gives the inputs the release adds to
+	// the boot into it (--set, --set-file, --answers): a refusal of one names that command, with
+	// vmUpgradeArgs (upgradeArgs: the release it reaches); unless vmNoInputs says why that upgrade
+	// can give none (the release's boot, or the OS the VM goes back to, built before
+	// stagedInputsSince), which the refusal says instead.
+	vmUpgrade                 bool
+	vmUpgradeArgs, vmNoInputs string
 	// seeding: the run is vm seed's, whose refusal of a secret input on its command line says a
 	// seed carries none (seedRefusal), where vm create's names its own way, and whose --tls byo
 	// awaits its certificate over SSH (awaitOverSSH).
@@ -3223,7 +3231,7 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 		}
 	}
 	if len(bad) > 0 {
-		return nil, refusal("give each a value its input accepts", errors.New(strings.Join(bad, "; ")))
+		return nil, in.valueRefusal(bad)
 	}
 	defaults := func(answers map[string]string) map[string]string {
 		values, _ := in.resolve(list, given, answers)
@@ -3262,7 +3270,19 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 		}
 	}
 	if len(missing) > 0 {
-		return nil, refuse(in.flagFix("give each with --set KEY=VALUE, --set-file KEY=PATH or --answers"), "missing required input(s), set by --set KEY=VALUE, the environment or --answers: %s", strings.Join(missing, "; "))
+		if in.givenNothing {
+			// On the VM the boot takes what the upgrade staged, and nothing else; a crossing takes
+			// nothing.
+			switch up := in.vmUpgradeWith("--set KEY=VALUE"); {
+			case up != "":
+				fix := up + " (or --set-file KEY=PATH, --answers FILE) gives each to the boot into the release"
+				return nil, refuse(fix, "missing required input(s) the release adds, which the upgrade did not give: %s: %s", strings.Join(missing, "; "), fix)
+			case in.vmUpgrade:
+				return nil, refuse("", "missing required input(s) the release adds, which the upgrade did not give: %s: %s", strings.Join(missing, "; "), in.vmNoInputs)
+			}
+			return nil, refuse("", "missing required input(s) the release adds, which reset-db --new-baseline cannot give on the VM: %s", strings.Join(missing, "; "))
+		}
+		return nil, refuse("give each with --set KEY=VALUE, --set-file KEY=PATH or --answers", "missing required input(s), set by --set KEY=VALUE, the environment or --answers: %s", strings.Join(missing, "; "))
 	}
 	for _, i := range list {
 		if i.check == nil {
@@ -3273,7 +3293,7 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 		}
 	}
 	if len(bad) > 0 {
-		return nil, refusal("give each a value its input accepts", errors.New(strings.Join(bad, "; ")))
+		return nil, in.valueRefusal(bad)
 	}
 	return values, nil
 }

@@ -573,6 +573,7 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 	// a mark (a removal that found none changed nothing).
 	mutated, touched := true, false
 	defer afterChange(&mutated, &err)
+	defer in.dropStagedInputs()
 	o := &in.O
 	if _, err := os.Stat(filepath.Join(o.Dir, envName)); errors.Is(err, os.ErrNotExist) {
 		return in.firstBoot(ctx, cmp.Or(o.Settings, SettingsFile(in.R.Spec.Name)))
@@ -614,7 +615,8 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 		}
 		return errors.Join(cerr, in.Install(ctx))
 	}
-	if _, err := in.keptInstaller(ctx, name, cur, rev); err != nil {
+	kept, err := in.keptInstaller(ctx, name, cur, rev)
+	if err != nil {
 		return err
 	}
 	switch {
@@ -651,6 +653,23 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 	o.logf("the install runs %s %s (revision %s); this OS carries %s (revision %d): upgrading", name, cur, rev, m.ProjectVersion, m.Revision)
 	if err := childFailed(in.ctl(), o.exec(ctx, in.ctl(), []string{bootCmd, "--dir", o.Dir})); err != nil {
 		return fmt.Errorf("bringing %s %s up before the upgrade: %w", name, cur, err)
+	}
+	// What the upgrade gave for this release's boot is given to it, as Docker's upgrade takes --set.
+	var channel string
+	if o.Set, channel, err = in.stagedInputs(); err != nil {
+		return err
+	}
+	// A refusal names, in its reason (printed alone here), the upgrade the OS the VM goes back to
+	// runs that reaches this release again, on the channel it was asked on; that OS's `upgrade`
+	// gives no input when an earlier Stowage built it.
+	in.vmUpgrade = true
+	in.vmUpgradeArgs = upgradeArgs(channel, m.ProjectVersion, needsUnordered(m, cur))
+	built := ""
+	if kept.Manifest != nil {
+		built = kept.Manifest.StowageVersion
+	}
+	if !stagedInputsBy(built, StowageVersion) {
+		in.vmNoInputs = fmt.Sprintf("the OS the VM goes back to was built with Stowage %s, whose upgrade gives no input: upgrade it first to a release built with Stowage %s or later that requires none", cmp.Or(built, "of no recorded version"), stagedInputsSince)
 	}
 	return in.Upgrade(ctx)
 }

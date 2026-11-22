@@ -13,14 +13,15 @@ import (
 )
 
 // upgradeCheck runs, against the install env records, what an upgrade to this installer's release
-// decides before it changes anything, as the VM's boot runs it: given no input, asking nothing.
-// The release must be this project's, its front one the install keeps (upgradeFits), and every
-// input it adds must take a value without being given one, so each route it adds has its domain
-// (upgradeRoutes), and its services' whole cores fit this host (coresUpgrade). It reads and writes
-// nothing but env.
-func (in *Installer) upgradeCheck(ctx context.Context, env *EnvFile) error {
+// decides before it changes anything, as the VM's boot runs it: given the inputs the upgrade
+// stages for that boot (given, which may be empty) and nothing else, asking nothing. The release
+// must be this project's, its front one the install keeps (upgradeFits); given must name only
+// inputs it adds (onlyAdded), and every input it adds must take a value, so each route it adds has
+// its domain (upgradeRoutes), and its services' whole cores fit this host (coresUpgrade). It reads
+// and writes nothing but env.
+func (in *Installer) upgradeCheck(ctx context.Context, env *EnvFile, given map[string]string) error {
 	o := &in.O
-	o.Set, o.Answers, o.Ports, o.Prompt = nil, nil, nil, nil
+	o.Set, o.Answers, o.Ports, o.Prompt = given, nil, nil, nil
 	in.givenNothing = o.Preloaded
 	o.Getenv = func(string) string { return "" } // the boot's environment gives no input either
 	if err := in.R.checkFront(); err != nil {
@@ -38,6 +39,9 @@ func (in *Installer) upgradeCheck(ctx context.Context, env *EnvFile) error {
 		return err
 	}
 	added := in.addedInputs(env, mode)
+	if err := in.onlyAdded(env, added); err != nil {
+		return err
+	}
 	in.recorded = map[string]string{}
 	for _, k := range env.Keys() {
 		in.recorded[k], _ = env.Get(k)
@@ -71,8 +75,10 @@ func checksTarget(first, rewrite bool, env *EnvFile, m *release.Manifest) bool {
 // targetRelease reads it. An upgrade across a schema baseline is always refused (reset-db
 // --new-baseline crosses it); the install's values are judged as valuesCheck judges them, and what
 // it leaves to the boot is answered (empty when nothing). channel is the one the upgrade was asked
-// with ("" for the install's), which the crossing's hint names again. Asked only when checksTarget.
-func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m *release.Manifest, channel string) (string, error) {
+// with ("" for the install's), which the crossing's hint names again; args the upgrade's
+// (upgradeArgs), which a refusal's fix names; given the inputs the upgrade stages for the boot
+// into m. Asked only when checksTarget.
+func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m *release.Manifest, channel, args string, given map[string]string) (string, error) {
 	name, v, rev := runs(env)
 	// The data is at the baseline of the release the install runs: the OS's, or — after a
 	// crossing whose boot fell back — the later one its own installer carries.
@@ -105,16 +111,27 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 		}
 		return "", failAs(http.StatusConflict, baselineRefused("stay on this release, or cross to it with its data wiped (reset-db --new-baseline)", m, to, fmt.Sprintf("the install runs %s %s", m.Name, v), from, way+"; its OS is not written"))
 	}
-	return h.valuesCheck(ctx, in, env, m, k, "this upgrade")
+	return h.valuesCheck(ctx, in, env, m, k, "this upgrade", args, given)
 }
 
 // valuesCheck judges the install's values against target release m, as its installer carries it
-// (k), the way the boot into m takes them (upgradeCheck) — only when m was published by the
-// Stowage that built this daemon, whose rules are then the boot's. Otherwise, or when this Stowage
-// does not read m's spec, it judges nothing and answers why, logged: the boot into m judges, with
-// its own rules, and falls back to the release the install runs on a refusal. what names the run a
-// refusal stops ("this upgrade", "it").
-func (h *Hostd) valuesCheck(ctx context.Context, in *Installer, env *EnvFile, m *release.Manifest, k *keptRelease, what string) (string, error) {
+// (k), the way the boot into m takes them (upgradeCheck), given the inputs the run stages for that
+// boot (given) — only when m was published by the Stowage that built this daemon, whose rules are
+// then the boot's. Otherwise, or when this Stowage does not read m's spec, it refuses nothing and
+// answers why, logged: the boot into m judges, with its own rules, and falls back to the release
+// the install runs on a refusal; where it reads m's spec, what this Stowage's rules would refuse is
+// answered with it, so a dry run names it. what names the run a refusal stops ("this upgrade",
+// "it"); upgrade, when that run is an upgrade, its arguments (upgradeArgs), with which a refusal
+// of an input the release adds names `upgrade --set` (vmUpgrade) — or says why it gives none, when
+// m's boot does not take what an upgrade stages.
+func (h *Hostd) valuesCheck(ctx context.Context, in *Installer, env *EnvFile, m *release.Manifest, k *keptRelease, what, upgrade string, given map[string]string) (string, error) {
+	check := func() error {
+		c := &Installer{R: k.Release, O: in.O, vmUpgrade: upgrade != "", vmUpgradeArgs: upgrade}
+		if c.vmUpgrade && !h.takesStaged(m) {
+			c.vmNoInputs = fmt.Sprintf("%s was published by Stowage %s, whose boot takes no input an upgrade gives: it is reached only by a release that requires none", m.Tag, cmp.Or(m.StowageVersion, "of no recorded version"))
+		}
+		return c.upgradeCheck(ctx, env, given)
+	}
 	note := ""
 	switch {
 	case k.Release == nil:
@@ -124,12 +141,21 @@ func (h *Hostd) valuesCheck(ctx context.Context, in *Installer, env *EnvFile, m 
 	}
 	if note != "" {
 		note += ": the boot into it judges whether it takes the install's values, with its own rules, and on a refusal falls back to the release the install runs"
+		if k.Release != nil {
+			if err := check(); err != nil {
+				note += fmt.Sprintf("; the host daemon's rules would refuse it: %v", err)
+			}
+		}
 		h.O.logf("%s", note)
 		return note, nil
 	}
-	if err := (&Installer{R: k.Release, O: in.O}).upgradeCheck(ctx, env); err != nil {
+	if err := check(); err != nil {
 		// A refusal stays one, with the fix it was raised with on the VM (or none).
-		return "", failAs(http.StatusConflict, fmt.Errorf("%w\nthe boot into %s would refuse %s (it is given no input), so its OS is not written", err, m.Tag, what))
+		gets := "it is given no input"
+		if len(given) > 0 {
+			gets = "it is given only the inputs this upgrade gives"
+		}
+		return "", failAs(http.StatusConflict, fmt.Errorf("%w\nthe boot into %s would refuse %s (%s), so its OS is not written", err, m.Tag, what, gets))
 	}
 	return "", nil
 }

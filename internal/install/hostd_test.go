@@ -55,6 +55,8 @@ type fakeHost struct {
 	// calendarErr fails systemd-analyze calendar; noTimer: systemd has no backup timer.
 	calendarErr error
 	noTimer     bool
+	// journal is what journalctl prints, when set.
+	journal string
 }
 
 // waitCall waits for h to run a command whose arguments read call, failing the test when it never
@@ -160,6 +162,9 @@ func (f *fakeHost) Run(ctx context.Context, c Cmd) ([]byte, error) {
 		}
 		return nil, nil
 	case "journalctl":
+		if f.journal != "" {
+			return []byte(f.journal), nil
+		}
 		return []byte("the boot's journal\n"), nil
 	case "systemd-analyze":
 		return nil, f.calendarErr
@@ -1225,10 +1230,23 @@ func TestAnUpgradeBeforeTheFirstInstall(t *testing.T) {
 	}
 	unlock()
 	no := false
+	// The first install takes its inputs from its settings.
+	e = errOf{}
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Reboot: &no, Inputs: map[string]string{"SMTP_HOST": "mail"}}, &e); code != 409 || !e.Refused ||
+		!strings.Contains(e.Error, "notes 1.0.0 (revision 2) adds no input to the install: the first install takes its inputs from its settings") {
+		t.Fatalf("inputs: %d %+v", code, e)
+	}
+	// What an earlier upgrade staged, whose OS never booted, is not this one's.
+	if err := os.WriteFile(stagedInputsFile(p.env.dir), []byte(`{"release":"0.9.0 1","inputs":{"K":"v"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Reboot: &no}, nil); code != 202 {
 		t.Fatalf("%d", code)
 	}
 	j := waitJob(t, hh)
+	if _, err := os.Stat(stagedInputsFile(p.env.dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("an earlier upgrade's inputs are left: %v", err)
+	}
 	if log := strings.Join(j.Log, "\n"); j.State != "done" || !strings.Contains(log, "the next boot runs it and makes the first install") || strings.Contains(log, "backup") {
 		t.Fatalf("%+v", j)
 	}

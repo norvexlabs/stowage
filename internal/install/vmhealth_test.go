@@ -453,8 +453,56 @@ func TestAFailedBootFailsTheGateAtOnce(t *testing.T) {
 	g.gate.Unit = time.Hour // waiting would never end
 	g.host.boot = "failed"
 	err := g.gate.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "notes.service failed") || !g.rebooted() {
+	if err == nil || !strings.Contains(err.Error(), "notes.service failed (its journal, in the failed boot's diagnostics as boot.log, tells why)") || !g.rebooted() {
 		t.Fatalf("%v, rebooted %v", err, g.rebooted())
+	}
+}
+
+// The boot's own error, the last its installer printed, is the gate's reason, kept with the
+// failed boot's diagnostics.
+func TestAFailedBootsErrorIsTheGatesReason(t *testing.T) {
+	t.Parallel()
+	g := newGate(t, "active", onTrial, true)
+	g.host.boot = "failed"
+	g.host.journal = "the install runs notes 1.0.0 (revision 1); this OS carries 2.0.0 (revision 1): upgrading\nerror: an earlier error\nnotes 1.0.0 is running\nerror: missing required input(s) the release adds, which the upgrade did not give: SMTP_HOST\n"
+	const want = "notes.service failed: missing required input(s) the release adds, which the upgrade did not give: SMTP_HOST"
+	if err := g.gate.Run(context.Background()); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("%v", err)
+	}
+	dirs, _ := filepath.Glob(filepath.Join(g.dir, FailedBootsDir, "*", failedBootFile))
+	if len(dirs) != 1 || !strings.Contains(read(t, dirs[0]), want) {
+		t.Errorf("diagnostics %v", dirs)
+	}
+}
+
+// The unit's own error is read from its installer's lines: a multi-line one whole; the error of
+// an installer it ran that exited beside the run's; none when the journal does not end on one.
+func TestABootFailureIsTheErrorTheInstallerEndedOn(t *testing.T) {
+	t.Parallel()
+	const generic = "notes.service failed (its journal, in the failed boot's diagnostics as boot.log, tells why)"
+	for name, c := range map[string]struct{ journal, want string }{
+		"multi-line": {"upgrading\nerror: route docs on port 8080\nthe boot into 2.0.0-1 would refuse it\n", "notes.service failed: route docs on port 8080 the boot into 2.0.0-1 would refuse it"},
+		"a child's":  {"error: port 443 is taken\nerror: bringing notes 1.0.0 up before the upgrade: /usr/local/notes/notes-stow exited with status 1\n", "notes.service failed: bringing notes 1.0.0 up before the upgrade: /usr/local/notes/notes-stow exited with status 1 (port 443 is taken)"},
+		"a multi-line child's": {"error: route docs on port 8080\nthe boot into 2.0.0-1 would refuse it\nerror: bringing notes 1.0.0 up before the upgrade: /x/notes-stow exited with status 3\n",
+			"notes.service failed: bringing notes 1.0.0 up before the upgrade: /x/notes-stow exited with status 3 (route docs on port 8080 the boot into 2.0.0-1 would refuse it)"},
+		// A warning the run prints after the child's error is no part of it.
+		"a warning after": {"error: port 443 is taken\nnote: X: kept\nwarning: removing /x: denied\nerror: bringing notes 1.0.0 up before the upgrade: /x/notes-stow exited with status 1\n",
+			"notes.service failed: bringing notes 1.0.0 up before the upgrade: /x/notes-stow exited with status 1 (port 443 is taken)"},
+		// A child that printed no error of its own gets none from further back.
+		"a silent child": {"error: an earlier run's\n" + strings.Repeat("waiting\n", bootErrorLines) + "panic: x\nerror: bringing notes 1.0.0 up before the upgrade: /x/notes-stow exited with status 2\n",
+			"notes.service failed: bringing notes 1.0.0 up before the upgrade: /x/notes-stow exited with status 2"},
+		"killed": {"error: a hook's retry\n" + strings.Repeat("waiting for the database\n", bootErrorLines), generic},
+		// The bound's other side: an error with the lines it goes on with, all in reach.
+		"in reach": {"error: a long one\n" + strings.Repeat("on\n", bootErrorLines-1), "notes.service failed: a long one" + strings.Repeat(" on", bootErrorLines-1)},
+		"none":     {"the boot's journal\n", generic},
+	} {
+		h := &fakeHost{journal: c.journal}
+		if got := bootFailure(context.Background(), h, "notes.service", "notes-stow"); got != c.want {
+			t.Errorf("%s: %q, want %q", name, got, c.want)
+		}
+		if calls := fmt.Sprint(h.calls()); !strings.Contains(calls, "--identifier notes-stow") {
+			t.Errorf("%s: read %s", name, calls)
+		}
 	}
 }
 

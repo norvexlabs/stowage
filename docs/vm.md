@@ -29,7 +29,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
 <short>-stow restart|stop|start SERVICE
 <short>-stow provision [--set KEY=VALUE]…   # the provision hook again; --set as on Docker (an input only it reads, or a value it returned or declares it returns; empty forgets it)
 <short>-stow updates [--channel C] [--version V] [--json]
-<short>-stow upgrade [--channel C] [--version V] [--yes] [--no-reboot] [--skip-backup] [--dry-run] [--unordered] [--accessible] [--json]   # ends at the reboot it schedules: status and events after it tell how it went
+<short>-stow upgrade [--channel C] [--version V] [--set KEY=VALUE] [--set-file KEY=PATH] [--answers FILE] [--yes] [--no-reboot] [--skip-backup] [--dry-run] [--unordered] [--accessible] [--json]   # ends at the reboot it schedules: status and events after it tell how it went
 <short>-stow rollback [--yes] [--dry-run] [--accessible] [--json]   # reboot into the passive system: back to the release the last upgrade replaced; ends at that reboot
 <short>-stow reset-db [--yes] [--no-provision] [--accessible]   # wipe the data, start again as first installed
           [--new-baseline [--channel C] [--version V [--unordered]]]   # instead: a later release at another schema baseline, its OS written and booted, that boot wiping the data
@@ -202,10 +202,13 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   release, to one published without an OS bundle, to one the install went back from, to one at
   another schema baseline, to one the boot into it would refuse (the boot's refusal, `…\nthe
   boot into <tag> would refuse this upgrade (it is given no input), so its OS is not written`,
-  with the fix it has on the VM: a re-run of the install for what the install records —
-  `sudo <short>-stow install --tls MODE`, `--set <input>=<domain>`, or `--cert FILE --key FILE`
-  for a certificate that covers a route the release adds —, none where the Docker fix is a flag
-  of the upgrade, such as a port or an input the release adds), and while a restore left the
+  or `(it is given only the inputs this upgrade gives)` when it gives some, with the fix it has
+  on the VM: a re-run of the install for what the install records — `sudo <short>-stow install
+  --tls MODE`, `--set <input>=<domain>`, or `--cert FILE --key FILE` for a certificate that covers
+  a route the release adds —; for a required input the release adds that the upgrade does not
+  give, ``sudo <short>-stow upgrade [--channel C] --version <v> [--unordered] --set KEY=VALUE` (or --set-file KEY=PATH, --answers FILE)
+  gives each to the boot into the release``; none where the Docker fix is a flag the VM's upgrade
+  does not take, such as a port), and while a restore left the
   volumes half restored; an upgrade of an install whose kept `<short>-stow` is not the installer
   of the release it runs (another release's or revision's, none it reads, or none at all),
   whatever the order of that release and the OS's (`<dir>/<short>-stow is not the installer of
@@ -251,7 +254,14 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `<name>.service` did not fail, the install runs the release this OS carries, and it is ready (as
   `health` judges). Healthy, a boot on trial is marked good (both cleared, the partition
   remounted read-write meanwhile); a failure to mark it fails the gate, as the next boot would
-  fall back. Not healthy by the deadline (at once when `<name>.service` failed), the gate keeps
+  fall back. When `<name>.service` failed, the reason is the error its installer ended on in
+  this boot (`<name>.service failed: <error>`, read from the installer's own lines of the unit's
+  journal: an `error:` line among their last 8, with the lines it goes on with; when it is an
+  installer the boot ran that exited, `… exited with status N (<that installer's error>)`), or,
+  when they end on none (the run killed, or the journal unread), `<name>.service failed (its
+  journal, in the failed boot's diagnostics as boot.log, tells why)`: the verdict, `status` and
+  `failed-boot.json` carry it. Not healthy by the deadline (at once when
+  `<name>.service` failed), the gate keeps
   diagnostics in `/usr/local/<name>/failed-boots/<N>-<version>-r<revision>/`, `<N>` (six digits)
   one past the last one kept, whatever the clock says
   (`failed-boot.json` — the release, the time, why —, `boot.log`, the boot unit's journal of this
@@ -374,19 +384,85 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   and `--unordered` after `<v>` when that release is under a `command` scheme and `<v>` is not the
   version of the release the install runs; the same words as Docker's and Kubernetes' refusal).
   When the release was published by the Stowage the host daemon was built with, it also checks the
-  upgrade's front and inputs as the boot would, given no input: a route it could not decide, or an
-  input the release adds that is required with no default, is refused then (the L4 routes' ports
-  are still the boot's to check) (409: `<why>\nthe boot into <tag> would refuse this upgrade (it
-  is given no input), so its OS is not written`), rather than by a boot that would fall back. A
+  upgrade's front and inputs as the boot would, given only the inputs the upgrade gives (below): a
+  route it could not decide, an input the release adds that is required with no default and not
+  given, or a given input the release does not add, is refused then (the L4 routes' ports are
+  still the boot's to check) (409: `<why>\nthe boot into <tag> would refuse this upgrade (it is
+  given no input), so its OS is not written`, or `(it is given only the inputs this upgrade
+  gives)` when it gives some), rather than by a boot that would fall back. A
   release another Stowage published, or whose spec this daemon's Stowage does not read, is left to
   the boot into it, which judges with its own rules and falls back on a refusal; the daemon logs
   why and answers it — the dry run's `unchecked` (printed `not checked here: …`), the job's log
   (`<tag> was published by Stowage <s>, and the host daemon is Stowage <s'>'s: the boot into it
   judges whether it takes the install's values, with its own rules, and on a refusal falls back to
   the release the install runs`; or `the installer of <tag> carries a spec this Stowage does not
-  read (…): …`), its baseline checked all the same. An installer that cannot be fetched is a 502
+  read (…): …`), its baseline checked all the same. When this Stowage reads that spec, what its own
+  rules would refuse follows (`; the host daemon's rules would refuse it: <why>`), so a dry run
+  names, say, an added input the upgrade does not give; the boot's rules decide. An installer that cannot be fetched is a 502
   (`the installer of <tag>: …`). An upgrade removes the mark a `reset-db
   --new-baseline` left whose OS never booted (`/usr/local/<name>.new-baseline`, below).
+  The inputs the release adds are given to `upgrade` as on Docker: `--set KEY=VALUE`,
+  `--set-file KEY=PATH` (a file input's file) and `--answers FILE` (`KEY: value`, or `KEY: {file:
+  PATH}`; `--set` and `--set-file` win over it; a `tls` section is refused, as the upgrade keeps
+  what the install records), read by `<short>-stow` on the VM and sent with the request
+  (`inputs`, `KEY: value`, a file's content as the install records it; the request body may then
+  be up to 1 MiB and 64 KiB; inputs over 1 MiB as sent are refused before the daemon is asked,
+  `the inputs given are N bytes, over the 1048576 an upgrade carries`, fix: give the upgrade
+  those the release requires, the rest by a re-run of `install` once it runs). When `updates`
+  says the upgrade takes no input, inputs given are refused before the question, as the daemon
+  would: before the first install or for a rewrite, `an upgrade to <v> (revision <r>) adds no
+  input to the install: …` (as below); else `an upgrade to <v> (revision <r>) takes no input: its
+  boot takes none an upgrade gives (published by a Stowage before 0.43.0, or one it does not
+  record)`. Only the inputs the release adds are taken: a recorded one is
+  refused (`KEY: recorded at the install, and an upgrade keeps it …`, a re-run of `install`
+  changes it), one it does not add too (`no input this release adds is named KEY (it adds: …)`),
+  as the boot into it would refuse them. The app socket refuses `inputs` (403, `inputs are the
+  operator's: upgrade --set, --set-file or --answers over SSH`), and so does an upgrade that does
+  not move the install to another release (409, `<name> <v> (revision <r>) adds no input to the
+  install: …` — before the first install, which takes its inputs from its settings, `vm create
+  --set`; to the release the install runs; or a rewrite). The job stages them, before
+  `kairos-agent` runs, in `/usr/local/<name>.os-upgrade-inputs` (root's alone, mode 0600, with the
+  release they are for and the `--channel` the upgrade was asked on; never logged), replacing what
+  an earlier upgrade staged; an upgrade that gives none and names no `--channel` removes that
+  file. A dry run stages nothing. The boot into that release gives them to
+  its upgrade as `--set` gives them, then removes the file whichever way the boot goes, so a value
+  stays in the install's records alone; after a boot that refuses (its health gate goes back), a
+  later upgrade gives them again. A boot of another release leaves the file to the boot into its
+  release (logged `… holds what an upgrade gave release <v> <r>, not this OS's <v'> <r'>: left
+  out` when that boot would upgrade), as does the installer of the release the install runs,
+  which the boot runs first; so does a boot that cannot read it, refusing with the file's error;
+  the next upgrade replaces or removes it. A `reset-db --new-baseline` job removes it too, as the
+  OS it writes replaces the one the inputs were for; a job whose OS write fails keeps it, as
+  `kairos-agent` may have moved that OS to the passive slot already. A boot whose upgrade misses a
+  required input the release adds refuses (``missing required input(s) the release adds, which
+  the upgrade did not give: KEY (Prompt): `sudo <short>-stow upgrade [--channel C] --version <v>
+  [--unordered] --set KEY=VALUE` (or --set-file KEY=PATH, --answers FILE) gives each to the boot
+  into the release``, naming the channel the upgrade was asked on and `--unordered` under a
+  `command` version scheme), and so does its host daemon's check before the OS is written; a
+  value an input's check refuses (an added route's domain left empty, say) names the same
+  command (``…: give each a value its input accepts: `sudo <short>-stow upgrade … --set
+  KEY=VALUE` (or …) gives it to the boot into the release``), in the refusal's reason and its
+  fix. Where that upgrade can give no input, the refusal says why instead, with no fix: the
+  daemon's check of a release another Stowage before 0.43.0 published (`<tag> was published by
+  Stowage <s>, whose boot takes no input an upgrade gives: it is reached only by a release that
+  requires none`), and the boot on a VM whose OS, the one it goes back to, an earlier Stowage
+  built (`the OS the VM goes back to was built with Stowage <s>, whose upgrade gives no input:
+  upgrade it first to a release built with Stowage 0.43.0 or later that requires none`).
+  The health gate's verdict carries the boot's refusal. A `reset-db --new-baseline`, which takes
+  no input, refuses a required one the release adds without a fix (`missing required input(s)
+  the release adds, which reset-db --new-baseline cannot give on the VM: KEY (Prompt)`), and a
+  value an input's check refuses so (`KEY: …: reset-db --new-baseline cannot give one on the VM`). Inputs
+  for a release published by a Stowage before 0.43.0, other than the one the host daemon was
+  built with, are refused (409, `<tag> was published by Stowage <s>, whose boot takes no input an
+  upgrade gives: nothing is staged`, fix: upgrade without them, then give them by a re-run of
+  `install` once it runs — an input it requires with no default fails that boot), as that boot
+  never reads them; `updates --json` answers `takes_inputs` when an upgrade to the release it
+  offers takes inputs, so a program tells before it gives any. With nothing to upgrade to, inputs given are refused (exit 3, `there is
+  nothing to upgrade to, so no release takes the inputs given`) rather than left unused. The VM's
+  upgrade is judged and staged by the host daemon of the OS it runs: one built before Stowage
+  0.43.0 takes no input (its `<short>-stow` refuses `--set` on `upgrade` as unknown), so a VM on
+  such an OS first upgrades to a release built with 0.43.0 or later that adds no required input,
+  then to the one that does.
   Before the first install, it reads the release as `updates` does, takes no backup, records the
   release (its version and revision) in `/usr/local/<name>.os-upgrade` before `kairos-agent`
   runs (the first boot on that OS also writes the switch's mark, `<name>.os-switch`, which the
@@ -1298,7 +1374,8 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   The operator's routes answer 403 there, token or not: `provision`, `reset-db` (its plan
   excepted), `secrets export`, `secrets rotate`, `secrets set`, `secrets show`, `exec`, `restore` and `backup config --remove`
   (`DELETE backup/config`), run over SSH alone, and so does an `upgrade` with `skip_backup` (the
-  backup a failed migration is restored from). `network` stays the app's, `revert_secs` 0
+  backup a failed migration is restored from) or with `inputs` (values the install records,
+  secrets among them). `network` stays the app's, `revert_secs` 0
   included: a service holding the token can move the VM to an address nothing reaches, which
   the console undoes. The backup settings stay the app's to change —
   destination (a remote of the operator's rclone config, and a path), recipients, retention,
@@ -1359,7 +1436,7 @@ as `upgrade`'s, given to both); a channel or version without it, `unordered` wit
 or `no_provision` with it, is a 400; a token is good for the plan its GET showed alone — a
 crossing or not, and its target — and another is refused: `reset-db's token is the GET's that
 showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rollback` marks a release the
-  install went back from; `rewrite` the running release offered on the passive system; `needs_unordered`, with `version`, a release under a `command` scheme other than the one the install runs, which `upgrade` takes only with `unordered`; `checks_installer`, an upgrade to it downloads its installer to check it before the OS is written), `POST upgrade` (`{"channel", "version", "confirm": {"version", "revision"}, "reboot", "skip_backup", "dry_run", "unordered"}`, 202; `unordered` without `version` is a 400; with `dry_run`, every check before the job and no job: 200, `{"to", "slot", "does", "backup", "unchecked"}`, the release the upgrade writes, the slot written, what the boot into it does, whether a backup comes first, and — when set — why the install's values are left to the boot into it), `GET job?since=N` (`log_total` is the line to ask from next; the last job's `started` (its identity), kind, target, state — `idle`, `running`, `done`, `failed`
+  install went back from; `rewrite` the running release offered on the passive system; `needs_unordered`, with `version`, a release under a `command` scheme other than the one the install runs, which `upgrade` takes only with `unordered`; `checks_installer`, an upgrade to it downloads its installer to check it before the OS is written; `takes_inputs`, an upgrade to it gives the boot into it the inputs it adds — it moves the install to another release, published by the host daemon's Stowage or by 0.43.0 or later), `POST upgrade` (`{"channel", "version", "confirm": {"version", "revision"}, "reboot", "skip_backup", "dry_run", "unordered", "inputs": {KEY: value}}`, 202; `inputs` are the inputs the release adds, staged for the boot into it (above), the operator's alone; `unordered` without `version` is a 400; with `dry_run`, every check before the job and no job: 200, `{"to", "slot", "does", "backup", "unchecked"}`, the release the upgrade writes, the slot written, what the boot into it does, whether a backup comes first, and — when set — why the install's values are left to the boot into it), `GET job?since=N` (`log_total` is the line to ask from next; the last job's `started` (its identity), kind, target, state — `idle`, `running`, `done`, `failed`
   — and its log from line N; `result`, what a job that is done found: `backup-verify`'s message;
   `reboot`, `{"action", "drain_secs"}`, the reboot a job that is done scheduled as its last step), `GET events?after=N&wait=S` (`{"events": [...],
   "last", "dropped", "truncated"}`: the journal's entries after N (default 0), at most 200,

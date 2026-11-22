@@ -13,6 +13,19 @@ Batched by the gate they share: a batch is one slice, one review, one gate run. 
 Must above Blocked (user, 2026-11-15): the clouds under Blocked ship in it as preview, Google
 Cloud alone proven.
 
+- **A lint warning a project has weighed, accepted with its reason**: `lint` (and `ship`'s) repeat
+  at every run the warnings a stack cannot avoid — a VPN's `cap_add: [NET_ADMIN]`, host
+  `sysctls` meant for the host's namespace alone (warned though each carries a `reason`) — so a
+  new warning is lost among the old. `audit-allow.yaml` already does this for findings: an
+  allowance file (or a key beside the warned one) naming the warning's path and text, its reason
+  and its last day, listed as accepted rather than warned, an expired one warned again, one
+  matching no warning logged "remove it", as the audit's are.
+- **A VM's `reset-db --new-baseline` gives the inputs the release adds**: a crossing to a release
+  at a new schema baseline that adds a required input with no default is refused on the VM
+  (`… which reset-db --new-baseline cannot give on the VM`), as the crossing's boot takes no input
+  and an upgrade cannot cross a baseline. `reset-db --new-baseline` takes `--set`, `--set-file`
+  and `--answers` as `upgrade` does, staged the same way for the boot that crosses.
+
 ### Supply chain — stopgaps back to canonical
 
 1. **Check every stopgap at each release, and drop each one the upstream has caught up with**:

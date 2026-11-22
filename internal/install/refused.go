@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -129,6 +130,35 @@ func (in *Installer) flagFix(fix string) string {
 		return ""
 	}
 	return fix
+}
+
+// vmUpgradeWith is the VM's `upgrade` given flag (`--set KEY=VALUE`), as a fix names it, when the
+// run is the VM's upgrade and that upgrade gives the inputs the release adds to the boot into it;
+// else "".
+func (in *Installer) vmUpgradeWith(flag string) string {
+	if !in.vmUpgrade || in.vmNoInputs != "" {
+		return ""
+	}
+	return "`" + in.vmCtl() + " upgrade" + in.vmUpgradeArgs + " " + flag + "`"
+}
+
+// valueRefusal refuses the inputs given or defaulted a value their check refuses (bad, one "KEY:
+// why" each). On the VM's upgrade, which gives the inputs the release adds, its fix names that
+// command, in its reason too (the text a person reads: a run prints it alone); one that can give
+// none says why instead.
+func (in *Installer) valueRefusal(bad []string) error {
+	why := strings.Join(bad, "; ")
+	up := in.vmUpgradeWith("--set KEY=VALUE")
+	switch {
+	case up != "":
+		fix := "give each a value its input accepts: " + up + " (or --set-file KEY=PATH, --answers FILE) gives it to the boot into the release"
+		return refusal(fix, fmt.Errorf("%s: %s", why, fix))
+	case in.vmUpgrade && in.vmNoInputs != "":
+		return refusal("", fmt.Errorf("%s: %s", why, in.vmNoInputs))
+	case in.givenNothing && !in.vmUpgrade:
+		return refusal("", fmt.Errorf("%s: reset-db --new-baseline cannot give one on the VM", why))
+	}
+	return refusal("give each a value its input accepts", errors.New(why))
 }
 
 // vmCtl is the VM's installer as its operator runs it: the one its OS carries, as root.

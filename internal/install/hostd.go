@@ -467,6 +467,10 @@ type Update struct {
 	// ChecksInstaller: an upgrade to the target downloads its installer and checks it against the
 	// install before it writes the OS (checksTarget).
 	ChecksInstaller bool `json:"checks_installer,omitempty"`
+	// TakesInputs: an upgrade to the target gives the boot into it the inputs it adds (`upgrade
+	// --set`, UpgradeRequest.Inputs): it moves the install to another release, and that release's
+	// boot reads what an upgrade stages (takesStaged).
+	TakesInputs bool `json:"takes_inputs,omitempty"`
 }
 
 // UpgradeRequest is POST /v1/upgrade's body.
@@ -484,6 +488,11 @@ type UpgradeRequest struct {
 	// Unordered, with Version, takes a version a `command` scheme would order, which the daemon
 	// cannot run (unorderedTo): the operator checked the order.
 	Unordered bool `json:"unordered,omitempty"`
+	// Inputs are values of inputs the release adds, KEY: value (a file input's as --set-file
+	// encodes it), staged root-only for the boot into it, which takes them as given and removes
+	// them: the operator's alone, and only for an upgrade that moves the install to another
+	// release.
+	Inputs map[string]string `json:"inputs,omitempty"`
 }
 
 // UpgradePlan is POST /v1/upgrade's answer to a dry run: every check passed, nothing started.
@@ -1593,7 +1602,7 @@ func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, 
 	if len(keep) > 0 {
 		kept = " (keeping " + strings.Join(keep, ", ") + ")"
 	}
-	unchecked, err := h.valuesCheck(ctx, in, env, m, k, "it")
+	unchecked, err := h.valuesCheck(ctx, in, env, m, k, "it", "", nil)
 	if err != nil {
 		return ResetPlan{}, nil, "", err
 	}
@@ -1696,6 +1705,10 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 	if m != nil {
 		src := fmt.Sprintf("%s/%s-os@%s", prefix, m.Name, m.Artifacts.OS)
 		go h.osJob(j, in, m.Tag, prefix, src, true, "wipes the data and installs it", func() error {
+			// What an upgrade staged was for the OS this one replaces in the passive slot.
+			if err := stageInputs(in.O.Dir, m, "", nil); err != nil {
+				return err
+			}
 			return writeAtomic(newBaselineFile(in.O.Dir), strings.NewReader(releaseMark(m.ProjectVersion, m.Revision)+"\n"), 0o600, nil)
 		})
 		accepted(w, j)
@@ -1813,6 +1826,7 @@ func (h *Hostd) updates(w http.ResponseWriter, r *http.Request) {
 		Available: (newer || rewrite) && m.Yanked == nil && m.Artifacts.OS != "" && !left, LeftByRollback: left, Rewrite: rewrite, Installed: installed, Passive: !h.Docker && bootMode(h.O.cos()) == "passive", Changelog: m.Changelog.Project,
 		NeedsUnordered:  q.Get("version") != "" && needsUnordered(m, h.runsVersion(env)),
 		ChecksInstaller: checksTarget(first, !newer && rewrite, env, m),
+		TakesInputs:     checksTarget(first, !newer && rewrite, env, m) && h.takesStaged(m),
 	})
 }
 
@@ -2132,8 +2146,14 @@ func (h *Hostd) finish(j *job, err error) {
 // digest with the install's pull account, then reboots into it: the boot upgrades the install.
 func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	var req UpgradeRequest
-	if err := decodeBody(r, &req); err != nil {
+	// The inputs may hold a file input's content.
+	if err := decodeBodyUpTo(w, r, &req, maxSecretsFile+64<<10); err != nil {
 		replyErr(w, err)
+		return
+	}
+	// The inputs may be secrets, recorded in the install: the operator's alone to give.
+	if len(req.Inputs) > 0 && fromApp(r) {
+		replyErr(w, fail(http.StatusForbidden, "inputs are the operator's: upgrade --set, --set-file or --answers over SSH"))
 		return
 	}
 	// The backup before an upgrade is what a failed migration is restored from: the operator's
@@ -2218,8 +2238,18 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	// What the boot into it would refuse is refused now, before its OS is written. The release
 	// the install runs, rewritten, has nothing to refuse.
 	unchecked := ""
+	if !checksTarget(first, rewrite, env, m) && len(req.Inputs) > 0 {
+		replyErr(w, refuseAs(http.StatusConflict, "leave out the inputs: "+inputsNotTaken(first), "%s %s (revision %d) adds no input to the install: %s", m.Name, m.ProjectVersion, m.Revision, inputsNotTaken(first)))
+		return
+	}
+	// A boot that does not read what an upgrade stages would leave it there, unused.
+	if len(req.Inputs) > 0 && !h.takesStaged(m) {
+		replyErr(w, refuseAs(http.StatusConflict, "upgrade without the inputs, then give them by a re-run of `install` once it runs: an input it requires with no default fails that boot, which only a release published with Stowage "+stagedInputsSince+" or later is given",
+			"%s was published by Stowage %s, whose boot takes no input an upgrade gives: nothing is staged", m.Tag, cmp.Or(m.StowageVersion, "of no recorded version")))
+		return
+	}
 	if checksTarget(first, rewrite, env, m) {
-		if unchecked, err = h.checkUpgrade(r.Context(), in, env, m, req.Channel); err != nil {
+		if unchecked, err = h.checkUpgrade(r.Context(), in, env, m, req.Channel, upgradeArgs(req.Channel, m.ProjectVersion, req.Unordered || needsUnordered(m, h.runsVersion(env))), req.Inputs); err != nil {
 			replyErr(w, err)
 			return
 		}
@@ -2275,6 +2305,9 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 			// An upgrade crosses no baseline: a crossing asked before, whose OS never booted, is
 			// not this release's to make.
 			if err := os.Remove(newBaselineFile(in.O.Dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if err := stageInputs(in.O.Dir, m, req.Channel, req.Inputs); err != nil {
 				return err
 			}
 			if !first {
