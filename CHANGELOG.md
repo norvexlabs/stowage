@@ -3,6 +3,17 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.42.1]
+
+### Fixed
+
+- A wait for a TrueNAS job cut off (Ctrl-C, a timeout) names the cut-off the same way wherever
+  it landed, where it sometimes named the read of the job it stopped instead: a disk's import
+  into a zvol says its convert's wait was cut off (`context canceled`), a cleanup whose own time
+  ran out on a read after its first names the job still running rather than unread, and any
+  other job's wait names the job (`<method>: the wait for job <id> was cut off: …`). An answer
+  TrueNAS gave is kept as it is.
+
 ## [0.42.0] - 2026-11-22
 
 ### Changed

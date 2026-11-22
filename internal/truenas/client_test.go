@@ -43,6 +43,7 @@ type fake struct {
 	jobArgs map[int64]string // job id → its method and arguments as core.get_jobs gives them, JSON
 	polled  func(id int64)   // run as a job's state is read, f.mu held
 	drop    string           // a method whose next call is run, then its connection closed unanswered
+	mute    string           // a method whose next call is run and never answered, its connection left open
 	noEmpty bool             // an upload of an empty file is refused
 	next    int64
 	notify  bool             // send a notification before each answer
@@ -148,13 +149,19 @@ func newFake(t *testing.T) (*fake, *httptest.Server) {
 			} else {
 				res, rerr = h(req.Params)
 			}
-			notify, drop := f.notify, f.drop == req.Method
+			notify, drop, mute := f.notify, f.drop == req.Method, f.mute == req.Method
 			if drop {
 				f.drop = ""
+			}
+			if mute {
+				f.mute = ""
 			}
 			f.mu.Unlock()
 			if drop {
 				return
+			}
+			if mute {
+				continue
 			}
 			if notify {
 				_ = c.Write(ctx, websocket.MessageText, []byte(`{"jsonrpc":"2.0","method":"collection_update","params":{}}`))
@@ -1054,6 +1061,70 @@ func TestImportImageBusy(t *testing.T) {
 	}
 }
 
+// TestWaitCutOff: a wait ctx cuts off names what and the job when the cut lands on a read of the
+// job, the first or a later one, left unanswered; a cut racing a read's answer, which lands on
+// either the read or the wait after it, names it the same; a job that ends is waited for.
+func TestWaitCutOff(t *testing.T) {
+	t.Parallel()
+	f, s := newFake(t)
+	c, err := dial(t, s, "k3y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cut at read n of the job, that read left unanswered (mute) or not (its answer racing the cut).
+	for _, cut := range []struct {
+		n    int
+		mute bool
+	}{{1, true}, {2, true}, {2, false}} {
+		ctx, cancel := context.WithCancel(context.Background())
+		f.mu.Lock()
+		id := f.start("pool.import", nil, "RUNNING")
+		reads := 0
+		f.polled = func(int64) {
+			if reads++; reads == cut.n {
+				cancel()
+				if cut.mute {
+					f.mute = "core.get_jobs"
+				}
+			}
+		}
+		f.mu.Unlock()
+		err := c.Wait(ctx, id, "pool.import")
+		if want := fmt.Sprintf("pool.import: the wait for job %d was cut off: context canceled", id); err == nil || err.Error() != want || !errors.Is(err, context.Canceled) {
+			t.Errorf("a wait cut off at read %d (unanswered %v): %v, want %s", cut.n, cut.mute, err, want)
+		}
+		cancel()
+		// A read cut off takes its connection with it: a new one waits on.
+		if c, err = dial(t, s, "k3y"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.mu.Lock()
+	id := f.start("pool.import", nil, "RUNNING")
+	f.polled = func(int64) { f.jobs[id] = "SUCCESS" }
+	f.mu.Unlock()
+	if err := c.Wait(context.Background(), id, "pool.import"); err != nil {
+		t.Errorf("a job that ends: %v", err)
+	}
+}
+
+// cutBy: a call's error once ctx is done is its ending, unless TrueNAS answered it.
+func TestCutBy(t *testing.T) {
+	t.Parallel()
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	eof := fmt.Errorf("TrueNAS core.get_jobs: failed to read: %w", io.EOF)
+	if !cutBy(done, eof) || cutBy(context.Background(), eof) || cutBy(done, &Error{Method: "core.get_jobs", Message: "jobs unread"}) {
+		t.Error("cutBy: want a read's error cut off once ctx is done, and neither one with ctx live nor TrueNAS's answer")
+	}
+	for _, answer := range []string{`{"N": "x"}`, `{`} {
+		var v struct{ N int }
+		if err := json.Unmarshal([]byte(answer), &v); err == nil || cutBy(done, fmt.Errorf("TrueNAS core.get_jobs: %w", err)) {
+			t.Errorf("cutBy: the answer %s, which does not decode, is cut off", answer)
+		}
+	}
+}
+
 // A convert this run cannot see end is waited for, never aborted (TrueNAS marks an aborted convert
 // ABORTED while its qemu-img writes on): only SUCCESS and FAILED end it. Ended, the staged file is
 // emptied and the lock deleted, and SUCCESS marks the zvol written; in any other state the lock
@@ -1065,10 +1136,12 @@ func TestImportImageConvertCut(t *testing.T) {
 	ctx := context.Background()
 	local, sum := image(t, "QFI\xfbdisk")
 	// convertCut answers vm.device.convert with a RUNNING job, and cancels the run's context as
-	// its wait first reads the job (the second read of it, after the check of its arguments);
-	// then(n) runs (f.mu held) at each read n of the job.
+	// it reads the job the cutAt-th time (2, the wait's first read; 1, the check of its
+	// arguments), that read left unanswered, so the cut lands on it; then(n) runs (f.mu held) at
+	// each read n of the job.
 	var cancel context.CancelFunc
 	var job int64
+	cutAt := 2
 	convertCut := func(then func(n int)) {
 		reads := 0
 		f.mu.Lock()
@@ -1081,8 +1154,9 @@ func TestImportImageConvertCut(t *testing.T) {
 			if id != job {
 				return
 			}
-			if reads++; reads == 2 {
+			if reads++; reads == cutAt {
 				cancel()
+				f.mute = "core.get_jobs"
 			}
 			if then != nil {
 				then(reads)
@@ -1124,14 +1198,28 @@ func TestImportImageConvertCut(t *testing.T) {
 	f.upload = func() { early = early || (job != 0 && f.jobs[job] == "RUNNING") }
 	f.mu.Unlock()
 	remote, err := run("tank/vms/ce")
-	// The cut-off's error is the wait's read cut off, which the cancellation words as it races it.
-	if want := fmt.Sprintf("warning: the zvol tank/vms/ce holds the image sha256:%s; the wait for the convert job %d was cut off (TrueNAS core.get_jobs: ", sum, job); err != nil || !strings.HasPrefix(warn.String(), want) || !strings.HasSuffix(warn.String(), "), and the job then ended SUCCESS\n") {
-		t.Errorf("a convert cut off, then ended SUCCESS: %v, warned\n%q\nwant\n%q…", err, warn.String(), want)
+	// The cut-off's error is the cancellation's own, as when it lands between reads.
+	if want := fmt.Sprintf("warning: the zvol tank/vms/ce holds the image sha256:%s; the wait for the convert job %d was cut off (context canceled), and the job then ended SUCCESS\n", sum, job); err != nil || warn.String() != want {
+		t.Errorf("a convert cut off, then ended SUCCESS: %v, warned\n%q\nwant\n%q", err, warn.String(), want)
 	}
 	if early || reads < 4 {
 		t.Errorf("a convert cut off, then ended SUCCESS: emptied while it ran %v, %d reads", early, reads)
 	}
 	ended("tank/vms/ce", remote, "sha256:"+sum)
+	// Cut off on the first read of the job (its arguments' check), the job then ending SUCCESS: the
+	// same cut-off.
+	cutAt = 1
+	convertCut(func(n int) {
+		if n == 3 {
+			f.jobs[job] = "SUCCESS"
+		}
+	})
+	remote, err = run("tank/vms/c1")
+	if want := fmt.Sprintf("warning: the zvol tank/vms/c1 holds the image sha256:%s; the wait for the convert job %d was cut off (context canceled), and the job then ended SUCCESS\n", sum, job); err != nil || warn.String() != want {
+		t.Errorf("a convert cut off on its first read, then ended SUCCESS: %v, warned\n%q\nwant\n%q", err, warn.String(), want)
+	}
+	ended("tank/vms/c1", remote, "sha256:"+sum)
+	cutAt = 2
 	// Cut off, the job ending FAILED (its qemu-img exited): the cut-off's error, the zvol left
 	// marked as begun.
 	convertCut(func(n int) {
@@ -1143,7 +1231,7 @@ func TestImportImageConvertCut(t *testing.T) {
 	// The job's own error named, a *FailedError (no run again with more time fixes it).
 	var lockLeft *LockLeftError
 	var failed *FailedError
-	if err == nil || !strings.HasPrefix(err.Error(), "TrueNAS core.get_jobs: ") || !strings.HasSuffix(err.Error(), fmt.Sprintf("; the convert job %d then ended FAILED: boom", job)) ||
+	if err == nil || err.Error() != fmt.Sprintf("context canceled; the convert job %d then ended FAILED: boom", job) ||
 		strings.Contains(err.Error(), "left") || errors.As(err, &lockLeft) || !errors.As(err, &failed) || warn.Len() != 0 {
 		t.Errorf("a convert cut off, then FAILED: %v", err)
 	}
@@ -1548,6 +1636,47 @@ func TestSettleSlowConnect(t *testing.T) {
 	r := importRun(t, f, s, z, local, sum, "tank/vms/sc")
 	if want := fmt.Sprintf("; the convert job %d is still RUNNING on TrueNAS after ", job); r.err == nil || !strings.Contains(r.err.Error(), want) {
 		t.Errorf("a slow connection: %v, want %q", r.err, want)
+	}
+}
+
+// A settle whose own time runs out on a read of the job left unanswered names the job still
+// running, from the row read before it, as when it runs out between reads; never unread. It sets
+// package variables: not parallel.
+func TestSettleReadCutOff(t *testing.T) {
+	ref, st := refTimeout, settleTimeout
+	t.Cleanup(func() { refTimeout, settleTimeout = ref, st })
+	// settle's watch ends 150 ms after it begins: room for its connection, its first read and a poll
+	// before the read left unanswered, which then waits out the budget's last 50 ms.
+	refTimeout, settleTimeout = 50*time.Millisecond, 100*time.Millisecond
+	f, s := newFake(t)
+	z := f.zvols()
+	local, sum := image(t, "QFI\xfbdisk")
+	var job int64
+	reads := 0
+	f.mu.Lock()
+	f.methods["vm.device.convert"] = func(p []json.RawMessage) (any, *rpcErr) {
+		job = f.start("vm.device.convert", p, "RUNNING")
+		return job, nil
+	}
+	// The run's first read fails (settled on a new connection), settle's first is answered, its
+	// next left unanswered.
+	f.polled = func(id int64) {
+		if id != job {
+			return
+		}
+		switch reads++; reads {
+		case 1:
+			f.drop = "core.get_jobs"
+		case 3:
+			f.mute = "core.get_jobs"
+		}
+	}
+	f.mu.Unlock()
+	r := importRun(t, f, s, z, local, sum, "tank/vms/sm")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if want := fmt.Sprintf("; the convert job %d is still RUNNING on TrueNAS after ", job); r.err == nil || !strings.Contains(r.err.Error(), want) || reads != 3 {
+		t.Errorf("a settle cut off on a read: %v (%d reads), want %q", r.err, reads, want)
 	}
 }
 

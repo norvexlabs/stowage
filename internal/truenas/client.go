@@ -301,17 +301,17 @@ func (c *Client) Job(ctx context.Context, method string, params ...any) error {
 	return c.Wait(ctx, id, method)
 }
 
-// Wait waits for job id to succeed; a job that fails, is aborted or vanishes is an error naming
-// what.
+// Wait waits for job id to succeed; a job that fails, is aborted or vanishes, or a wait ctx cuts
+// off, is an error naming what and the job.
 func (c *Client) Wait(ctx context.Context, id int64, what string) error {
 	j, done, err := c.follow(ctx, id, nil, time.Time{}, ended)
 	switch {
-	case err != nil:
+	case err != nil && (ctx.Err() == nil || !errors.Is(err, ctx.Err())):
 		return err
+	case err != nil || !done && j != nil:
+		return fmt.Errorf("%s: the wait for job %d was cut off: %w", what, id, ctx.Err())
 	case j == nil:
 		return fmt.Errorf("%s: job %d vanished", what, id)
-	case !done:
-		return ctx.Err()
 	case j.State == "SUCCESS":
 		return nil
 	}
@@ -356,20 +356,40 @@ func (c *Client) job(ctx context.Context, id int64) (*jobRow, error) {
 // ended says whether a job in state has ended: SUCCESS, FAILED or ABORTED.
 func ended(state string) bool { return state == "SUCCESS" || state == "FAILED" || state == "ABORTED" }
 
+// cutBy says whether err, a call's, is ctx's ending: ctx is done and TrueNAS gave no answer, nor
+// one that does not decode (an *Error, a JSON error). A cancelled read may name the connection it
+// closed rather than the cancellation, so any other error once ctx is done is taken as it.
+func cutBy(ctx context.Context, err error) bool {
+	var answered *Error
+	var syntax *json.SyntaxError
+	var typ *json.UnmarshalTypeError
+	return ctx.Err() != nil && !errors.As(err, &answered) && !errors.As(err, &syntax) && !errors.As(err, &typ)
+}
+
 // follow reads job id every poll until done(its state), giving the row then read and true; until
 // the job is gone, giving nil; or until ctx is done or end (unless zero) passes, giving the last
-// row read and false. A read that fails is err. j, unless nil, is the job's row the caller just
+// row read and false. A read that fails is err, but one cut off (cutBy) is ctx's ending, as
+// between reads: the last row read and false, or, with none read yet, nil, false and ctx.Err(),
+// so a cut-off reads the same wherever it lands. j, unless nil, is the job's row the caller just
 // read: taken as the first read.
 func (c *Client) follow(ctx context.Context, id int64, j *jobRow, end time.Time, done func(string) bool) (*jobRow, bool, error) {
+	last := j
 	for {
 		if j == nil {
 			var err error
 			if j, err = c.job(ctx, id); err != nil {
-				return nil, false, err
+				switch {
+				case !cutBy(ctx, err):
+					return nil, false, err
+				case last == nil:
+					return nil, false, ctx.Err()
+				}
+				return last, false, nil
 			}
 			if j == nil {
 				return nil, false, nil
 			}
+			last = j
 		}
 		if done(j.State) {
 			return j, true, nil
@@ -931,6 +951,9 @@ func (c *Client) convert(ctx context.Context, remote, zvol string) error {
 	what := "vm.device.convert of " + remote
 	j, err := c.job(ctx, id)
 	if err != nil {
+		if cutBy(ctx, err) {
+			err = ctx.Err()
+		}
 		return c.settle(ctx, id, remote, zvol, err, true)
 	}
 	switch who, of := whose(j, remote, zvol); who {
