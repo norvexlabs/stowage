@@ -734,7 +734,7 @@ step_upgrade() {
 		{ cat "$WORK/upgrade-dry.txt"; fail "a dry run without the input 1.0.1 adds is not refused (exit $code), naming upgrade --set"; }
 	code=0
 	on_vm sudo notes-stow upgrade --dry-run --set RELAY_TOKEN=x --set NOT_AN_INPUT=x >"$WORK/upgrade-dry.txt" 2>&1 || code=$?
-	[[ $code == 3 ]] && grep -q 'no input this release adds is named NOT_AN_INPUT (it adds: RELAY_TOKEN)' "$WORK/upgrade-dry.txt" ||
+	[[ $code == 3 ]] && grep -qE 'no input this release adds is named NOT_AN_INPUT \(it adds: ([A-Z_]+, )*RELAY_TOKEN[,)]' "$WORK/upgrade-dry.txt" ||
 		{ cat "$WORK/upgrade-dry.txt"; fail "a dry run giving an input 1.0.1 does not add is not refused (exit $code)"; }
 	local relay=relay-$RANDOM$RANDOM
 	printf 'RELAY_TOKEN: %s\n' "$relay" | on_vm "umask 077; cat >/tmp/relay.yaml" || fail "writing the answers file on the VM"
@@ -918,8 +918,8 @@ step_fallback() {
 	step "ship 1.0.2, which never becomes ready: its health gate fails, and Kairos falls back to the passive system"
 	release 1.0.2 false
 	boot=$(boot_id)
-	# The rollback went back to 1.0.0, which records no RELAY_TOKEN: the upgrade gives it again.
-	on_vm sudo notes-stow upgrade --yes --set RELAY_TOKEN=relay-fallback >"$WORK/upgrade3.txt" 2>&1 || { cat "$WORK/upgrade3.txt"; fail "upgrade to 1.0.2 from the passive system"; }
+	# The install keeps RELAY_TOKEN through the rollback to 1.0.0: 1.0.2 does not add it.
+	on_vm sudo notes-stow upgrade --yes >"$WORK/upgrade3.txt" 2>&1 || { cat "$WORK/upgrade3.txt"; fail "upgrade to 1.0.2 from the passive system"; }
 	# The fallback left the last attempt marked; the upgrade clears it (Kairos's after-upgrade, or the
 	# host daemon's job after it) before the 30 s reboot, so that reboot tries 1.0.2. That 1.0.2 then
 	# ran and was judged is the failed boot status below.
@@ -941,7 +941,7 @@ step_barrier() {
 	step "ship 1.0.3, a rollback barrier that never becomes ready: its health gate fails, and keeps it, as going back is refused"
 	release 1.0.3 false 2 '{"2": "notes moved to a new table"}'
 	boot=$(boot_id)
-	on_vm sudo notes-stow upgrade --yes --set RELAY_TOKEN=relay-barrier >"$WORK/upgrade4.txt" 2>&1 || { cat "$WORK/upgrade4.txt"; fail "upgrade to 1.0.3"; }
+	on_vm sudo notes-stow upgrade --yes >"$WORK/upgrade4.txt" 2>&1 || { cat "$WORK/upgrade4.txt"; fail "upgrade to 1.0.3"; }
 	back_on 1.0.3 active "after 1.0.3 failed its health gate past a barrier" "$boot"
 	! ran nic || edge_v6_clean "after 1.0.3 failed its health gate past a barrier"
 	[[ $(on_vm systemctl is-active notes-health.service) == failed ]] || fail "the health gate passed 1.0.3"
