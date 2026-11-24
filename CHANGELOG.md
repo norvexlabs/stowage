@@ -3,6 +3,27 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.44.0]
+
+### Added
+
+- `kit create --json` on Docker and Kubernetes, as on the VM: a program issues a kit from a JSON
+  request and gets the kit and its code back as one JSON object, with no file written and nothing
+  asked. `--request FILE` reads the request from a file instead of standard input.
+- `describe` lists the handoffs a release issues: the project each kit is for, what it asks
+  (secret answers marked), the keys it gives and whether it can be checked.
+
+### Fixed
+
+- A kit request read as JSON (the VM's `kit create --json`) is held to what `kit create`'s flags
+  hold: good for at most 36500 days, at most 1 MiB, and its instance, left out, is the handoff's
+  name. Its refusals name the request's field, not a flag `--json` refuses.
+- `--expires` given in hours over 36500 days is refused before anything is asked, as in days.
+- `--expires` with a count of days far out of range, such as `-213503d`, is refused, where it
+  wrapped into a kit good for about a day.
+- The Kubernetes suites' checks that an object or a release is gone fail when `kubectl` or `helm`
+  cannot answer, instead of reading it as gone.
+
 ## [0.43.0] - 2026-11-23
 
 ### Added

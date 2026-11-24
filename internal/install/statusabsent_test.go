@@ -209,18 +209,19 @@ func TestDockerStatusJSONFailsOnAnUnreadableRegistryCA(t *testing.T) {
 	}
 }
 
-// describe's text names each route, its loopback port when the spec gives one, each L4 route and
-// the registry.
+// describe's text names each route, its loopback port when the spec gives one, each L4 route, each
+// handoff (checked when it has a check) and the registry.
 func TestDescribeTextRoutes(t *testing.T) {
 	t.Parallel()
 	d := Description{Name: "notes", Registry: "ghcr.io/acme/notes",
 		Routes:   []DescribedRoute{{Name: "app", LoopbackPort: 8080}, {Name: "bare"}},
-		L4Routes: []DescribedL4Route{{Name: "db", Protocol: "tcp", Port: 5432}}}
+		L4Routes: []DescribedL4Route{{Name: "db", Protocol: "tcp", Port: 5432}},
+		Handoffs: []DescribedHandoff{{Name: "client", For: "atlas", Gives: []string{"A", "B"}, Check: true}, {Name: "bare", For: "x", Gives: []string{"C"}}}}
 	var b bytes.Buffer
 	if err := d.print(&b); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"\nroute     app (loopback port 8080)\n", "\nroute     bare\n", "\nl4 route  db (tcp/5432)\n", "\nregistry  ghcr.io/acme/notes\nfirst install only: "} {
+	for _, want := range []string{"\nroute     app (loopback port 8080)\n", "\nroute     bare\n", "\nl4 route  db (tcp/5432)\n", "\nhandoff   client (for atlas, gives A,B, checked)\n", "\nhandoff   bare (for x, gives C)\n", "\nregistry  ghcr.io/acme/notes\nfirst install only: "} {
 		if !strings.Contains(b.String(), want) {
 			t.Errorf("no %q in:\n%s", want, b.String())
 		}

@@ -24,17 +24,26 @@ type kitVerbs struct {
 	check  func(cmd *cobra.Command, handoff, instance string) (int, error)
 	flags  func(c *cobra.Command)
 	// host, when set, makes HOSTNAME each command's first argument, which it receives: the VM
-	// `vm kit` reaches over SSH.
+	// `vm kit` reaches over SSH. Its create writes the kit on the operator's machine, so it takes
+	// no --json; every other create does: the request read from --request (standard input by
+	// default), the issued kit written to standard output as JSON, no file — what `vm kit create`
+	// runs on the VM, and what a program issuing a kit runs on any shape.
 	host *string
 	// precheck, when set, runs before create asks anything or makes its file.
 	precheck func(cmd *cobra.Command) error
-	// json gives `create` --json: the request read from standard input, the issued kit written to
-	// standard output as JSON, no file — the VM's side of `vm kit create`.
-	json bool
 }
 
 // maxKitRequest bounds a --json request: its answers are a handoff's, each a recorded value's size.
 const maxKitRequest = 1 << 20
+
+// maxKitExpiry is the longest a kit is good for, by --expires or a request's expires, as its
+// refusals say it (maxKitExpiryText).
+const (
+	maxKitExpiry     = maxKitExpiryDays * 24 * time.Hour
+	maxKitExpiryDays = 36500
+)
+
+var maxKitExpiryText = strconv.Itoa(maxKitExpiryDays) + "d"
 
 // kitCommand is `kit`, for a project that declares a handoff; nil for one that does not.
 func kitCommand(r *Release, stdout, stderr io.Writer, terminal func(bool) Prompter, verbs kitVerbs) *cobra.Command {
@@ -60,7 +69,7 @@ func kitCommand(r *Release, stdout, stderr io.Writer, terminal func(bool) Prompt
 		}
 		return args[lead:]
 	}
-	var instance, expires, out, answers string
+	var instance, expires, out, answers, request string
 	var sets []string
 	var noInput, accessible, asJSON bool
 	create := &cobra.Command{
@@ -72,14 +81,17 @@ func kitCommand(r *Release, stdout, stderr io.Writer, terminal func(bool) Prompt
 			if asJSON {
 				for _, name := range []string{"name", "expires", "output", "set", "answers"} {
 					if cmd.Flags().Changed(name) {
-						return fmt.Errorf("--json reads the whole request on standard input: --%s with it is refused", name)
+						return fmt.Errorf("--json reads the whole request from --request: --%s with it is refused", name)
 					}
 				}
-				return kitJSON(cmd, args[0], verbs, stdout)
+				return kitJSON(cmd, r.Spec, args[0], request, verbs, stdout)
 			}
-			h := r.Spec.Handoff(args[0])
-			if h == nil {
-				return fmt.Errorf("%s declares no handoff %q", r.Spec.Name, args[0])
+			if cmd.Flags().Changed("request") {
+				return errors.New("--request is the request --json reads: give --json with it")
+			}
+			h, err := findHandoff(r.Spec, args[0])
+			if err != nil {
+				return err
 			}
 			after, err := parseKitExpiry(expires)
 			if err == nil && verbs.precheck != nil {
@@ -146,8 +158,9 @@ func kitCommand(r *Release, stdout, stderr io.Writer, terminal func(bool) Prompt
 	cf.StringVar(&answers, "answers", "", "a YAML file of what the handoff asks, KEY: value")
 	cf.BoolVar(&noInput, "no-input", false, "never ask")
 	cf.BoolVar(&accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
-	if verbs.json {
-		cf.BoolVar(&asJSON, "json", false, "read the request (instance, answers, expires in nanoseconds) as JSON on standard input and write the kit, its code and the run's log as JSON on standard output, no file: what `vm kit create` runs over SSH")
+	if verbs.host == nil {
+		cf.BoolVar(&asJSON, "json", false, "read the request (instance, answers, expires in nanoseconds) as JSON from --request and write the kit, its code and the run's log as JSON on standard output, no file: the machine interface")
+		cf.StringVar(&request, "request", "-", "with --json, the file holding the request (- is standard input)")
 	}
 	verbs.flags(create)
 	check := &cobra.Command{
@@ -189,26 +202,51 @@ func kitCommand(r *Release, stdout, stderr io.Writer, terminal func(bool) Prompt
 	return root
 }
 
-// kitJSON is `kit create --json`: the request strictly read from standard input, for handoff, and
-// the issued kit written to stdout as one JSON object. The verb checks the request as any other's.
-func kitJSON(cmd *cobra.Command, handoff string, verbs kitVerbs, stdout io.Writer) error {
-	raw, err := readFlagFile("--json", "-", cmd.InOrStdin(), maxKitRequest)
+// kitJSON is `kit create --json`: the request strictly read from request (a file, or - for standard
+// input), for handoff, and the issued kit written to stdout as one JSON object. An instance left out
+// is the handoff's name, as without --json, unless the handoff asks one. The verb checks the
+// request as any other's.
+func kitJSON(cmd *cobra.Command, s *spec.Spec, handoff, request string, verbs kitVerbs, stdout io.Writer) error {
+	h, err := findHandoff(s, handoff)
 	if err != nil {
 		return err
+	}
+	raw, err := readFlagFile("--request", request, cmd.InOrStdin(), maxKitRequest)
+	if err != nil {
+		return err
+	}
+	if len(raw) > maxKitRequest {
+		return fmt.Errorf("--request: the request is over %d bytes", maxKitRequest)
 	}
 	var req KitRequest
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		return fmt.Errorf("--json: the request on standard input: %w", err)
+		return fmt.Errorf("--request: %w", err)
 	}
 	if dec.More() {
-		return errors.New("--json: the request on standard input holds more than one object")
+		return errors.New("--request: the request holds more than one object")
 	}
 	if req.Handoff != "" && req.Handoff != handoff {
-		return fmt.Errorf("--json: the request names the handoff %q, the command %q", req.Handoff, handoff)
+		return fmt.Errorf("--request: the request names the handoff %q, the command %q", req.Handoff, handoff)
 	}
 	req.Handoff = handoff
+	if req.Instance == "" {
+		if h.Instance != "" {
+			return fmt.Errorf("--request: the handoff %s asks %q: the request's instance gives it", h.Name, h.Instance)
+		}
+		req.Instance = h.Name
+	}
+	// What the verb would refuse naming a flag, refused here naming the request's field: --json
+	// takes none of those flags.
+	if req.Expires != 0 { // 0 is the default
+		if err := checkKitExpiry(req.Expires); err != nil {
+			return fmt.Errorf("--request: expires: %w", err)
+		}
+	}
+	if a := missingAnswer(h, req.Answers); a != nil {
+		return fmt.Errorf("--request: the handoff %s asks %s (%s): answers.%s gives it", h.Name, a.Key, a.Prompt, a.Key)
+	}
 	issued, err := verbs.create(cmd, req)
 	if err != nil {
 		return err
@@ -230,9 +268,8 @@ func parseKitExpiry(s string) (time.Duration, error) {
 	if days, ok := strings.CutSuffix(s, "d"); ok {
 		var n int
 		if n, err = strconv.Atoi(days); err == nil {
-			if n > 36500 {
-				return 0, fmt.Errorf("--expires %q: at most 36500d", s)
-			}
+			// Bounded before the product, which a count far out of range would overflow.
+			n = max(min(n, maxKitExpiryDays+1), 0)
 			d = time.Duration(n) * 24 * time.Hour
 		}
 	} else {
@@ -241,10 +278,32 @@ func parseKitExpiry(s string) (time.Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf("--expires %q: a number of days, as 7d, or a duration, as 12h", s)
 	}
-	if d <= 0 {
-		return 0, fmt.Errorf("--expires %q: a kit expires after now", s)
+	if err := checkKitExpiry(d); err != nil {
+		return 0, fmt.Errorf("--expires %q: %w", s, err)
 	}
 	return d, nil
+}
+
+// checkKitExpiry is the one rule on how long a kit is good for, after now and at most 36500 days,
+// its reason bare: each caller names what gave it.
+func checkKitExpiry(d time.Duration) error {
+	switch {
+	case d <= 0:
+		return errors.New("a kit expires after now")
+	case d > maxKitExpiry:
+		return fmt.Errorf("at most %s", maxKitExpiryText)
+	}
+	return nil
+}
+
+// missingAnswer is the first question of h answers leaves without a value; nil when none.
+func missingAnswer(h *spec.Handoff, answers map[string]string) *spec.HandoffAsk {
+	for i := range h.Ask {
+		if answers[h.Ask[i].Key] == "" {
+			return &h.Ask[i]
+		}
+	}
+	return nil
 }
 
 // kitInstance is the instance when --name gave none: asked when the handoff has a prompt for it, else
@@ -325,7 +384,6 @@ func kitAnswers(ctx context.Context, h *spec.Handoff, sets []string, answers str
 // vmKitVerbs run a handoff through the host daemon, on its operators' socket alone.
 func vmKitVerbs(c *hostClient, stderr io.Writer) kitVerbs {
 	return kitVerbs{
-		json:  true,
 		flags: func(*cobra.Command) {},
 		create: func(cmd *cobra.Command, req KitRequest) (*IssuedKit, error) {
 			var out IssuedKit

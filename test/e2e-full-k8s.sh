@@ -84,7 +84,7 @@ except urllib.error.HTTPError as e:
 # key it returned in no log (its stdout went to the pod's volume, then the outputs Secret).
 hook_ran() {
 	grep -q 'the Job atlas-stowage runs the hook' "$1" && grep -q 'registering admin@atlas.test' "$1" || { cat "$1"; fail "the hook's Job did not run, or its stderr is not in the log"; }
-	! kubectl get job -n "$NS" atlas-stowage >/dev/null 2>&1 || fail "the provision Job was not deleted"
+	k8s_absent "$NS" job/atlas-stowage || fail "the provision Job was not deleted"
 	! grep -qF "$2" "$1" || fail "what the hook returned reached a log"
 }
 # lacks <target> <key>…: none of the keys is in the target's environment.
@@ -239,8 +239,8 @@ ctl v1.sh k8s kit create search-client --name site-2 --set SITE_SEARCH_URL="$SEA
 code=$(sed -n 's/^code  //p' "$WORK/kit.log")
 [[ -n $code ]] || { cat "$WORK/kit.log"; fail "k8s kit create printed no code"; }
 ! grep -qF "$SEARCH3" "$WORK/kit.log" "$OP/search.kit" || fail "a value in the clear"
-! kubectl get -n "$NS" secret atlas-stowage-kit-search-client >/dev/null 2>&1 || fail "the kit's Secret is still there"
-! kubectl get -n "$NS" job atlas-stowage-kit-search-client >/dev/null 2>&1 || fail "the kit's Job is still there"
+k8s_absent "$NS" secret/atlas-stowage-kit-search-client || fail "the kit's Secret is still there"
+k8s_absent "$NS" job/atlas-stowage-kit-search-client || fail "the kit's Job is still there"
 printf '%s\n' "$code" >"$OP/search.code"
 ctl v1.sh k8s upgrade --kit search.kit --kit-code-file search.code --no-input --timeout 5m >"$WORK/kit-up.log" 2>&1 || { cat "$WORK/kit-up.log"; cluster_logs >&2; fail "k8s upgrade --kit"; }
 grep -qF "changing SEARCH_URL: $SEARCH2 → $SEARCH3" "$WORK/kit-up.log" || { cat "$WORK/kit-up.log"; fail "the kit's change was not logged"; }
@@ -251,6 +251,15 @@ hook_ran "$WORK/kit-up.log" "$key"
 ctl v1.sh k8s kit check search-client site-2 >"$WORK/kit-check.log" 2>&1 && grep -q 'proven$' "$WORK/kit-check.log" || { cat "$WORK/kit-check.log"; fail "k8s kit check of a site"; }
 rc=0; ctl v1.sh k8s kit check search-client site-unknown >"$WORK/kit-check.log" 2>&1 || rc=$?
 [[ $rc == 2 ]] || { cat "$WORK/kit-check.log"; fail "k8s kit check of an unknown site exited $rc, not 2"; }
+# The machine form: the request read from a file, its secret answer in it, the kit and its code one
+# JSON object on standard output, no file; the Job and its Secret gone.
+printf '{"instance":"site-3","answers":{"SITE_SEARCH_URL":"%s","SITE_SEARCH_TOKEN":"the-token"},"expires":3600000000000}' "$SEARCH3" >"$OP/kit-req.json"
+ctl v1.sh k8s kit create search-client --json --request kit-req.json </dev/null >"$WORK/kit-json.out" 2>"$WORK/kit-json.log" || { cat "$WORK/kit-json.log"; cluster_logs >&2; fail "k8s kit create --json"; }
+jq -se 'length == 1 and (.[0] | (.kit | startswith("-----BEGIN AGE ENCRYPTED FILE-----")) and (.code | length > 0) and has("log"))' "$WORK/kit-json.out" >/dev/null || { cat "$WORK/kit-json.out"; fail "k8s kit create --json did not answer one object with the kit, its code and the log"; }
+[[ ! -e $OP/search-client-site-3.kit ]] || fail "k8s kit create --json wrote a file"
+! grep -qF -e "$SEARCH3" -e the-token "$WORK/kit-json.out" "$WORK/kit-json.log" || fail "a value in the clear"
+k8s_absent "$NS" secret/atlas-stowage-kit-search-client || fail "the --json kit's Secret is still there"
+k8s_absent "$NS" job/atlas-stowage-kit-search-client || fail "the --json kit's Job is still there"
 
 step "the app's users revoke the key; ship $V2 (a migration), k8s upgrade --version $V2: the hook fails, the release runs $V2"
 kubectl exec -n atlas-db deploy/db -- psql -U atlas -d atlas -qc 'DELETE FROM api_keys' || fail "revoking the key"
@@ -355,6 +364,7 @@ ingest_event
 atlas_runs "$V1" 2
 
 step "k8s uninstall keeps the embedded database's claim and its Secrets; k8s install takes them back"
+! helm_absent "$NS" atlas || fail "helm_absent does not see the release installed: its check after the uninstall would prove nothing"
 NS=atlas-eval
 ingest_event
 events=$(status events)
@@ -362,8 +372,8 @@ claim=$(kubectl get -n "$NS" pvc data-atlas-postgres-0 -o jsonpath='{.metadata.u
 secret=$(kubectl get -n "$NS" secret atlas-stowage -o jsonpath='{.data}')
 ctl v1.sh k8s uninstall --namespace "$NS" --yes --timeout 3m >"$WORK/uninstall.log" 2>&1 || { cat "$WORK/uninstall.log"; cluster_logs >&2; fail "k8s uninstall"; }
 grep -q 'kept: its PersistentVolumeClaims data-atlas-postgres-0, which hold its data' "$WORK/uninstall.log" || { cat "$WORK/uninstall.log"; fail "uninstall does not say it kept the claim"; }
-! helm status -n "$NS" atlas >/dev/null 2>&1 || fail "the release is still installed"
-[[ -z $(kubectl get -n "$NS" serviceaccount atlas-stowage-provision --ignore-not-found -o name) ]] || fail "the hook's account is left"
+helm_absent "$NS" atlas || fail "the release is still installed"
+k8s_absent "$NS" serviceaccount/atlas-stowage-provision || fail "the hook's account is left"
 [[ $(kubectl get -n "$NS" pvc data-atlas-postgres-0 -o jsonpath='{.metadata.uid}') == "$claim" ]] || fail "the database's claim was deleted"
 (cd "$OP" && "${OPERATOR[@]}" sh v1.sh k8s install --namespace "$NS" --no-input --timeout 5m) >"$WORK/again.log" 2>&1 ||
 	{ cat "$WORK/again.log"; cluster_logs >&2; fail "k8s install over the kept data"; }

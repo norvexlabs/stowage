@@ -134,7 +134,7 @@ returned() { kubectl get -n "$NS" secret notes-stowage-provision -o jsonpath='{.
 pw=$(returned)
 [[ -n $pw ]] || fail "the provision hook's outputs Secret holds no ADMIN_PASSWORD"
 ! grep -qF "$pw" "$WORK/install.log" || fail "what the hook returned reached the installer's log"
-! kubectl get -n "$NS" job notes-stowage >/dev/null 2>&1 || fail "the provision Job was not deleted"
+k8s_absent "$NS" job/notes-stowage || fail "the provision Job was not deleted"
 # somaxconn: the net.core.somaxconn of each web pod not being deleted, its namespace's own, one
 # line each, sorted unique (a failed exec fails).
 somaxconn() {
@@ -164,8 +164,8 @@ ctl v1.sh k8s kit create second-site --name site-2 --set SITE_ADMIN=second@notes
 sed -n 's/^code  //p' "$WORK/kit.log" >"$OP/site.code"
 [[ -s $OP/site.code ]] || { cat "$WORK/kit.log"; fail "k8s kit create printed no code"; }
 ! grep -qF second@notes.test "$WORK/kit.log" "$OP/site.kit" || fail "a value in the clear"
-! kubectl get -n "$NS" secret notes-stowage-kit-second-site >/dev/null 2>&1 || fail "the kit's Secret is still there"
-! kubectl get -n "$NS" job notes-stowage-kit-second-site >/dev/null 2>&1 || fail "the kit's Job is still there"
+k8s_absent "$NS" secret/notes-stowage-kit-second-site || fail "the kit's Secret is still there"
+k8s_absent "$NS" job/notes-stowage-kit-second-site || fail "the kit's Job is still there"
 ctl v1.sh k8s upgrade --kit site.kit --kit-code-file site.code --no-input --timeout 3m >"$WORK/kit-up.log" 2>&1 || { cat "$WORK/kit-up.log"; cluster_logs >&2; fail "k8s upgrade --kit"; }
 [[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data.ADMIN_EMAIL}' | base64 -d) == second@notes.test ]] || fail "--kit did not replace the recorded input"
 grep -qF 'changing ADMIN_EMAIL: ' "$WORK/kit-up.log" || { cat "$WORK/kit-up.log"; fail "the change was not logged"; }
@@ -292,6 +292,7 @@ kubectl delete namespace notes2 --wait=false >/dev/null || fail "deleting the na
 rm -f "$OP/secrets.yaml"
 
 step "k8s uninstall: refused without --data (helm deletes the chart's claim), then removes all but the namespace"
+! helm_absent "$NS" notes || fail "helm_absent does not see the release installed: its check after the uninstall would prove nothing"
 rc=0; ctl v1.sh k8s uninstall --yes --json >"$WORK/uninstall0.json" 2>"$WORK/uninstall0.log" || rc=$?
 grep -q 'notes-uploads, which `helm uninstall` deletes with it' "$WORK/uninstall0.log" || { cat "$WORK/uninstall0.log"; fail "the refusal does not name the claim"; }
 refused "$WORK/uninstall0.json" "$rc" 'notes-uploads, which `helm uninstall` deletes with it'
@@ -300,9 +301,9 @@ helm status -n "$NS" notes >/dev/null 2>&1 || fail "the refused uninstall remove
 ctl v1.sh k8s uninstall --data --yes --timeout 3m --json >"$WORK/uninstall.json" 2>"$WORK/uninstall.log" || { cat "$WORK/uninstall.log" "$WORK/uninstall.json"; cluster_logs >&2; fail "k8s uninstall --data --json"; }
 result "$WORK/uninstall.json" "done"
 grep -q 'kept: the namespace notes' "$WORK/uninstall.log" || { cat "$WORK/uninstall.log"; fail "uninstall does not say what it kept"; }
-! helm status -n "$NS" notes >/dev/null 2>&1 || fail "the release is still installed"
+helm_absent "$NS" notes || fail "the release is still installed"
 for o in secret/notes-stowage secret/notes-stowage-provision serviceaccount/notes-stowage-provision role/notes-stowage-provision rolebinding/notes-stowage-provision pvc/notes-uploads; do
-	[[ -z $(kubectl get -n "$NS" "$o" --ignore-not-found -o name) ]] || fail "$o is left"
+	k8s_absent "$NS" "$o" || fail "$o is left"
 done
 kubectl get namespace "$NS" >/dev/null || fail "the namespace was deleted"
 

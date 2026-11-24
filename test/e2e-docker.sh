@@ -100,8 +100,9 @@ jq -se 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .short_nam
 	(.inputs | map(.key) | index("ADMIN_EMAIL") != null and index("E2E_TOKEN") != null) and
 	(.inputs[] | select(.key == "ADMIN_EMAIL") | .required and (.secret | not) and .default == "") and
 	(.inputs[] | select(.key == "E2E_TOKEN") | .secret and .optional) and
-	all(.inputs[]; if .secret then has("default") | not else has("default") end))' "$WORK/describe.json" >/dev/null ||
-	{ cat "$WORK/describe.json"; fail "describe --json does not describe 1.0.0, its inputs (no secret's default) and the first-install-only settings"; }
+	all(.inputs[]; if .secret then has("default") | not else has("default") end) and
+	.handoffs == [{name: "second-site", for: "notes", instance: "", ask: [{key: "SITE_ADMIN", prompt: "The second site'"'"'s administrator", secret: false}], gives: ["ADMIN_EMAIL"], check: true}])' "$WORK/describe.json" >/dev/null ||
+	{ cat "$WORK/describe.json"; fail "describe --json does not describe 1.0.0, its inputs (no secret's default), the first-install-only settings and the handoff"; }
 rc=0; (cd "$WORK" && "${OPERATOR[@]}" sh notes.sh status --dir "$D" --json) >"$WORK/status0.json" 2>"$WORK/status0.log" || rc=$?
 [[ $rc == 3 ]] && grep -q 'holds no install' "$WORK/status0.log" && jq -se 'length == 1 and .[0].format == 1 and .[0].refused.absent == true and ((.[0].refused.reason + " " + (.[0].refused.fix // "")) | contains("holds no install"))' "$WORK/status0.json" >/dev/null ||
 	{ cat "$WORK/status0.log" "$WORK/status0.json"; fail "status --json before the install exited $rc, not 3 with its refusal ('holds no install', absent) one object on standard output"; }
@@ -156,6 +157,17 @@ rc=0; "${CTL[@]}" kit check second-site site-unknown --dir "$D" >"$WORK/kit-chec
 [[ $rc == 2 ]] || { cat "$WORK/kit-check.log"; fail "kit check of an unknown site exited $rc, not 2"; }
 rc=0; "${CTL[@]}" kit check second-site site-refused --dir "$D" >"$WORK/kit-check.log" 2>&1 || rc=$?
 [[ $rc == 1 ]] || { cat "$WORK/kit-check.log"; fail "kit check of a refused site exited $rc, not 1"; }
+# The machine form: the request read from a file (standard input is a program's), the kit and its
+# code one JSON object on standard output, no file; the kit taken as a file one is.
+printf '{"instance":"site-3","answers":{"SITE_ADMIN":"third@notes.test"},"expires":3600000000000}' >"$WORK/kit-req.json"
+"${CTL[@]}" kit create second-site --dir "$D" --json --request "$WORK/kit-req.json" </dev/null >"$WORK/kit-json.out" 2>"$WORK/kit-json.log" || { cat "$WORK/kit-json.log"; fail "kit create --json"; }
+jq -se 'length == 1 and (.[0] | (.kit | startswith("-----BEGIN AGE ENCRYPTED FILE-----")) and (.code | length > 0) and has("log"))' "$WORK/kit-json.out" >/dev/null || { cat "$WORK/kit-json.out"; fail "kit create --json did not answer one object with the kit, its code and the log"; }
+[[ ! -e second-site-site-3.kit && ! -e $D/second-site-site-3.kit ]] || fail "kit create --json wrote a file"
+! grep -qF third@notes.test "$WORK/kit-json.out" "$WORK/kit-json.log" || fail "a value in the clear"
+jq -r .kit "$WORK/kit-json.out" >"$WORK/site3.kit"; jq -r .code "$WORK/kit-json.out" >"$WORK/site3.code"; chmod 600 "$WORK/site3.kit" "$WORK/site3.code"
+"${CTL[@]}" --dir "$D" --no-input --kit "$WORK/site3.kit" --kit-code-file "$WORK/site3.code" >"$WORK/kit6.log" 2>&1 || { cat "$WORK/kit6.log"; fail "--kit of a kit made by --json"; }
+grep -q "^ADMIN_EMAIL='third@notes.test'\$" "$D/.env" || fail "the kit made by --json did not give its input"
+given admin@notes.test
 running 1.0.0 1
 
 step "audit on the Docker host: the release's SBOMs, scanned with its own scanner (the database given)"

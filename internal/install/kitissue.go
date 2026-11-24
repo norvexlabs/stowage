@@ -55,12 +55,16 @@ type KitRequest struct {
 type IssuedKit struct {
 	Kit  string `json:"kit"`
 	Code string `json:"code"`
-	Log  string `json:"log,omitempty"`
+	// Log is the run's log the VM's host daemon kept; "" on Docker and Kubernetes, whose run
+	// writes it on standard error as it runs.
+	Log string `json:"log"`
 }
 
 // handoff finds a handoff, naming those there are.
-func (in *Installer) handoff(name string) (*spec.Handoff, error) {
-	s := in.R.Spec
+func (in *Installer) handoff(name string) (*spec.Handoff, error) { return findHandoff(in.R.Spec, name) }
+
+// findHandoff is s's handoff name, or a refusal naming the handoffs s declares.
+func findHandoff(s *spec.Spec, name string) (*spec.Handoff, error) {
 	if h := s.Handoff(name); h != nil {
 		return h, nil
 	}
@@ -81,8 +85,10 @@ func (in *Installer) checkKitRequest(req *KitRequest) (*spec.Handoff, error) {
 	if err := checkKitInstance(req.Instance); err != nil {
 		return nil, err
 	}
-	if req.Expires < 0 {
-		return nil, errors.New("--expires: a kit expires after now")
+	if req.Expires != 0 { // 0 is the default
+		if err := checkKitExpiry(req.Expires); err != nil {
+			return nil, fmt.Errorf("expires: %w", err)
+		}
 	}
 	req.Expires = cmp.Or(req.Expires, DefaultKitExpiry)
 	for _, key := range sortedKeys(req.Answers) {
@@ -90,12 +96,11 @@ func (in *Installer) checkKitRequest(req *KitRequest) (*spec.Handoff, error) {
 			return nil, fmt.Errorf("the handoff %s does not ask %s", h.Name, key)
 		}
 	}
+	if a := missingAnswer(h, req.Answers); a != nil {
+		return nil, fmt.Errorf("the handoff %s asks %s (%s): --set or --answers gives it, or a terminal asks it", h.Name, a.Key, a.Prompt)
+	}
 	for _, a := range h.Ask {
-		v := req.Answers[a.Key]
-		if v == "" {
-			return nil, fmt.Errorf("the handoff %s asks %s (%s): --set or --answers gives it, or a terminal asks it", h.Name, a.Key, a.Prompt)
-		}
-		if err := spec.CheckEnvValue(v); err != nil {
+		if err := spec.CheckEnvValue(req.Answers[a.Key]); err != nil {
 			return nil, fmt.Errorf("%s: %w", a.Key, err)
 		}
 	}

@@ -221,7 +221,9 @@ Every command, verb and flag is described in the reference page each line links.
 | Every shape | `kit create`/`check` (`k8s kit`, `vm kit`), `mirror export`/`import` | [docs/kits.md](docs/kits.md), [docs/mirror.md](docs/mirror.md) |
 
 **For programs**: `describe --json`, `status --json` and `--json` on every verb that changes an
-install print one JSON object with a `format` number; a refusal exits `3`, a failure `1`. See
+install print one JSON object with a `format` number; a refusal exits `3`, a failure `1`.
+`kit create --json` issues a kit as one JSON object, its request read from `--request`
+([docs/kits.md](docs/kits.md)). See
 [docs/machine-interface.md](docs/machine-interface.md).
 
 ## Documentation

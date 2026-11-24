@@ -1978,6 +1978,11 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   standard output, so neither the code nor a secret answer reaches the VM's disk, process list or
   journal, and the kit lands where the operator hands it on. `kit check`'s statuses keep their
   meaning across the link, ssh's own failure (255) read as no answer, never as not proven.
+  `kit create --json` is on every shape, not only the VM's, so a program (the OpenTofu provider)
+  issues a kit on any shape with the code never touching a file it did not choose; its request may
+  come from `--request FILE`, as a program running the installer on a Docker host already uses
+  standard input for the files a run needs (a mirror's CA, a login). `describe` lists the handoffs
+  so that program builds the request and tells a kit's keys from its own without the spec.
   A handoff's `run` and `check` are one-shot containers shaped as the provision hook, not a service
   plus `exec`: Kubernetes has no `exec` verb and no service-pod contract, and the hook already runs on
   every shape. Their output is the hook's `KEY=VALUE` grammar, so on Kubernetes values stay out of pod

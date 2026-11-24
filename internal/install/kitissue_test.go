@@ -207,6 +207,7 @@ func TestIssueKitRefusals(t *testing.T) {
 		"answer unasked": {mod: func(r *KitRequest) { r.Answers = map[string]string{"SITE": "x", "OTHER": "y"} }, want: "does not ask OTHER"},
 		"bad answer":     {mod: func(r *KitRequest) { r.Answers = map[string]string{"SITE": "a\nb"} }, want: "SITE: "},
 		"past":           {mod: func(r *KitRequest) { r.Expires = -time.Second }, want: "expires after now"},
+		"too long":       {mod: func(r *KitRequest) { r.Expires = maxKitExpiry + 1 }, want: "at most 36500d"},
 		"run fails":      {out: "TOKEN=the-token\n", err: exitCode(1), want: "did not finish, and no kit is written"},
 		"not KEY=VALUE":  {out: "hello\n", want: "KEY=VALUE lines only"},
 		"install's key":  {out: "STOWAGE_X=y\nTOKEN=t\n", want: "a value the install records"},
@@ -233,6 +234,11 @@ func TestIssueKitRefusals(t *testing.T) {
 	e.docker.kitOut, e.docker.kitErr = "TOKEN=t\n", nil
 	if _, err := e.installer(kitFast).IssueKit(context.Background(), req, kitNow); err != nil {
 		t.Errorf("%v", err)
+	}
+	// The longest a kit is good for, the other side of "too long".
+	req.Expires = maxKitExpiry
+	if _, err := e.installer(kitFast).IssueKit(context.Background(), req, kitNow); err != nil {
+		t.Errorf("at most 36500d: %v", err)
 	}
 }
 
@@ -367,6 +373,18 @@ func TestKitCreateFlags(t *testing.T) {
 	}
 	if d, err := parseKitExpiry("1d"); err != nil || d != 24*time.Hour {
 		t.Errorf("%v %v", d, err)
+	}
+	// A count far out of range, either way, is refused: never wrapped into a duration that passes.
+	for _, in := range []string{"-213503d", "-1d", "0d", "9223372036854775807d", "36501d"} {
+		if d, err := parseKitExpiry(in); err == nil {
+			t.Errorf("%s: %v, want a refusal", in, d)
+		}
+	}
+	if d, err := parseKitExpiry("876000h"); err != nil || d != maxKitExpiry {
+		t.Errorf("876000h: %v %v", d, err)
+	}
+	if _, err := parseKitExpiry("876001h"); err == nil || !strings.Contains(err.Error(), "at most 36500d") {
+		t.Errorf("876001h: %v", err)
 	}
 	if d, err := parseKitExpiry("36500d"); err != nil || d <= 0 {
 		t.Errorf("%v %v", d, err)

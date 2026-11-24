@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -57,6 +58,53 @@ func TestEveryInputFieldIsDecidedInDescribe(t *testing.T) {
 		if key != "" && !slices.Contains(keys, key) {
 			t.Errorf("spec.Input.%s maps to %q, which DescribedInput has not", field, key)
 		}
+	}
+}
+
+// describeHandoffFields maps each field of spec.Handoff and spec.HandoffAsk to the JSON key describe
+// gives it, or "" for one it leaves out on purpose (the run's container is the installer's own).
+var describeHandoffFields = map[reflect.Type]map[string]string{
+	reflect.TypeFor[spec.Handoff](): {"Name": "name", "For": "for", "Instance": "instance", "Ask": "ask",
+		"Run": "", "Gives": "gives", "Check": "check"},
+	reflect.TypeFor[spec.HandoffAsk](): {"Key": "key", "Prompt": "prompt", "Secret": "secret"},
+}
+
+func TestEveryHandoffFieldIsDecidedInDescribe(t *testing.T) {
+	t.Parallel()
+	described := map[reflect.Type]reflect.Type{
+		reflect.TypeFor[spec.Handoff]():    reflect.TypeFor[DescribedHandoff](),
+		reflect.TypeFor[spec.HandoffAsk](): reflect.TypeFor[DescribedHandoffAsk](),
+	}
+	for typ, fields := range describeHandoffFields {
+		var keys []string
+		for f := range described[typ].Fields() {
+			keys = append(keys, f.Tag.Get("json"))
+		}
+		for f := range typ.Fields() {
+			key, ok := fields[f.Name]
+			switch {
+			case !ok:
+				t.Errorf("%s.%s: describe neither carries it nor leaves it out on purpose: map it in describeHandoffFields", typ, f.Name)
+			case key != "" && !slices.Contains(keys, key):
+				t.Errorf("%s.%s maps to %q, which %s has not", typ, f.Name, key, described[typ])
+			}
+		}
+		// The other way: a key describe prints that no field of the spec gives.
+		for _, key := range keys {
+			if !slices.Contains(slices.Collect(maps.Values(fields)), key) {
+				t.Errorf("%s prints %q, which no field of %s maps to", described[typ], key, typ)
+			}
+		}
+	}
+	// Each field set, then each left at its zero, as a handoff without check or secret answers is.
+	h := spec.Handoff{Name: "n", For: "f", Instance: "i", Ask: []spec.HandoffAsk{{Key: "K", Prompt: "p", Secret: true}},
+		Gives: []string{"G"}, Check: &spec.HandoffStep{}}
+	bare := spec.Handoff{Name: "b", For: "f", Ask: []spec.HandoffAsk{{Key: "Q", Prompt: "q"}}, Gives: []string{"H"}}
+	got := Describe(&Release{Spec: &spec.Spec{Handoffs: []spec.Handoff{h, bare}}, Manifest: &release.Manifest{}}).Handoffs
+	want := []DescribedHandoff{{Name: "n", For: "f", Instance: "i", Ask: []DescribedHandoffAsk{{Key: "K", Prompt: "p", Secret: true}}, Gives: []string{"G"}, Check: true},
+		{Name: "b", For: "f", Ask: []DescribedHandoffAsk{{Key: "Q", Prompt: "q"}}, Gives: []string{"H"}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Describe's handoffs = %+v, want %+v", got, want)
 	}
 }
 

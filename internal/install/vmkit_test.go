@@ -306,15 +306,18 @@ func TestVMKitTakeFailureNamesTheLink(t *testing.T) {
 	}
 }
 
-// The VM's kit create --json reads its request strictly and answers the kit as JSON, no file.
+// kit create --json, on every shape but `vm kit`, reads its request strictly from --request and
+// answers the kit as JSON, no file.
 func TestKitCreateJSON(t *testing.T) {
 	t.Parallel()
 	f := &fakeVerbs{issued: &IssuedKit{Kit: "SEALED\n", Code: "c", Log: "ran\n"}}
+	var host *string
+	rel := kitRelease()
 	run := func(stdin string, args ...string) (string, error) {
 		var out bytes.Buffer
 		v := f.verbs()
-		v.json = true
-		c := kitCommand(kitRelease(), &out, io.Discard, func(bool) Prompter { return nil }, v)
+		v.host = host
+		c := kitCommand(rel, &out, io.Discard, func(bool) Prompter { return nil }, v)
 		c.SetArgs(args)
 		c.SetIn(strings.NewReader(stdin))
 		c.SetOut(io.Discard)
@@ -334,22 +337,81 @@ func TestKitCreateJSON(t *testing.T) {
 		t.Errorf("request %+v", r)
 	}
 	for stdin, want := range map[string]string{
-		`{"instance":"s","extra":1}`:                "unknown field",
-		`{"instance":"s"}{"instance":"t"}`:          "more than one object",
-		`{"handoff":"other","instance":"s"}`:        `names the handoff "other"`,
-		strings.Repeat(" ", maxKitRequest+1) + "{}": "",
+		`{"instance":"s","extra":1}`:                                            "unknown field",
+		`{"instance":"s","answers":{"SITE":"x"}}{"instance":"t"}`:               "more than one object",
+		`{"handoff":"other","instance":"s"}`:                                    `--request: the request names the handoff "other"`,
+		strings.Repeat(" ", maxKitRequest+1) + "{}":                             "--request: the request is over 1048576 bytes",
+		`{"instance":"s"}`:                                                      "--request: the handoff client asks SITE (The site): answers.SITE gives it",
+		`{"instance":"s","answers":{"SITE":"x"},"expires":-1}`:                  "--request: expires: a kit expires after now",
+		`{"instance":"s","answers":{"SITE":"x"},"expires":3153600000000000001}`: "--request: expires: at most 36500d",
 	} {
 		f.reqs = nil
 		if _, err := run(stdin, "create", "client", "--json"); err == nil || !strings.Contains(err.Error(), want) || len(f.reqs) != 0 {
 			t.Errorf("%.40q: %v", stdin, err)
 		}
 	}
-	if _, err := run(`{"instance":"s"}`, "create", "client", "--json", "--name", "s"); err == nil || !strings.Contains(err.Error(), "--name with it is refused") {
-		t.Errorf("--name with --json: %v", err)
+	for _, flag := range [][]string{{"--name", "s"}, {"--expires", "1d"}, {"-o", "x.kit"}, {"--set", "SITE=x"}, {"--answers", "a.yaml"}} {
+		f.reqs = nil
+		if _, err := run(`{"instance":"s","answers":{"SITE":"x"}}`, append([]string{"create", "client", "--json"}, flag...)...); err == nil || !strings.Contains(err.Error(), " with it is refused") || len(f.reqs) != 0 {
+			t.Errorf("%s with --json: %v", flag[0], err)
+		}
 	}
-	// Only the VM's kit takes it.
-	if _, err := runKit(t, f, nil, "create", "client", "--json"); err == nil || !strings.Contains(err.Error(), "unknown flag") {
-		t.Errorf("--json on Docker: %v", err)
+	// log is always there, "" where the run wrote it on standard error (Docker, Kubernetes).
+	g := &fakeVerbs{issued: &IssuedKit{Kit: "SEALED\n", Code: "c"}}
+	var raw bytes.Buffer
+	c := kitCommand(kitRelease(), &raw, io.Discard, func(bool) Prompter { return nil }, g.verbs())
+	c.SetArgs([]string{"create", "client", "--json"})
+	c.SetIn(strings.NewReader(`{"instance":"s","answers":{"SITE":"x"}}`))
+	if err := c.ExecuteContext(context.Background()); err != nil || !strings.Contains(raw.String(), `"log":""`) {
+		t.Errorf("no log: %v %s", err, raw.String())
+	}
+	// --json never asks: --no-input and --accessible with it change nothing, and are taken.
+	f.reqs = nil
+	if _, err := run(`{"instance":"s","answers":{"SITE":"x"}}`, "create", "client", "--json", "--no-input", "--accessible"); err != nil || len(f.reqs) != 1 {
+		t.Errorf("--no-input with --json: %v", err)
+	}
+	// An instance left out is the handoff's name, as without --json; a handoff asking one refuses it.
+	f.reqs = nil
+	if _, err := run(`{"answers":{"SITE":"x"}}`, "create", "client", "--json"); err != nil || len(f.reqs) != 1 || f.reqs[0].Instance != "client" {
+		t.Errorf("no instance: %v %+v", err, f.reqs)
+	}
+	rel.Spec.Handoffs[0].Instance = "The site"
+	f.reqs = nil
+	if _, err := run(`{"answers":{"SITE":"x"}}`, "create", "client", "--json"); err == nil || !strings.Contains(err.Error(), `--request: the handoff client asks "The site": the request's instance gives it`) || len(f.reqs) != 0 {
+		t.Errorf("no instance, one asked: %v", err)
+	}
+	rel.Spec.Handoffs[0].Instance = ""
+	// The other side of each bound: a request of exactly 1 MiB, good for exactly 36500 days.
+	f.reqs = nil
+	at := `{"instance":"s","answers":{"SITE":"x"},"expires":3153600000000000000}`
+	if _, err := run(at+strings.Repeat(" ", maxKitRequest-len(at)), "create", "client", "--json"); err != nil || len(f.reqs) != 1 || f.reqs[0].Expires != maxKitExpiry {
+		t.Errorf("at the bounds: %v", err)
+	}
+	f.reqs = nil
+	if _, err := run(`{}`, "create", "nope", "--json"); err == nil || !strings.Contains(err.Error(), `declares no handoff "nope" (handoffs: client)`) || len(f.reqs) != 0 {
+		t.Errorf("no handoff: %v", err)
+	}
+	// --request names a file, standard input left unread.
+	req := filepath.Join(t.TempDir(), "req.json")
+	if err := os.WriteFile(req, []byte(`{"instance":"from-file","answers":{"SITE":"x"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.reqs = nil
+	if _, err := run("not json", "create", "client", "--json", "--request", req); err != nil || len(f.reqs) != 1 || f.reqs[0].Instance != "from-file" {
+		t.Errorf("--request FILE: %v %+v", err, f.reqs)
+	}
+	f.reqs = nil
+	if _, err := run("", "create", "client", "--json", "--request", req+".gone"); err == nil || !strings.HasPrefix(err.Error(), "--request: ") || len(f.reqs) != 0 {
+		t.Errorf("--request missing: %v", err)
+	}
+	f.reqs = nil
+	if _, err := run("", "create", "client", "--request", req, "--name", "s"); err == nil || !strings.Contains(err.Error(), "give --json with it") || len(f.reqs) != 0 {
+		t.Errorf("--request without --json: %v", err)
+	}
+	// `vm kit create` writes its kit on the operator's machine: no --json.
+	host = new(string)
+	if _, err := run("", "create", "client", "--json"); err == nil || !strings.Contains(err.Error(), "unknown flag") {
+		t.Errorf("--json on vm kit: %v", err)
 	}
 }
 

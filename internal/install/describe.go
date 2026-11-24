@@ -77,6 +77,8 @@ type Description struct {
 	// takes. L4Routes are the host ports published beside the front ([] when none).
 	Routes   []DescribedRoute   `json:"routes"`
 	L4Routes []DescribedL4Route `json:"l4_routes"`
+	// Handoffs are the kits this release issues (`kit create`), in the spec's order ([] when none).
+	Handoffs []DescribedHandoff `json:"handoffs"`
 }
 
 // DescribedRoute is a front route: its name, and the host port it binds in loopback mode when
@@ -92,6 +94,26 @@ type DescribedL4Route struct {
 	Name     string `json:"name"`
 	Protocol string `json:"protocol"`
 	Port     int    `json:"port"`
+}
+
+// DescribedHandoff is a handoff `kit create` issues: the project whose install takes its kit (For),
+// the question naming the instance ("" when the handoff's name is the default), what it asks,
+// the keys its kit gives, and whether `kit check` can prove one taken.
+type DescribedHandoff struct {
+	Name     string                `json:"name"`
+	For      string                `json:"for"`
+	Instance string                `json:"instance"`
+	Ask      []DescribedHandoffAsk `json:"ask"`
+	Gives    []string              `json:"gives"`
+	Check    bool                  `json:"check"`
+}
+
+// DescribedHandoffAsk is a question of a handoff: a secret answer is given in a --json request or
+// an --answers file, never by --set.
+type DescribedHandoffAsk struct {
+	Key    string `json:"key"`
+	Prompt string `json:"prompt"`
+	Secret bool   `json:"secret"`
 }
 
 // DescribedInput is one of the spec's inputs, in the spec's order. Default is left out for a
@@ -133,6 +155,15 @@ func Describe(r *Release) Description {
 		StowageVersion: r.Manifest.StowageVersion,
 		Routes:         []DescribedRoute{},
 		L4Routes:       []DescribedL4Route{},
+		Handoffs:       []DescribedHandoff{},
+	}
+	for _, h := range r.Spec.Handoffs {
+		dh := DescribedHandoff{Name: h.Name, For: h.For, Instance: h.Instance, Ask: []DescribedHandoffAsk{},
+			Gives: append([]string{}, h.Gives...), Check: h.Check != nil}
+		for _, a := range h.Ask {
+			dh.Ask = append(dh.Ask, DescribedHandoffAsk{Key: a.Key, Prompt: a.Prompt, Secret: a.Secret})
+		}
+		d.Handoffs = append(d.Handoffs, dh)
 	}
 	for _, rt := range r.Spec.Front.Routes {
 		d.Routes = append(d.Routes, DescribedRoute{Name: rt.Name, LoopbackPort: r.Spec.Front.LoopbackPorts[rt.Name]})
@@ -272,6 +303,13 @@ func (d Description) print(w io.Writer) error {
 	}
 	for _, rt := range d.L4Routes {
 		fmt.Fprintf(&b, "l4 route  %s (%s/%d)\n", rt.Name, rt.Protocol, rt.Port)
+	}
+	for _, h := range d.Handoffs {
+		check := ""
+		if h.Check {
+			check = ", checked"
+		}
+		fmt.Fprintf(&b, "handoff   %s (for %s, gives %s%s)\n", h.Name, h.For, strings.Join(h.Gives, ","), check)
 	}
 	fmt.Fprintf(&b, "registry  %s\n", d.Registry)
 	if d.StowageVersion != "" {

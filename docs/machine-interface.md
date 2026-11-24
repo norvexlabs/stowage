@@ -14,6 +14,7 @@ share; each shape's own fields and verbs are on its page:
 | `status --json` on Docker | [below](#status---json) |
 | `--json` on the verbs that change an install; the Result object; `absent` | [below](#--json-on-the-verbs-that-change-an-install) |
 | `updates --json` on Docker and Kubernetes (the VM's object, `follows` theirs alone) | [below](#updates---json) |
+| `kit create --json` on every shape: a kit issued as one JSON object, no file | [kits.md](kits.md) |
 | Exit status: `0` done, `1` failed, `2` unknown (`kit check`), `3` refused | [below](#exit-status) |
 | `k8s status --json` and the `k8s` verbs' `--json` | [kubernetes.md](kubernetes.md) |
 | `vm seed --json`, `vm host-key --json`, `<short>-stow host-key --json` | [vm-create.md](vm-create.md) |
@@ -191,8 +192,17 @@ share; each shape's own fields and verbs are on its page:
     `l4_routes`: the `l4` routes, each `{name, protocol, port}` — host ports no flag moves; `[]`
     when none. A program compares a release's routes with the installed one's to tell a route an
     upgrade adds from one the install holds.
+  - `handoffs`: the kits the release issues ([kits](kits.md)), in the spec's order, each `{name,
+    for, instance, ask, gives, check}`: `for` the project whose install takes the kit, `instance`
+    the question naming the instance (`""` when the handoff's name is the default), `ask` each
+    question `{key, prompt, secret}` (a secret answer goes in a `kit create --json` request or an
+    `--answers` file, never `--set`), `gives` the keys its kit gives (by the target's input names,
+    or `KIT_TLS_*` for the target's front), `check` whether `kit check` can prove a kit taken; `[]`
+    when none. A program issuing a kit reads it to build the request, and to tell the keys a kit
+    gives from the ones it gives itself.
   Without `--json`, a `route` line per route (`route     NAME (loopback port N)`), an `l4 route`
-  line per L4 route (`l4 route  NAME (PROTOCOL/PORT)`), `registry  PREFIX` and `stowage   VERSION`
+  line per L4 route (`l4 route  NAME (PROTOCOL/PORT)`), a `handoff` line per handoff
+  (`handoff   NAME (for PROJECT, gives KEY,…[, checked])`), `registry  PREFIX` and `stowage   VERSION`
   (the Stowage that built the installer; left out when its manifest records none) come before
   `first install only: …`.
 

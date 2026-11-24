@@ -773,6 +773,21 @@ prev_stowage() (
 	fi
 	printf '%s\n' "$out"
 )
+# k8s_absent <namespace> <kind/name>: true when the object is not found; a kubectl that fails
+# (the API server away, a wrong context) fails the suite, never reads as absent.
+k8s_absent() {
+	local out
+	out=$(kubectl get -n "$1" "$2" --ignore-not-found -o name) || fail "kubectl get $2 in $1"
+	[[ -z $out ]]
+}
+# helm_absent <namespace> <release>: true when helm keeps no record of the release, in any state:
+# none of the Secrets it stores each revision in (owner=helm, name=<release>). A kubectl that
+# fails fails the suite, never reads as absent.
+helm_absent() {
+	local out
+	out=$(kubectl get secret -n "$1" -l "owner=helm,name=$2" -o name) || fail "kubectl get the helm records of $2 in $1"
+	[[ -z $out ]]
+}
 # ctl <installer script> <args…>: the bootstrap script, run as the operator in $OP.
 ctl() {
 	local s=$1
