@@ -45,8 +45,9 @@ Cloud alone proven.
    - Findings with no upstream fix yet, to take once one is released (`make self-audit`
      2026-11-09): the front's go-jose/v3 3.0.5, which Caddy 2.11.9 (and 2.11.7 before it) still
      links beside v4, GHSA-mgcc-cww5-fp2q high (v3's last release is affected; v4 4.1.6 is
-     fixed); golang.org/x/crypto 0.58.0 in every Go artifact (Stowage's own binaries included),
-     GO-2026-5932, fixed only in a pseudo-version after 0.58.0 — take the first tagged release.
+     fixed); golang.org/x/crypto 0.58.0 in the front, the scanner and the backup runner,
+     GO-2026-5932 (its `openpgp` package), fixed in 0.59.0, which Stowage's own binaries carry
+     (checked 2026-11-25) — take each upstream's release that requires it.
    - The audit allowances in `examples/full/audit-allow.yaml` (the OS bundle's containerd,
      containerd-shim-runc-v2, ctr and runc, until 2027-01-31, each narrowed to its package and
      binary; every project with the kairos shape and `audit` needs the same): removed once Docker
@@ -62,13 +63,6 @@ Cloud alone proven.
    Caddy, grype or rclone carrying the module: move the recipe, then drop the override; a base
    build carrying the package: repin it, then drop the raise), the `apk upgrade` and any module the
    release does not require it leaves to judge, base repins, and the findings with no fix yet.
-2. **`vm truenas import-image|seed|stop` back to the TrueNAS provider**: the TrueNAS example's
-   `local-exec` steps run them because `truenas/truenas` (1.9.1, checked 2026-11-15) cannot put a
-   file on the host (its issue #55, `truenas_filesystem_file`, open: no API deletes a file, and an
-   HTTP `/_upload/` transport is needed), write a disk image into a zvol (`vm.device.convert`; no
-   issue found) or stop a VM before its devices are deleted (`truenas_vm_power`'s delete does
-   nothing, and `truenas_vm_device`'s delete refuses a running VM). Each goes once the provider
-   covers it: drop the verb and its step from the example, and `internal/truenas` with the last.
 
 ### Blocked — upstream or accounts
 
@@ -97,6 +91,13 @@ Cloud alone proven.
    `describe --json` and a `k8s` verb from each; if macOS refuses one (killed, `Code Signature
    Invalid`), re-sign it ad hoc after the payload is appended (the code directory's code limit
    covering it, as Go's `cmd/internal/codesign` writes one), and add that run to the proof.
+5. **`vm truenas import-image|seed|stop` back to the TrueNAS provider**: the TrueNAS example's
+   `local-exec` steps run them because `truenas/truenas` (1.9.3, checked 2026-11-25) cannot put a
+   file on the host (its issue #55, `truenas_filesystem_file`, open: no API deletes a file, and an
+   HTTP `/_upload/` transport is needed), write a disk image into a zvol (`vm.device.convert`; no
+   issue found) or stop a VM before its devices are deleted (`truenas_vm_power`'s delete does
+   nothing, and `truenas_vm_device`'s delete refuses a running VM). Each goes once the provider
+   covers it: drop the verb and its step from the example, and `internal/truenas` with the last.
 
 ## Should
 
@@ -267,9 +268,6 @@ Cloud alone proven.
 - **Kubernetes schema check for a `command` schema-compat provider**: `shapes.kubernetes.schema`
   runs the `sql` provider's queries in a pod; a `command` provider's ops (JSON on stdin) are not
   run on Kubernetes, so its rollback is not checked there.
-- **Docker restore drill of a machine made again**: e2e-docker restores into the install the
-  backup came from; an install made with `--secrets` that then restores (`restore_awaited`) is
-  unit-tested only on Docker.
 - **The Docker disk-pressure check end to end**: `disk-check` and its timer are unit-tested; no
   suite runs the check against a filled volume on a Docker host.
 

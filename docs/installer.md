@@ -219,9 +219,11 @@ refusal is the verb's Result.
   re-run of the installer with --dir D finishes it` (or `… runs, or was stopped; …`); while a
   restore left the volumes half restored, `not running: a restore left <name>'s volumes half
   restored … (or a restore is running)` instead; each
-  route's URL (after it, while an install given `--secrets` awaits its data, `not provisioned: a
-  backup of the install --secrets came from is awaited; once loaded, `<short>-stow provision --dir D`
-  provisions it`), each `l4` route as `<name> <protocol>/<port>` followed by its endpoint when it has
+  route's URL (after it, while an install given `--secrets` awaits its data, `awaiting its data:
+  made again by --secrets: `<short>-stow backup config --dir D` with the old install's
+  destination, then `<short>-stow restore OBJECT --unrecorded --dir D` loads a backup of it
+  (--unrecorded: its digests' records went with it)`; on a release that runs no backups, `… made
+  again by --secrets: load a backup of it by hand, then `<short>-stow provision --dir D``), each `l4` route as `<name> <protocol>/<port>` followed by its endpoint when it has
   an `address_input` (`echo      tcp/17007 localhost:17007`) and where it listens (`· on
   192.0.2.7 alone` from its `bind_input`, else `· on every address, open to whoever reaches this
   host`, adding `(<BIND_INPUT> gives it one address)` when the route has a `bind_input`; `· not
@@ -713,9 +715,19 @@ refusal is the verb's Result.
   before the stack starts, so the hook's next run is given it. Those values belong to the old
   install's data, so the hook does not run on the new, empty database — not by this run, a
   re-run or a boot: the stack starts unprovisioned, `status` says a backup is awaited
-  (`.stowage-restore-awaited`), and `sudo <short>-stow restore OBJECT` (the VM) loads it and runs
-  the hook; on Docker, which has no `restore`, a backup loaded by hand, then `provision` runs it,
-  as it does an empty database. A file without provision values awaits nothing. The front's
+  (`.stowage-restore-awaited`), and, once `backup config` has the old install's destination,
+  `restore OBJECT --unrecorded` (`sudo <short>-stow restore OBJECT --unrecorded` on the VM,
+  `<short>-stow restore OBJECT --unrecorded --dir D` on Docker) — or `restore --input FILE
+  --unrecorded`, which needs no settings — loads it and runs the hook — `--unrecorded` as the records
+  of the old install's backup digests went with it; a backup loaded by hand instead is followed
+  by `provision`, which runs it, as it does an empty database. A file without provision values (or a
+  release without a hook) awaits its data too when the release runs backups — the install says so
+  — until `restore` loads it, or `provision` (which, on a release without a hook, only ends the
+  wait while one is awaited, and refuses `--set`) or `reset-db` says it is the install's; a release
+  with neither a hook nor backups awaits nothing. While it awaits, no backup is taken (a timer's
+  run and `backup run` are refused naming the way on, an upgrade takes none first): it would store
+  an empty machine beside the old one's backups. `status --json` says `made_again` for every
+  install made by `--secrets`. The front's
   local CA the file holds is recorded (`.stowage-front-ca`, 0600) for an install in the
   `internal` mode (in another, it is left out, said), and put in the front's data volume before
   the front first starts: a front container already there is removed, the root and its key

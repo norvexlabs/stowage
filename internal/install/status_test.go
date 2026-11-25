@@ -616,8 +616,16 @@ func TestDockerStatusJSONRestoreAndVolumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, out := statusOf(t, e, nil)
-	if st.RestoreAwaited || st.VolumesSplit || strings.Contains(out, "restore_awaited") || strings.Contains(out, "volumes_split") {
+	if st.RestoreAwaited || st.VolumesSplit || st.MadeAgain || strings.Contains(out, "restore_awaited") || strings.Contains(out, "volumes_split") || strings.Contains(out, "made_again") {
 		t.Errorf("%s", out)
+	}
+	// An install made by --secrets says so, from its first write.
+	again := newEnv(t)
+	if err := again.install(func(o *Options) { o.Secrets = []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\n") }); err != nil {
+		t.Fatal(err)
+	}
+	if st, out := statusOf(t, again, nil); !st.MadeAgain || !st.RestoreAwaited {
+		t.Errorf("made again: %s", out)
 	}
 	for _, f := range []string{restoreAwaitedFile, volumesSplitFile} {
 		if err := os.WriteFile(filepath.Join(e.dir, f), nil, 0o600); err != nil {

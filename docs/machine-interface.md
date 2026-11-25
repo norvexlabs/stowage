@@ -71,7 +71,11 @@ share; each shape's own fields and verbs are on its page:
   else `127.0.0.1`; `STOWAGE_LOOPBACK_ADDRESS`); `registry_ca` `sha256:<hex>` of the registry CA
   the install keeps (`registry-ca.pem`, the `--registry-ca` file as given), absent when it keeps
   none — so a program compares what it would give with what the install holds; `restore_awaited` (`true`, absent otherwise) while
-  an install given `--secrets` awaits its data, and `volumes_split` while a restore left the
+  an install given `--secrets` awaits its data (from Stowage 0.48.0 every one whose release runs
+  backups, or whose hook is given the export's provision values: until `restore` loads a backup,
+  or `provision` or `reset-db` ends the wait), `made_again` (`true`, absent otherwise; Docker and
+  the VM, Stowage 0.48.0 or later) for an install made by `--secrets` from another install's
+  export, recorded before its `.env` and kept for good, and `volumes_split` while a restore left the
   volumes half restored — not while a restore runs (it holds the install's host lock), as on the
   VM; `services` the stack's services as the VM's `ps --json` gives them
   (`service`, `state`, `health`, `image`, `exit_code`, `id`, `oom_killed`, `mem_limit_bytes`,
@@ -373,7 +377,7 @@ whole; one cut short exits `1`. `restore --input FILE|- --identity FILE` takes i
   one pass; `secrets set` of a key without `settable: true`, or a value it cannot record (empty,
   over 4096 bytes, a quote or a line break), or with no terminal to ask it on and nothing piped;
   `secrets show` to no terminal; `secrets export` without `--recipient`, or with one that is not an age public key; `backup run --output` with no
-  recipient given or set, `backup export` of a backup the host does not keep; `restore` of a backup not of the project,
+  recipient given or set, `backup export` of a backup the host does not keep; `backup run` while the install awaits its data (made again by `--secrets`, not restored); `restore` of a backup not of the project,
   not taken from the release installed or of a profile leaving rows out, a release confirmed that
   is not the one installed, an identity that is not one, and `restore --input` of an archive
   that is not exactly one whole backup of the release installed; a required input missing, or a value its

@@ -15,6 +15,7 @@ import (
 	"filippo.io/age/armor"
 	"go.yaml.in/yaml/v3"
 
+	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -202,8 +203,10 @@ func TestASecretsInstallWaitsForItsDataBeforeTheHook(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.dir, restoreAwaitedFile)); err != nil {
 		t.Fatalf("no restore-awaited marker: %v", err)
 	}
-	// Docker has no restore verb: the backup is loaded by hand, then provision.
-	if log := e.log.String(); strings.Contains(log, "restore OBJECT") || !strings.Contains(log, "load a backup of it, then `") || !strings.Contains(log, "notes-stow provision --dir") {
+	// Docker's restore, with the install's directory: the records of the digests went with the
+	// old install.
+	if log := e.log.String(); !strings.Contains(log, "notes-stow backup config --dir "+e.dir+"` with the old install's destination, then `") ||
+		!strings.Contains(log, "notes-stow restore OBJECT --unrecorded --dir "+e.dir+"` loads a backup of it") {
 		t.Errorf("log: %s", log)
 	}
 	// The install is finished: its stack is up, the hook waits by design.
@@ -211,7 +214,7 @@ func TestASecretsInstallWaitsForItsDataBeforeTheHook(t *testing.T) {
 		t.Fatal("the install is marked as not finished")
 	}
 	var out bytes.Buffer
-	if err := e.installer(func(o *Options) { o.Out = &out }).Status(context.Background()); err != nil || !strings.Contains(out.String(), "not provisioned: a backup of the install --secrets came from is awaited") {
+	if err := e.installer(func(o *Options) { o.Out = &out }).Status(context.Background()); err != nil || !strings.Contains(out.String(), "awaiting its data: made again by --secrets: `") {
 		t.Errorf("status: %v\n%s", err, out.String())
 	}
 	// A re-run waits too.
@@ -244,6 +247,10 @@ func TestASecretsInstallWithoutTheHookStillWaitsAndResetDBEndsTheWait(t *testing
 	if err := e.install(func(o *Options) { o.Secrets = plain; o.NoProvision = true }); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
+	// --no-provision says how the data comes, never to provision the empty database.
+	if log := e.log.String(); !strings.Contains(log, "awaits its data: `") || strings.Contains(log, "not provisioned (--no-provision)") {
+		t.Fatalf("--no-provision's log: %s", log)
+	}
 	if err := e.install(nil); err != nil || len(e.hookCalls()) != 0 {
 		t.Fatalf("%v: a re-run after --no-provision ran the hook %d times on the empty database", err, len(e.hookCalls()))
 	}
@@ -260,7 +267,7 @@ func TestASecretsInstallWithoutTheHookStillWaitsAndResetDBEndsTheWait(t *testing
 	}
 }
 
-func TestASecretsInstallWhoseStackFailsStillWaitsAndOneWithoutValuesDoesNot(t *testing.T) {
+func TestASecretsInstallWhoseStackFailsStillWaitsAndOneWithoutValuesToo(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	plain := []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\nprovision:\n  ADMIN_KEY: key-of-the-old-data\n")
@@ -274,12 +281,127 @@ func TestASecretsInstallWhoseStackFailsStillWaitsAndOneWithoutValuesDoesNot(t *t
 	if err := e.install(nil); err != nil || len(e.hookCalls()) != 0 {
 		t.Fatalf("%v: the re-run ran the hook %d times on the empty database", err, len(e.hookCalls()))
 	}
-	// A file holding no provision values has nothing of another install's data: no wait.
+	// A file holding no provision values is a machine made again too: it awaits its data.
 	e2 := newEnv(t)
 	if err := e2.install(func(o *Options) { o.Secrets = []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\n") }); err != nil {
 		t.Fatalf("%v\n%s", err, e2.log)
 	}
-	if _, err := os.Stat(filepath.Join(e2.dir, restoreAwaitedFile)); !errors.Is(err, os.ErrNotExist) || len(e2.hookCalls()) != 1 {
+	if _, err := os.Stat(filepath.Join(e2.dir, restoreAwaitedFile)); err != nil || len(e2.hookCalls()) != 0 {
 		t.Fatalf("marker %v, %d hook runs", err, len(e2.hookCalls()))
+	}
+	// provision, the operator's word that the data is the install's, ends the wait and runs it.
+	if err := e2.installer(nil).Provision(context.Background()); err != nil || len(e2.hookCalls()) != 1 {
+		t.Fatalf("provision: %v, %d hook runs", err, len(e2.hookCalls()))
+	}
+	if _, err := os.Stat(filepath.Join(e2.dir, restoreAwaitedFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("still awaiting after provision: %v", err)
+	}
+}
+
+// A release without a provision hook that runs backups: --secrets marks the install awaiting its
+// data, provision (the operator's word) ends the wait, refusing --set as it has no hook. One that
+// runs no backups, the file holding no provision values: nothing a restore could load, no wait.
+func TestASecretsInstallWithoutAHook(t *testing.T) {
+	t.Parallel()
+	secretsOnly := []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\n")
+	e := newEnv(t)
+	e.r.Spec.Hooks.Provision = nil
+	if !providers.RunsBackups(e.r.Spec) {
+		t.Fatal("the test release runs no backups")
+	}
+	if err := e.install(func(o *Options) { o.Secrets = secretsOnly }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	marker := filepath.Join(e.dir, restoreAwaitedFile)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("no wait: %v", err)
+	}
+	if err := e.installer(func(o *Options) { o.Set = map[string]string{"K": "v"} }).Provision(context.Background()); err == nil || !strings.Contains(err.Error(), "has no provision hook") {
+		t.Fatalf("provision --set without a hook: %v", err)
+	}
+	if err := e.installer(nil).Provision(context.Background()); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) || !strings.Contains(e.log.String(), "ends the wait --secrets began") {
+		t.Fatalf("still waiting: %v\n%s", err, e.log)
+	}
+	if err := e.installer(nil).Provision(context.Background()); err == nil || !strings.Contains(err.Error(), "has no provision hook") {
+		t.Fatalf("provision with nothing awaited: %v", err)
+	}
+	e2 := newEnv(t)
+	e2.r.Spec.Backup = nil
+	if err := e2.install(func(o *Options) { o.Secrets = secretsOnly }); err != nil {
+		t.Fatalf("%v\n%s", err, e2.log)
+	}
+	if _, err := os.Stat(filepath.Join(e2.dir, restoreAwaitedFile)); !errors.Is(err, os.ErrNotExist) || len(e2.hookCalls()) != 1 {
+		t.Fatalf("a release without backups waits: %v, %d hook runs", err, len(e2.hookCalls()))
+	}
+	// Neither a hook nor backups: provision values the file holds are left out, nothing awaited.
+	withValues := []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\nprovision:\n  ADMIN_KEY: old\n")
+	e3 := newEnv(t)
+	e3.r.Spec.Backup, e3.r.Spec.Hooks.Provision = nil, nil
+	if err := e3.install(func(o *Options) { o.Secrets = withValues }); err != nil {
+		t.Fatalf("%v\n%s", err, e3.log)
+	}
+	if _, err := os.Stat(filepath.Join(e3.dir, restoreAwaitedFile)); !errors.Is(err, os.ErrNotExist) || !strings.Contains(e3.log.String(), "are left out") {
+		t.Fatalf("no hook, no backups: %v\n%s", err, e3.log)
+	}
+	// A hook given the values, no backups: it waits, the way on loading the data by hand.
+	e4 := newEnv(t)
+	e4.r.Spec.Backup = nil
+	if err := e4.install(func(o *Options) { o.Secrets = withValues }); err != nil {
+		t.Fatalf("%v\n%s", err, e4.log)
+	}
+	if _, err := os.Stat(filepath.Join(e4.dir, restoreAwaitedFile)); err != nil || !strings.Contains(e4.log.String(), "load a backup of it by hand, then `") || strings.Contains(e4.log.String(), "restore OBJECT") {
+		t.Fatalf("no backups: %v\n%s", err, e4.log)
+	}
+	// A release without a hook that runs backups says it waits, at the install.
+	if !strings.Contains(e.log.String(), "an install made again by --secrets awaits its data: `") {
+		t.Fatalf("the wait unsaid:\n%s", e.log)
+	}
+}
+
+// Records an earlier attempt left (its .env never written) do not make the next first install,
+// given no export, one made again or awaiting its data: its hook runs.
+func TestAStaleMadeAgainIsNotKept(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	if err := os.MkdirAll(e.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{madeAgainFile, restoreAwaitedFile} {
+		if err := os.WriteFile(filepath.Join(e.dir, f), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.install(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if st, out := statusOf(t, e, nil); st.MadeAgain || st.RestoreAwaited || len(e.hookCalls()) != 1 {
+		t.Fatalf("made again, or awaiting (%d hook runs): %s", len(e.hookCalls()), out)
+	}
+}
+
+// A first install given --secrets whose .env is not written removes the records it wrote: no
+// install owns them.
+func TestAFailedFirstWriteRemovesItsRecords(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile})
+	// The file inputs' directory a plain file: writing them, before .env, fails.
+	if err := os.MkdirAll(e.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.dir, InputFilesDir), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := e.install(func(o *Options) { o.Secrets = []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\n") })
+	if err == nil || fileExists(filepath.Join(e.dir, envName)) {
+		t.Fatalf("the first write did not fail: %v", err)
+	}
+	for _, f := range []string{madeAgainFile, restoreAwaitedFile} {
+		if fileExists(filepath.Join(e.dir, f)) {
+			t.Errorf("%v: %s is left", err, f)
+		}
 	}
 }

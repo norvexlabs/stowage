@@ -733,7 +733,28 @@ func (in *Installer) Provision(ctx context.Context) error {
 		return err
 	}
 	if h == nil {
-		return fmt.Errorf("%s has no provision hook", in.R.Spec.Name)
+		if !in.restoreAwaited() || len(o.Set) > 0 {
+			return fmt.Errorf("%s has no provision hook", in.R.Spec.Name)
+		}
+		// An install made again by --secrets awaits its data: loaded by hand, provision ends the
+		// wait, with the checks a provision runs (this installer's release, the volumes whole).
+		env, unlock, err := in.openLocked(ctx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		if err := in.sameRelease(ctx, env); err != nil {
+			return err
+		}
+		if err := in.volumesSplit(); err != nil {
+			return err
+		}
+		if !in.restoreAwaited() { // ended under the lock meanwhile (a restore)
+			return fmt.Errorf("%s has no provision hook", in.R.Spec.Name)
+		}
+		in.restoreDone()
+		o.logf("%s has no provision hook: the data loaded by hand ends the wait --secrets began", in.R.Spec.Name)
+		return nil
 	}
 	env, unlock, err := in.openLocked(ctx)
 	if err != nil {

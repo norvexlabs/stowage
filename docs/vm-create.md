@@ -438,7 +438,7 @@ over SSH from your machine takes its host key with `--known-hosts-line`.
   release names it: `sudo <short>-stow secrets export --recipient <age key>` and `sudo
   <short>-stow backup run` here, a new VM of this release made with those secrets (`vm create
   --secrets`, or `vm seed --await-secrets`), then there `sudo <short>-stow backup config` with
-  this VM's destination and rclone config, and `sudo <short>-stow restore <backup>``). By hand, the steps of a VM of several NICs list each NIC with its MAC and network (a VM
+  this VM's destination and rclone config, and `sudo <short>-stow restore <backup> --unrecorded``). By hand, the steps of a VM of several NICs list each NIC with its MAC and network (a VM
   of one NIC lists none); an OpenTofu root takes them from the seed's `interfaces`. A role that is not one of the release's NICs, the primary's addressing
   (`--network`'s), a `static` without its address or an address without `static`, two NICs of one
   MAC, and `attach=` on metal are refused, naming the flag.

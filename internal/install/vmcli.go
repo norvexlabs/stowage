@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/norvexlabs/stowage/internal/lint"
+	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -85,7 +86,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	resultFlag := func(cmd *cobra.Command) {
 		cmd.Flags().BoolVar(&resultJSON, "json", false, "print the run's result as one JSON object at its end, for a program; what the run prints otherwise goes to standard error")
 	}
-	c := &hostClient{http: socketClient(&socket), out: stdout, clientTimes: times, ctl: r.Ctl()}
+	c := &hostClient{http: socketClient(&socket), out: stdout, clientTimes: times, ctl: r.Ctl(), runsBackups: providers.RunsBackups(r.Spec)}
 	// vmVerb makes cmd run its PreRunE, then run, and end on c.result: under --json every outcome,
 	// a PreRunE's refusal included, prints one Result. run tells whether there was nothing to do.
 	vmVerb := func(cmd *cobra.Command, run func(ctx context.Context) (nothing bool, err error)) {
@@ -909,6 +910,8 @@ type hostClient struct {
 	out  io.Writer
 	// ctl is the installer's name, which messages give the operator.
 	ctl string
+	// runsBackups: the release runs backups, so a restore gives an install made again its data.
+	runsBackups bool
 	clientTimes
 }
 
@@ -1054,13 +1057,13 @@ func (c *hostClient) status(ctx context.Context, asJSON, values bool) error {
 		fmt.Fprintf(c.out, "installed  %s %s\n", st.Name, st.Installed)
 		switch {
 		case st.VolumesSplit:
-			fmt.Fprintf(c.out, "           not running: a restore left the volumes half restored; `sudo %s restore OBJECT` again finishes it\n", c.ctl)
+			fmt.Fprintf(c.out, "           not running: a restore left the volumes half restored; `sudo %s restore OBJECT` again (with --unrecorded if it had it) finishes it\n", c.ctl)
 		case st.InstallFailed != "":
 			fmt.Fprintf(c.out, "           not finished: the first install failed: %s (`journalctl -u %s` tells more); `sudo %s install` runs it again\n", st.InstallFailed, st.Name, c.ctl)
 		case st.Installing:
 			fmt.Fprintln(c.out, "           not finished: the stack is coming up, or the provision hook runs")
 		case st.RestoreAwaited:
-			fmt.Fprintf(c.out, "           not provisioned: a backup of the install --secrets came from is awaited (`sudo %s restore OBJECT` loads it and provisions)\n", c.ctl)
+			fmt.Fprintf(c.out, "           awaiting its data: made again by --secrets: %s\n", awaitedHint(c.runsBackups, func(args string) string { return "sudo " + c.ctl + " " + args }))
 		}
 	}
 	if st.Channel != "" {

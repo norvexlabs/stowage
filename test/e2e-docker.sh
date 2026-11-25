@@ -8,7 +8,8 @@
 # installs it → a re-run changes nothing → `--given` replaces an input, a kit issued and taken by --kit too → backups to a WebDAV server through the release's
 # runner (the dump and the uploads volume's archive), and a restore that brings both back → a backup pulled as
 # a tool over SSH would (`backup run --output -` with no settings, given back with `restore --input -`;
-# cut short, refused; another install's, --unrecorded) and one kept on the host, exported and restored → ship 2.0.0 (a migration) → `notes-stow upgrade --version
+# cut short, refused; another install's, --unrecorded) and one kept on the host, exported and restored → a machine made again
+# (secrets export, install --secrets awaiting its restore, restore --unrecorded running the hook) → ship 2.0.0 (a migration) → `notes-stow upgrade --version
 # 2.0.0` fetches its installer and upgrades → rollback is allowed (1.0.0 reads the newer schema) →
 # ship 3.0.0 (a migration that is a rollback barrier) → upgrade → going back to 1.0.0 by upgrade
 # is refused, and rollback is refused naming the snapshot → `reset-db` wipes the data volumes and
@@ -271,6 +272,43 @@ docker exec "$(pg)" psql -U notes -d notes -c 'INSERT INTO e2e_backup VALUES (5)
 "${CTL[@]}" restore "$kept" --dir "$D" --identity "$AGE_KEY" --yes >"$WORK/keep-restore.txt" 2>&1 || { cat "$WORK/keep-restore.txt"; fail "restore of a backup kept on the host"; }
 [[ $(docker exec "$(pg)" psql -U notes -d notes -tAc 'SELECT count(*) FROM e2e_backup') == 1 ]] || fail "the restore of a backup kept on the host did not bring its data back"
 running 1.0.0 1
+
+step "a machine made again: secrets export and a backup, a new install given --secrets awaits the restore, which loads it and runs the hook"
+docker exec "$(pg)" psql -U notes -d notes -c 'INSERT INTO e2e_backup VALUES (6)' >/dev/null || fail "a row before the last backup"
+"${CTL[@]}" backup config --dir "$D" --destination dav:backups --rclone-config "$DAV_CONF" --recipient "$AGE_RECIPIENT" >/dev/null 2>&1 || fail "backup config back to WebDAV"
+"${CTL[@]}" backup run --dir "$D" >"$WORK/again-run.txt" 2>&1 || { cat "$WORK/again-run.txt"; fail "backup run before the machine is made again"; }
+backups=("$WORK"/dav/backups/notes-full-*-1.0.0-r1.pgdump.age)
+last=${backups[-1]##*/}
+"${CTL[@]}" secrets export --dir "$D" --recipient "$AGE_RECIPIENT" --output "$WORK/again-secrets.age" >/dev/null 2>&1 || fail "secrets export"
+"$BIN/age" -d -i "$AGE_KEY" -o "$WORK/again-secrets.yaml" "$WORK/again-secrets.age" || fail "the secrets export does not decrypt"
+D0=$D project0=$project
+# The first install's own cleanup, spelled out: D names the new one until this step ends.
+CLEANUP+=("D='$D0' remove_install" 'D=$WORK/stowage-e2e-again remove_install')
+D=$WORK/stowage-e2e-again
+"${OPERATOR[@]}" "$D0/notes-stow" --no-input --dir "$D" --ports "app=$(free_port),api=$(free_port)" --set ADMIN_EMAIL=admin@notes.test \
+	--secrets "$WORK/again-secrets.yaml" >"$WORK/again-install.log" 2>&1 || { cat "$WORK/again-install.log"; fail "install --secrets"; }
+project=$(project)
+[[ -n $project && $project != "$project0" ]] || fail "the install made again shares the first one's compose project"
+"${OPERATOR[@]}" "$D/notes-stow" status --dir "$D" --json >"$WORK/again-status.json" 2>/dev/null || fail "status of the install made again"
+[[ $(jq .restore_awaited "$WORK/again-status.json") == true ]] || { cat "$WORK/again-status.json"; fail "the install given --secrets does not await its restore"; }
+"${OPERATOR[@]}" "$D/notes-stow" backup config --dir "$D" --destination dav:backups --rclone-config "$DAV_CONF" --recipient "$AGE_RECIPIENT" >/dev/null 2>&1 ||
+	fail "backup config on the install made again"
+# Its records went with the old machine: the restore asks for --unrecorded, then loads the backup.
+rc=0; "${OPERATOR[@]}" "$D/notes-stow" restore "$last" --dir "$D" --identity "$AGE_KEY" --yes >"$WORK/again-restore.txt" 2>&1 || rc=$?
+[[ $rc != 0 ]] && grep -q 'this install recorded no digest of it' "$WORK/again-restore.txt" || { cat "$WORK/again-restore.txt"; fail "a backup the install made again has no record of was restored without --unrecorded"; }
+touch "$WORK/again-before-restore"
+"${OPERATOR[@]}" "$D/notes-stow" restore "$last" --dir "$D" --identity "$AGE_KEY" --yes --unrecorded >"$WORK/again-restore.txt" 2>&1 ||
+	{ cat "$WORK/again-restore.txt"; fail "restore --unrecorded on the install made again"; }
+[[ $(docker exec "$(pg)" psql -U notes -d notes -tAc 'SELECT count(*) FROM e2e_backup') == 2 ]] || fail "the restore did not bring the backup's data to the install made again"
+"${OPERATOR[@]}" "$D/notes-stow" status --dir "$D" --json >"$WORK/again-status.json" 2>/dev/null || fail "status after the restore"
+[[ $(jq '.restore_awaited // false' "$WORK/again-status.json") == false ]] || { cat "$WORK/again-status.json"; fail "the install still awaits a restore after it"; }
+grep -q 'provisioning notes on the restored data' "$WORK/again-restore.txt" || { cat "$WORK/again-restore.txt"; fail "the restore did not run the provision hook"; }
+old_pw=$(grep '^ADMIN_PASSWORD=.' "$D0/provision.env") || fail "the first install's hook recorded no ADMIN_PASSWORD"
+[[ $(grep '^ADMIN_PASSWORD=' "$D/provision.env") == "$old_pw" ]] || fail "the hook did not keep the old install's values"
+# The hook wrote what it returned after the restore: what --secrets wrote before is replaced.
+[[ $D/provision.env -nt $WORK/again-before-restore ]] || fail "the hook did not write provision.env after the restore"
+"${OPERATOR[@]}" "$D/notes-stow" uninstall --dir "$D" --data --yes >/dev/null 2>&1 || fail "uninstall of the install made again"
+D=$D0 project=$project0
 "${CTL[@]}" backup config --dir "$D" --remove >/dev/null 2>&1 || fail "backup config --remove"
 
 step "ship 2.0.0, upgrade --version 2.0.0"

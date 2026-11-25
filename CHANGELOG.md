@@ -3,6 +3,42 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.48.0]
+
+### Security
+
+- Stowage's own binaries (`stowage` and every installer) no longer link the unmaintained OpenPGP
+  package flagged by GO-2026-5932: the signature verifier's sigstore libraries are raised to the
+  release that dropped it, and `golang.org/x/crypto` to 0.59.0.
+
+### Changed
+
+- **BREAKING — an install made again awaits its data**: on Docker and the VM, one made with
+  `--secrets` now awaits its data whenever its release runs backups, whatever the file holds:
+  before, one whose file carried no provision values (or a release without a provision hook) did
+  not, so `status` could not tell a machine made again from one in use. A Kubernetes install still waits only for provision values.
+  `status` says a backup is awaited (`restore_awaited` in `status --json`) and how to load it
+  until `restore` loads one, or `provision` or `reset-db` ends the wait; on a release without a
+  hook, `provision` ends a wait instead of refusing (and still refuses `--set`, or with nothing
+  awaited).
+- **BREAKING — no backup while an install awaits its data**: the timer's run and `backup run` are
+  refused naming the way on (the timer's unit fails, so the wait is seen), and an upgrade takes
+  no backup first — a backup then would store an empty machine beside the old one's backups.
+
+### Added
+
+- On Docker and the VM, `status --json` says `made_again` for an install made by `--secrets` from
+  another install's export, so a program can tell it took one.
+
+### Fixed
+
+- `restore --input` removes the archive it was given before its job is reported ended, so a
+  program reading the job's end finds nothing of it left.
+- The installer's reference said a Docker install made again with `--secrets` has no `restore`:
+  `restore OBJECT --dir D --unrecorded` (or `restore --input … --unrecorded`) loads its backup and
+  runs the provision hook, as on the VM — `--unrecorded` as the old install's records of its
+  backups' digests went with it. The Docker lifecycle suite now proves it end to end.
+
 ## [0.47.0] - 2026-11-25
 
 ### Added

@@ -345,9 +345,14 @@ const (
 	envPrev        = ".env.prev"
 	changingFile   = ".stowage-changing"
 	installingFile = ".stowage-installing"
-	// restoreAwaitedFile marks an install that --secrets gave another install's provision values:
-	// they belong to that install's data, so the hook waits for it to be loaded (provisionUp).
+	// restoreAwaitedFile marks an install made again by --secrets that awaits its data (written
+	// before .env by madeAgainRecords): its release runs backups (a restore loads them), or its hook
+	// was given the old install's provision values. While it is there the hook does not run
+	// (provisionUp) and no backup is taken; restore, provision or reset-db removes it.
 	restoreAwaitedFile = ".stowage-restore-awaited"
+	// madeAgainFile records an install made by --secrets, from another install's export: written
+	// before .env, so every install that took an export says so (status's made_again).
+	madeAgainFile = ".stowage-made-again"
 	// volumesSplitFile marks an install a restore left with its volumes not whole (a swap that
 	// failed, or a database swap whose outcome was not read): nothing brings the stack up, and no
 	// backup is taken, until a restore again finishes.
@@ -507,6 +512,7 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 	mutated = true // the run writes the install from here
 	// Until .env is written no install owns what this run wrote: a failure removes it.
 	certWritten, caWritten, clientCAWritten, acmeRootWritten := false, false, false, false
+	var records []string // madeAgainRecords' files this run wrote
 	unwritten := func(err error) error {
 		switch {
 		case in.removeDir:
@@ -525,6 +531,9 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 				_ = os.RemoveAll(in.path(ACMERootDir))
 			}
 			_ = os.Remove(in.path(installingFile)) // written by this run, under its lock
+			for _, f := range records {
+				_ = os.Remove(in.path(f))
+			}
 		}
 		return err
 	}
@@ -574,17 +583,19 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 	}
 	// .env first: once it exists the directory is this install's, and a re-run finishes it. The
 	// marker before it: an install .env tells is not done until the stack came up, provisioned.
+	// So is the record of a secrets export taken: the install that took it says so.
 	if err := os.WriteFile(in.path(installingFile), nil, 0o600); err != nil {
+		return unwritten(err)
+	}
+	// The records of an export taken and of the wait it begins, before .env: no install exists
+	// without them, and they follow this first install alone.
+	if records, err = in.madeAgainRecords(); err != nil {
 		return unwritten(err)
 	}
 	if err := in.writeEnv(env); err != nil {
 		return unwritten(err)
 	}
 	o.logf("wrote %s", in.path(envName))
-	if err := in.writeRestoredProvision(); err != nil {
-		in.markInstall(err)
-		return err
-	}
 	if err := in.writeRestoredFrontCA(mode); err != nil {
 		in.markInstall(err)
 		return err
@@ -1309,6 +1320,40 @@ func (in *Installer) installEvent(kind, why string) {
 	}
 }
 
+// verbHint is `<short>-stow ARGS` as the operator runs it on this install: through sudo on the
+// VM, with --dir on Docker.
+func (in *Installer) verbHint(args string) string {
+	if in.O.Preloaded {
+		return fmt.Sprintf("sudo %s %s", in.R.Ctl(), args)
+	}
+	return fmt.Sprintf("%s %s --dir %s", in.ctl(), args, in.O.Dir)
+}
+
+// awaitedHint is how the operator gives an install made again its data, ctl the installer as run
+// on the shape (with its trailing flags, as verbHint): on a release that runs backups, the old
+// install's backup settings, then a restore of one of its backups (--unrecorded: its digests'
+// records went with it); on one that does not, the data loaded by hand, then provision.
+func awaitedHint(runsBackups bool, cmd func(args string) string) string {
+	if runsBackups {
+		return fmt.Sprintf("`%s` with the old install's destination, then `%s` loads a backup of it (--unrecorded: its digests' records went with it)",
+			cmd("backup config"), cmd("restore OBJECT --unrecorded"))
+	}
+	return fmt.Sprintf("load a backup of it by hand, then `%s`", cmd("provision"))
+}
+
+// awaitedHint is the package's awaitedHint for this install.
+func (in *Installer) awaitedHint() string {
+	return awaitedHint(providers.RunsBackups(in.R.Spec), in.verbHint)
+}
+
+// awaitingData refuses while the install awaits its data: made again by --secrets, not restored.
+func (in *Installer) awaitingData() error {
+	if !in.restoreAwaited() {
+		return nil
+	}
+	return refuse(in.awaitedHint(), "%s was made again by --secrets and awaits its data: a backup of it now would store an empty machine", in.R.Spec.Name)
+}
+
 // restoreAwaited reports whether the install waits for its data before its provision hook runs.
 func (in *Installer) restoreAwaited() bool { return fileExists(in.path(restoreAwaitedFile)) }
 
@@ -1319,7 +1364,7 @@ func (in *Installer) volumesSplit() error {
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	return refuse("finish the restore (run it again), then run again", "a restore left %s's volumes half restored (%s): its services stay stopped until a restore again finishes", in.R.Spec.Name, in.path(volumesSplitFile))
+	return refuse("finish the restore (run it again, with --unrecorded if it had it), then run again", "a restore left %s's volumes half restored (%s): its services stay stopped until a restore again finishes", in.R.Spec.Name, in.path(volumesSplitFile))
 }
 
 // restoreDone removes the restore-awaited marker: the hook ran on the data its values belong to,
@@ -1421,16 +1466,14 @@ func (in *Installer) provisionUp(ctx context.Context, env *EnvFile, h *providers
 	if h == nil {
 		return nil
 	}
-	if in.O.NoProvision {
-		in.O.logf("not provisioned (--no-provision): `%s provision --dir %s` does it", in.ctl(), in.O.Dir)
+	// The wait first: with --no-provision too, an install made again is told how its data comes,
+	// never to provision an empty database.
+	if in.restoreAwaited() {
+		in.O.logf("not provisioned: an install made again by --secrets awaits its data: %s", in.awaitedHint())
 		return nil
 	}
-	if in.restoreAwaited() {
-		if in.O.Preloaded {
-			in.O.logf("not provisioned: --secrets gave the provision hook's values from another install, which belong to its data: `sudo %s restore OBJECT` loads a backup of it and provisions", in.R.Ctl())
-		} else {
-			in.O.logf("not provisioned: --secrets gave the provision hook's values from another install, which belong to its data: load a backup of it, then `%s provision --dir %s` provisions it", in.ctl(), in.O.Dir)
-		}
+	if in.O.NoProvision {
+		in.O.logf("not provisioned (--no-provision): `%s provision --dir %s` does it", in.ctl(), in.O.Dir)
 		return nil
 	}
 	if err := in.runHook(ctx, env, h); err != nil {
@@ -2872,7 +2915,7 @@ func (in *Installer) unnamedRoleWarning(role string, primary bool, there vmNICs)
 		return
 	}
 	if primary && !named {
-		in.O.logf("warning: no NIC of this VM is named %s, the primary (its cloud-config, from before its release named it, names none): its ports reach nothing; a VM made by this release names it: `sudo %s secrets export --recipient <age key>` and `sudo %s backup run` here, a new VM of this release made with those secrets (`vm create --secrets`, or `vm seed --await-secrets`), then there `sudo %s backup config` with this VM's destination and rclone config, and `sudo %s restore <backup>`", role, ctl, ctl, ctl, ctl)
+		in.O.logf("warning: no NIC of this VM is named %s, the primary (its cloud-config, from before its release named it, names none): its ports reach nothing; a VM made by this release names it: `sudo %s secrets export --recipient <age key>` and `sudo %s backup run` here, a new VM of this release made with those secrets (`vm create --secrets`, or `vm seed --await-secrets`), then there `sudo %s backup config` with this VM's destination and rclone config, and `sudo %s restore <backup> --unrecorded`", role, ctl, ctl, ctl, ctl)
 		return
 	}
 	hint, err := unnamedRoleHint(networkdDir, in.R.Spec.Name, ctl, in.O.Dir, role, there)
@@ -2984,7 +3027,7 @@ func (in *Installer) Status(ctx context.Context) error {
 	case unfinished:
 		fmt.Fprintf(in.O.Out, "not finished: the first install runs, or was stopped; a re-run of the installer with --dir %s finishes it\n", dir)
 	case in.restoreAwaited():
-		fmt.Fprintf(in.O.Out, "not provisioned: a backup of the install --secrets came from is awaited; once loaded, `%s provision --dir %s` provisions it\n", in.ctl(), dir)
+		fmt.Fprintf(in.O.Out, "awaiting its data: made again by --secrets: %s\n", in.awaitedHint())
 	}
 	for _, r := range in.R.Spec.Front.Routes {
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", r.Name, get(spec.URLVar(r.Name)))

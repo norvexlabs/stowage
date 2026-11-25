@@ -260,7 +260,7 @@ func TestAVolumeNotSwappedInFailsTheRestore(t *testing.T) {
 		}
 		// A refusal on the verbs that move the release, as the Docker install's.
 		if strings.HasPrefix(path, "/v1/upgrade") || strings.HasPrefix(path, "/v1/rollback") {
-			if e409.Fix != "finish the restore (run it again), then run again" {
+			if e409.Fix != "finish the restore (run it again, with --unrecorded if it had it), then run again" {
 				t.Errorf("%s: fix %q", path, e409.Fix)
 			}
 		}

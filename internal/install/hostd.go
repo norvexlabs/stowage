@@ -193,8 +193,8 @@ type Hostd struct {
 	backingUp atomic.Bool
 	// backups counts the backups running: Serve waits for them to clean up as it stops.
 	backups sync.WaitGroup
-	// inputMu is held from the read of an archive `restore --input` gives until its restore
-	// ends: one at a time uses restoreInput.
+	// inputMu is held from the read of an archive `restore --input` gives until its restore no
+	// longer reads it, just before its job is marked ended: one at a time uses restoreInput.
 	inputMu sync.Mutex
 	// rollbacks counts the rollbacks running, each counted under mu as its job is claimed: Serve
 	// waits for one stopped in its grace to journal that its reboot does not come. stopping, under
@@ -329,9 +329,12 @@ type Status struct {
 	// failed; a re-run of the install finishes it.
 	Installing    bool   `json:"installing,omitempty"`
 	InstallFailed string `json:"install_failed,omitempty"`
-	// RestoreAwaited: --secrets gave the install another's provision values; the hook waits for a
-	// backup of that install's data (`restore` loads it, then provisions).
+	// RestoreAwaited: made again by --secrets, the install awaits its data (madeAgainRecords):
+	// `restore` loads a backup of the old install's, or `provision` ends the wait for data loaded by
+	// hand (a release without backups).
 	RestoreAwaited bool `json:"restore_awaited,omitempty"`
+	// MadeAgain: the install was made by --secrets, from another install's export.
+	MadeAgain bool `json:"made_again,omitempty"`
 	// VolumesSplit: a restore left the volumes half restored; the stack stays down until a
 	// restore again finishes.
 	VolumesSplit bool   `json:"volumes_split,omitempty"`
@@ -505,7 +508,7 @@ type UpgradePlan struct {
 	Slot string  `json:"slot"` // the slot its OS is written to: passive, or active for a rewrite
 	Does string  `json:"does"` // what the boot into it does
 	// Backup: the job takes a backup first (settings configured, no skip_backup, not a first
-	// install nor a rewrite).
+	// install nor a rewrite, the install opening and not awaiting its data: backupFirstOf).
 	Backup bool `json:"backup"`
 	// Unchecked, when set, says why the daemon left the install's values to the boot into the
 	// release (published by another Stowage, or a spec this one does not read): the job's log says
@@ -1074,6 +1077,7 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		}
 		st.Installing, st.InstallFailed, _ = in.firstInstall()
 		st.RestoreAwaited = in.restoreAwaited()
+		st.MadeAgain = fileExists(in.path(madeAgainFile))
 		st.Channel, _ = env.Get(ChannelVar)
 		// A registry CA that cannot be read is left out: the status always answers, and a poll
 		// logs nothing at each request.

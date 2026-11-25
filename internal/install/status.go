@@ -220,12 +220,15 @@ func (in *Installer) heldValues(v *RecordedValues, loginHost, loginProblem strin
 type DockerStatus struct {
 	InstallStatus
 	FirstInstall
-	// RestoreAwaited and VolumesSplit are the VM's: the provision hook waits for a backup of the
-	// install --secrets came from; a restore left the volumes half restored (or one runs).
-	RestoreAwaited bool      `json:"restore_awaited,omitempty"`
-	VolumesSplit   bool      `json:"volumes_split,omitempty"`
-	Services       []Service `json:"services"`
-	ServicesError  string    `json:"services_error,omitempty"`
+	// RestoreAwaited: made again by --secrets, the install awaits its data (madeAgainRecords): no
+	// hook runs, no backup is taken, until restore, provision or reset-db;
+	// VolumesSplit: a restore left the volumes half restored (or one runs). Docker's as the VM's.
+	RestoreAwaited bool `json:"restore_awaited,omitempty"`
+	VolumesSplit   bool `json:"volumes_split,omitempty"`
+	// MadeAgain: the install was made by --secrets, from another install's export.
+	MadeAgain     bool      `json:"made_again,omitempty"`
+	Services      []Service `json:"services"`
+	ServicesError string    `json:"services_error,omitempty"`
 	// RegistryLogin is the host the install holds a login for (`registry-login`,
 	// --registry-login-file), the release's own registry's or its mirror's: never the login itself.
 	// Empty when it holds none; RegistryLoginError when the file held cannot be read (the reads of
@@ -461,6 +464,7 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 		Installed: &StatusRelease{Version: v, Revision: n, Installer: installerFor(ref, of, v, n)}}}
 	st.Installing, st.InstallFailed, _ = in.firstInstall()
 	st.RestoreAwaited = in.restoreAwaited()
+	st.MadeAgain = fileExists(in.path(madeAgainFile))
 	// As the VM's: not while a restore runs (it holds the mark from its database's swap to its last
 	// volume's), which holds the install's hostLock — a backup refuses to start on split volumes.
 	st.VolumesSplit = in.volumesSplit() != nil && !hostBusy(in.O.Dir)

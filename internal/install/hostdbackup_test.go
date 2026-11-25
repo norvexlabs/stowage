@@ -1718,3 +1718,62 @@ func TestAStoredScheduleUncheckedIsKept(t *testing.T) {
 		}
 	}
 }
+
+// An install made again by --secrets and not restored yet stores no backup: it would be an empty
+// machine beside the old one's. The timer's run and a run asked are refused with the way on (the
+// timer's unit fails: never a quiet skip), and an upgrade takes no backup first.
+func TestAnInstallAwaitingItsDataTakesNoBackup(t *testing.T) {
+	t.Parallel()
+	_, d, f, key := backupVM(t)
+	configure(t, d, validConfig(key))
+	if err := os.WriteFile(filepath.Join(d.O.Dir, restoreAwaitedFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := d.Handler()
+	var e errOf
+	if code := call(t, h, "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &e); code != 409 || !strings.Contains(e.Error, "awaits its data") {
+		t.Errorf("the timer's run: %d %+v", code, e)
+	}
+	if code := call(t, h, "POST", "/v1/backup", nil, &e); code != 409 || !strings.Contains(e.Error, "awaits its data") || !strings.Contains(e.Fix, "restore OBJECT --unrecorded") {
+		t.Errorf("a run asked: %d %+v", code, e)
+	}
+	if len(f.objects) != 0 {
+		t.Errorf("stored %v", f.objects)
+	}
+
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.release("2.0.0", 1, nil)
+	f2 := &fakeRclone{objects: map[string][]byte{}}
+	p.env.docker.runner = f2.run
+	d2 := daemon(p.env, &fakeHost{})
+	configure(t, d2, validConfig(key))
+	if err := os.WriteFile(filepath.Join(d2.O.Dir, restoreAwaitedFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The dry run says no backup first, as the upgrade takes none.
+	var plan UpgradePlan
+	if code := call(t, d2.Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true}, &plan); code != 200 || plan.Backup {
+		t.Errorf("the dry run: %d %+v", code, plan)
+	}
+	no := false
+	call(t, d2.Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Reboot: &no}, nil)
+	if j := waitJob(t, d2.Handler()); j.State != "done" || !strings.Contains(strings.Join(j.Log, "\n"), "no backup first: notes was made again by --secrets and awaits its data") || len(f2.objects) != 0 {
+		t.Errorf("the upgrade's backup: %+v %v", j, f2.objects)
+	}
+}
+
+// The VM's status says an install was made by --secrets.
+func TestVMStatusSaysMadeAgain(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(func(o *Options) {
+		vm(o)
+		o.Secrets = []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\n")
+	}); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	var st Status
+	if code := call(t, daemon(e, &fakeHost{}).Handler(), "GET", "/v1/status", nil, &st); code != 200 || !st.MadeAgain || !st.RestoreAwaited {
+		t.Errorf("%d %+v", code, st)
+	}
+}

@@ -782,7 +782,7 @@ func TestTheDaemonKeepsTheRollbacksVMFix(t *testing.T) {
 				t.Fatal(err)
 			}
 			return func() {}
-		}, "finish the restore (run it again), then run again"},
+		}, "finish the restore (run it again, with --unrecorded if it had it), then run again"},
 	} {
 		e, d, _ := upgradedVM(t)
 		defer c.set(t, e)()

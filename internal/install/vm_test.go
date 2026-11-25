@@ -1624,7 +1624,7 @@ func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
 	log.Reset()
 	in.roleNames(true, "uplink")
 	if want := "warning: no NIC of this VM is named uplink, the primary (its cloud-config, from before its release named it, names none): its ports reach nothing; a VM made by this release names it: " +
-		"`sudo notes-stow secrets export --recipient <age key>` and `sudo notes-stow backup run` here, a new VM of this release made with those secrets (`vm create --secrets`, or `vm seed --await-secrets`), then there `sudo notes-stow backup config` with this VM's destination and rclone config, and `sudo notes-stow restore <backup>`\n"; log.String() != want {
+		"`sudo notes-stow secrets export --recipient <age key>` and `sudo notes-stow backup run` here, a new VM of this release made with those secrets (`vm create --secrets`, or `vm seed --await-secrets`), then there `sudo notes-stow backup config` with this VM's destination and rclone config, and `sudo notes-stow restore <backup> --unrecorded`\n"; log.String() != want {
 		t.Errorf("log %q\nwant %q", log.String(), want)
 	}
 	// The primary the cloud-config names, no NIC carrying it now: its case's hint, never a new VM.

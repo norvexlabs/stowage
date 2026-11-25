@@ -20,14 +20,14 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
           [--json]   # the run's result as one object, for a program (see "Exit status and --json on the VM")
 <short>-stow --version               # (-v) the release this OS carries and the Stowage that built it, as the Docker installer's
 <short>-stow describe [--json]        # what the release this OS carries offers, read with no install: the Docker installer's describe
-<short>-stow status [--json [--values]]   # --values: the recorded values (machine-interface.md), the operator's alone; this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot (until a later boot is judged healthy), the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more, but on a link whose static `address6` has no `gateway6`), the services
+<short>-stow status [--json [--values]]   # --values: the recorded values (machine-interface.md), the operator's alone; this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `awaiting its data: made again by --secrets: …` while an install given `--secrets` awaits its data, with the way on (`backup config` with the old install's destination, then `restore OBJECT --unrecorded`; on a release without backups, the data loaded by hand, then `provision`), `"restore_awaited": true`; `"made_again": true` for an install made by `--secrets`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot (until a later boot is judged healthy), the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more, but on a link whose static `address6` has no `gateway6`), the services
 <short>-stow health [--json]          # ready, or fails saying why: the health gate's check, once
 <short>-stow events [--after N] [--follow|-f] [--json]   # the event journal: jobs, reboots, boots and the health gate's verdicts, the first install; --follow waits for more until interrupted, through daemon restarts
 <short>-stow ps [--json]              # the stack's services, state and health, then `down: <service> <why>` for each service down (as on Docker's `status`; the VM's `status` ends with the same); `--json`: each with `exit_code`, and when set (each absent when false, 0 or empty) `id`, `oom_killed`, `mem_limit_bytes` and `restarts` (these three from docker inspect)
 <short>-stow logs SERVICE [--tail N]  # 1 to 5000 lines, default 200
 <short>-stow exec [--stdin] SERVICE -- COMMAND [ARG…]   # in the running container, no terminal; --stdin (-i) passes this command's input (at most 4 MiB), else none; its outputs once it ends, its exit status
 <short>-stow restart|stop|start SERVICE
-<short>-stow provision [--set KEY=VALUE]…   # the provision hook again; --set as on Docker (an input only it reads, or a value it returned or declares it returns; empty forgets it)
+<short>-stow provision [--set KEY=VALUE]…   # the provision hook again; --set as on Docker (an input only it reads, or a value it returned or declares it returns; empty forgets it); on a release without a hook, only the end of an install made again's wait for its data (no --set)
 <short>-stow updates [--channel C] [--version V] [--json]
 <short>-stow upgrade [--channel C] [--version V] [--set KEY=VALUE] [--set-file KEY=PATH] [--answers FILE] [--yes] [--no-reboot] [--skip-backup] [--dry-run] [--unordered] [--accessible] [--json]   # ends at the reboot it schedules: status and events after it tell how it went
 <short>-stow rollback [--yes] [--dry-run] [--accessible] [--json]   # reboot into the passive system: back to the release the last upgrade replaced; ends at that reboot
@@ -1161,6 +1161,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   swapped, the volumes are the whole backup, so `.stowage-volumes-split` marks the install from
   the first volume's swap — and brings the stack up and provisions it. A machine made again with
   `--secrets` awaits it as it awaits a dump.
+- No backup is taken while an install made again by `--secrets` awaits its data (`status`'s `awaiting
+  its data`): the timer's run and `backup run` are refused naming the way on (the timer's unit
+  fails, so the wait is seen), and an upgrade takes no backup first — a backup then would store an
+  empty machine beside the old one's backups.
 - Backups (a `pg-age-rclone` or `volumes-age-rclone` `backup`): the daemon runs `pg_dump --format=custom --compress=9`
   (owners and privileges kept: the stack's roles exist on every install) as `database.roles.migrate` inside the database service (`docker
   compose exec`: the server's own version), encrypts the dump with age as it streams, to every
@@ -1608,7 +1612,8 @@ showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rol
   start the boot cancels, `Job for <name>.service canceled.`, is tried once more once
   `systemctl is-system-running --wait` returns, 10 min at most, unless the unit failed; a failure
   then fails the create, the VM kept), then `backup config` with the same destination, `backup
-  list` and `restore OBJECT` load the data back. The front's local CA (`--tls internal`) goes
+  list` and `restore OBJECT --unrecorded` load the data back (the old VM's records of its
+  backups' digests went with it). The front's local CA (`--tls internal`) goes
   with the secrets: the new VM's front issues from the same root.
 - Not yet: `upgrade --reset-db`, secrets sealed in an encrypted answers file.
 - The firewall: the bundle's `/etc/nftables.conf` holds a table of the project's own (`inet

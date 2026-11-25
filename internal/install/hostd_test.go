@@ -204,10 +204,17 @@ func (f *fakeHost) calls() [][]string {
 	return append([][]string(nil), f.ran...)
 }
 
-// daemon is a host daemon over e's install, carrying e's release.
+// daemon is a host daemon over e's install, carrying e's release, on a disk with room to spare:
+// a test of the disk's space sets Statfs itself, so none depends on the machine's free space.
 func daemon(e *env, host *fakeHost) *Hostd {
 	o := e.installer(vm).O
-	return &Hostd{R: e.r, O: o, Host: host, Unit: time.Millisecond, Run: e.t.TempDir(), State: e.t.TempDir(), Networkd: e.t.TempDir(), RunNetworkd: e.t.TempDir(), Issue: e.t.TempDir(), InstallNet: filepath.Join(e.t.TempDir(), "install-network.yaml"), Systemd: e.t.TempDir(), Stowage: testStowage}
+	return &Hostd{R: e.r, O: o, Host: host, Unit: time.Millisecond, Run: e.t.TempDir(), State: e.t.TempDir(), Networkd: e.t.TempDir(), RunNetworkd: e.t.TempDir(), Issue: e.t.TempDir(), InstallNet: filepath.Join(e.t.TempDir(), "install-network.yaml"), Systemd: e.t.TempDir(), Stowage: testStowage,
+		Statfs: roomyDisk}
+}
+
+// roomyDisk is a 1 TiB disk a tenth used, for dir.
+func roomyDisk(dir string) *Disk {
+	return &Disk{Path: dir, Total: 1 << 40, Used: 1 << 40 / 10, Available: 1 << 40 / 10 * 9}
 }
 
 // call asks h and decodes its JSON answer into out; it returns the status.

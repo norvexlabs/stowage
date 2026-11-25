@@ -1117,8 +1117,14 @@ func (h *Hostd) planBackup(ctx context.Context, req BackupRequest) (*backupPlan,
 	if err != nil {
 		return nil, err
 	}
-	// A backup of volumes half restored would pass for a whole one.
+	// A backup of volumes half restored would pass for a whole one; one of an install made again,
+	// before its data is loaded, would store an empty machine beside the old one's backups.
 	if err := in.volumesSplit(); err != nil {
+		return nil, failAs(http.StatusConflict, err)
+	}
+	// Refused, the timer's run too: an install made again and never restored is seen to take no
+	// backup (its unit fails), never skipped quietly while its data grows.
+	if err := in.awaitingData(); err != nil {
 		return nil, failAs(http.StatusConflict, err)
 	}
 	h.backupMu.Lock()
@@ -1166,40 +1172,51 @@ func (h *Hostd) planBackup(ctx context.Context, req BackupRequest) (*backupPlan,
 	return &backupPlan{in: in, env: env, t: t, pg: pg, profile: profile, obj: obj}, nil
 }
 
-// preflightBackup takes a backup before an upgrade, when one is configured: one that fails is
-// logged, and the upgrade goes on (the boot still dumps the database before it migrates).
-// backupFirst says whether preflightBackup would take a backup: settings that can be read
-// configure one.
-func (h *Hostd) backupFirst() bool {
+// backupFirstOf is what an upgrade's backup first takes on in, or why it takes none: the release
+// running no backup (no reason), settings that do not read or none configured, an install that
+// does not open, or one awaiting its data. The upgrade (preflightBackup) and its dry run
+// (backupFirst) decide by it alone.
+func (h *Hostd) backupFirstOf(in *Installer) (pg *providers.AgeRclone, c *BackupConfig, env *EnvFile, why string, ok bool) {
 	pg, err := h.pgBackup()
 	if err != nil {
-		return false
+		if !providers.RunsBackups(h.R.Spec) {
+			return nil, nil, nil, "", false // a release that takes none: nothing to say
+		}
+		return nil, nil, nil, err.Error(), false
 	}
 	h.backupMu.Lock()
-	c, err := h.readBackup(pg)
-	h.backupMu.Unlock()
-	return err == nil && c != nil
-}
-
-func (h *Hostd) preflightBackup(in *Installer, logf func(string, ...any)) {
-	pg, err := h.pgBackup()
-	if err != nil {
-		return
-	}
-	h.backupMu.Lock()
-	c, err := h.readBackup(pg)
+	c, err = h.readBackup(pg)
 	h.backupMu.Unlock()
 	switch {
 	case err != nil:
-		logf("no backup first: %v", err)
-		return
+		return nil, nil, nil, err.Error(), false
 	case c == nil:
-		logf("no backup first: none is configured")
-		return
+		return nil, nil, nil, "none is configured", false
 	}
-	env, err := in.open()
-	if err != nil {
-		logf("no backup first: %v", err)
+	if env, err = in.open(); err != nil {
+		return nil, nil, nil, err.Error(), false
+	}
+	if err := in.awaitingData(); err != nil {
+		return nil, nil, nil, err.Error(), false
+	}
+	return pg, c, env, "", true
+}
+
+// backupFirst says whether preflightBackup would take a backup.
+func (h *Hostd) backupFirst() bool {
+	in, _ := h.run()
+	_, _, _, _, ok := h.backupFirstOf(in)
+	return ok
+}
+
+// preflightBackup takes a backup before an upgrade, when one is configured: one that fails is
+// logged, and the upgrade goes on (the boot still dumps the database before it migrates).
+func (h *Hostd) preflightBackup(in *Installer, logf func(string, ...any)) {
+	pg, c, env, why, ok := h.backupFirstOf(in)
+	if !ok {
+		if why != "" {
+			logf("no backup first: %s", why)
+		}
 		return
 	}
 	m := h.R.Manifest

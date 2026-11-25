@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"filippo.io/age"
@@ -343,13 +344,20 @@ func (h *Hostd) startRestore(w http.ResponseWriter, in *Installer, pg *providers
 	h.backups.Add(1)
 	go func() {
 		defer h.backups.Done()
-		if done != nil {
-			defer done()
+		// done (the input's removal) runs before the job is seen to end: a client that reads it
+		// ended finds nothing of it left. Once, a panic included.
+		var once sync.Once
+		release := func() {
+			if done != nil {
+				once.Do(done)
+			}
 		}
+		defer release()
 		jw := &jobWriter{h: h, j: j}
 		in.O.Out, in.O.Log = jw, jw
 		err := h.runRestore(in, input, req.Object, ids, req.Unrecorded, func(format string, a ...any) { h.logf(j, format, a...) })
 		jw.flush()
+		release()
 		h.finish(j, err)
 	}()
 	accepted(w, j)
@@ -521,7 +529,7 @@ func (h *Hostd) provisionRestored(ctx context.Context, in *Installer, env *EnvFi
 	}
 	logf("provisioning %s on the restored data", in.R.Spec.Name)
 	if err := in.provisionNow(ctx, env, hook); err != nil {
-		return fmt.Errorf("restored %s, but the provision hook failed: %w (`sudo %s provision` runs it again)", object, err, in.R.Ctl())
+		return fmt.Errorf("restored %s, but the provision hook failed: %w (`%s` runs it again)", object, err, in.verbHint("provision"))
 	}
 	return nil
 }

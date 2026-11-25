@@ -12,6 +12,8 @@ import (
 	"filippo.io/age"
 	"filippo.io/age/armor"
 	"go.yaml.in/yaml/v3"
+
+	"github.com/norvexlabs/stowage/internal/providers"
 )
 
 // SecretsFile is an install's secrets as `secrets export` writes them, encrypted to the operator's
@@ -201,34 +203,74 @@ func (in *Installer) restoredSecret(k string) string {
 	return in.restored.Secrets[k]
 }
 
-// writeRestoredProvision records the provision hook's values --secrets gives, as the hook's own
-// run would: its next run is given them.
-func (in *Installer) writeRestoredProvision() error {
-	if in.restored == nil || len(in.restored.Provision) == 0 {
-		return nil
+// madeAgainRecords writes the records of a first install: made_again when it is given a secrets
+// export, and restore_awaited when that install awaits its data — its release runs backups (a
+// restore loads them), or its hook is given the file's provision values: the machine made again
+// is not the old one until a backup of it is loaded (restore), or the operator says it is
+// (provision, reset-db). One an earlier attempt left (its .env never written) is removed when
+// this install makes none. Run before .env, so no install exists without its records. It says
+// which it wrote.
+func (in *Installer) madeAgainRecords() (written []string, err error) {
+	again := in.restored != nil
+	var h *providers.ProvisionHook
+	if again {
+		if h, err = in.hook(); err != nil {
+			return nil, fmt.Errorf("--secrets: %w", err)
+		}
 	}
-	h, err := in.hook()
-	if err != nil {
-		return err
+	awaits := again && (providers.RunsBackups(in.R.Spec) || len(in.restored.Provision) > 0 && h != nil)
+	for _, r := range []struct {
+		file string
+		on   bool
+	}{{madeAgainFile, again}, {restoreAwaitedFile, awaits}} {
+		if !r.on {
+			if err := os.Remove(in.path(r.file)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return written, fmt.Errorf("a record an earlier attempt left: %w", err)
+			}
+			continue
+		}
+		if err := os.WriteFile(in.path(r.file), nil, 0o600); err != nil {
+			return written, fmt.Errorf("--secrets: %w", err)
+		}
+		written = append(written, r.file)
+	}
+	// The hook's values the file gives belong with the wait: written with it, before .env.
+	switch wrote, err := in.writeRestoredProvision(h); {
+	case err != nil:
+		return written, err
+	case wrote:
+		written = append(written, ProvisionEnv)
+	}
+	if awaits && h == nil { // a hook's provisionUp says it otherwise
+		in.O.logf("an install made again by --secrets awaits its data: %s", in.awaitedHint())
+	}
+	return written, nil
+}
+
+// writeRestoredProvision records the provision hook h's values --secrets gives, as the hook's own
+// run would: its next run is given them; the install awaits its data (madeAgainRecords). It says
+// whether it wrote them.
+func (in *Installer) writeRestoredProvision(h *providers.ProvisionHook) (bool, error) {
+	if in.restored == nil || len(in.restored.Provision) == 0 {
+		return false, nil
 	}
 	if h == nil {
 		in.O.logf("--secrets: %s %s runs no provision hook: its values in the file are left out", in.R.Spec.Name, in.R.Manifest.ProjectVersion)
-		return nil
+		return false, nil
 	}
 	// The values are what the hook returned on another install's data: run on this empty database
 	// it would be refused them, or mint new ones the restore then leaves matching nothing. Every
 	// run — this one, a re-run after a failure or --no-provision, the boot's — waits until the data
-	// is loaded (provisionUp). Written before the values, before the stack starts: no failure on
-	// the way leaves the values without the wait.
-	if err := os.WriteFile(in.path(restoreAwaitedFile), nil, 0o600); err != nil {
-		return fmt.Errorf("--secrets: %w", err)
-	}
+	// is loaded (provisionUp).
 	p := NewEnvFile()
 	for _, k := range sortedKeys(in.restored.Provision) {
 		p.Set(k, in.restored.Provision[k])
 	}
 	if err := p.Check(); err != nil {
-		return fmt.Errorf("--secrets: provision: %w", err)
+		return false, fmt.Errorf("--secrets: provision: %w", err)
 	}
-	return p.WriteFile(in.path(ProvisionEnv))
+	if err := p.WriteFile(in.path(ProvisionEnv)); err != nil {
+		return false, err
+	}
+	return true, nil
 }
