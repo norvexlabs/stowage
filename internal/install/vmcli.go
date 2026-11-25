@@ -789,13 +789,37 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 // the backup's objects and the role its release loads a dump as, names them in its log or refusal.
 func restoreCommand(c *hostClient, name string, noInstall func() error, stderr io.Writer, terminal func(accessible bool) Prompter) *cobra.Command {
 	var yes, accessible, unrecorded bool
-	var identity string
+	var identity, input string
 	restore := &cobra.Command{
-		Use:   "restore OBJECT",
-		Short: "Load a backup (`backup list` names them) of the release the install runs into its database and its volumes; the age identity that decrypts it is read from standard input or --identity, and kept nowhere; the services but the database (every service, without one) stop meanwhile",
-		Args:  cobra.ExactArgs(1),
+		Use:   "restore OBJECT | --input FILE|-",
+		Short: "Load a backup (`backup list` names them; or an archive `backup export` or `backup run --output` streamed out, given with --input) of the release the install runs into its database and its volumes; the age identity that decrypts it is read from standard input or --identity, and kept nowhere; the services but the database (every service, without one) stop meanwhile",
+		Args:  cobra.RangeArgs(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+			f := cmd.Flags()
+			switch {
+			case f.Changed("input") && input == "":
+				return Refused{Reason: "--input names no file: a file, or - for standard input"}
+			case f.Changed("input") == (len(args) == 1):
+				return Refused{Reason: "restore OBJECT, or restore --input FILE|-: one of them"}
+			case input == "-" && (!f.Changed("identity") || identity == "-"):
+				return Refused{Reason: "--input - reads the archive from standard input: give the identity as a file, --identity FILE"}
+			case input == "-" && !yes:
+				return Refused{Reason: "--input - reads the archive from standard input, which leaves nothing to confirm on: --yes restores without asking"}
+			}
+			var archive io.Reader
+			if input != "" {
+				if input == "-" {
+					archive = cmd.InOrStdin()
+				} else {
+					a, err := os.Open(input)
+					if err != nil {
+						return fmt.Errorf("--input: %w", err)
+					}
+					defer a.Close()
+					archive = a
+				}
+			}
 			var st Status
 			if err := c.do(ctx, http.MethodGet, "/v1/status", nil, &st); err != nil {
 				return err
@@ -812,7 +836,11 @@ func restoreCommand(c *hostClient, name string, noInstall func() error, stderr i
 				if t == nil {
 					return errors.New("no terminal to confirm on: --yes restores without asking")
 				}
-				title := fmt.Sprintf("Replace %s %s's data with %s?", name, st.Installed, args[0])
+				what := input
+				if len(args) == 1 {
+					what = args[0]
+				}
+				title := fmt.Sprintf("Replace %s %s's data with %s?", name, st.Installed, what)
 				if unrecorded {
 					title += " " + unrecordedConfirm
 				}
@@ -827,13 +855,32 @@ func restoreCommand(c *hostClient, name string, noInstall func() error, stderr i
 					return ErrAborted
 				}
 			}
+			req := RestoreRequest{Identity: string(key), Confirm: st.Installed, Unrecorded: unrecorded}
 			var started JobStarted
-			if err := c.do(ctx, http.MethodPost, "/v1/restore", RestoreRequest{Object: args[0], Identity: string(key), Confirm: st.Installed, Unrecorded: unrecorded}, &started); err != nil {
+			if archive == nil {
+				req.Object = args[0]
+				if err := c.do(ctx, http.MethodPost, "/v1/restore", req, &started); err != nil {
+					return err
+				}
+				return c.follow(ctx, stderr, started)
+			}
+			// The request on one line, then the archive as it is read.
+			line, err := json.Marshal(req)
+			if err != nil {
 				return err
+			}
+			resp, err := c.send(ctx, http.MethodPost, "/v1/restore/input", "application/x-stowage-restore", io.MultiReader(bytes.NewReader(append(line, '\n')), archive))
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&started); err != nil {
+				return fmt.Errorf("the host daemon's answer: %w", err)
 			}
 			return c.follow(ctx, stderr, started)
 		},
 	}
+	restore.Flags().StringVar(&input, "input", "", "restore the backup of this archive (backup export, backup run --output), a file or - for standard input (then --identity FILE and --yes)")
 	restore.Flags().StringVar(&identity, "identity", "-", "the age identity file that decrypts the backup; - for standard input")
 	restore.Flags().BoolVarP(&yes, "yes", "y", false, "restore without asking")
 	restore.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
@@ -887,49 +934,22 @@ func (u unreachable) Unwrap() error { return u.err }
 // do sends body (JSON, when not nil) and decodes the answer into out (when not nil).
 func (c *hostClient) do(ctx context.Context, method, path string, body, out any) error {
 	var rd io.Reader
+	ct := ""
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		rd = bytes.NewReader(raw)
+		rd, ct = bytes.NewReader(raw), "application/json"
 	}
-	req, err := http.NewRequestWithContext(ctx, method, "http://hostd"+path, rd)
+	resp, err := c.send(ctx, method, path, ct, rd)
 	if err != nil {
 		return err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := c.http.Do(req)
-	if me := (madeErr{}); errors.As(err, &me) {
-		return me.error // the daemon of this process failed to be made: its error as it is
-	}
-	if err != nil {
-		var op *net.OpError
-		if errors.As(err, &op) && errors.Is(err, os.ErrPermission) {
-			return fmt.Errorf("the host daemon's socket: permission denied (are you root or in the %s group?)", AdminGroup)
-		}
-		return unreachable{fmt.Errorf("the host daemon is not reachable (systemctl status of its service tells why): %w", err)}
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
 		return unreachable{fmt.Errorf("the host daemon stopped before it answered: %w", err)}
-	}
-	if resp.StatusCode >= 400 {
-		var e struct {
-			Error, Fix      string
-			Refused, Absent bool
-		}
-		switch {
-		case json.Unmarshal(raw, &e) != nil || e.Error == "":
-		case e.Refused: // the daemon's refusal, with its fix or without: nothing changed
-			return Refused{Reason: e.Error, Fix: e.Fix, Absent: e.Absent}
-		default:
-			return errors.New(e.Error)
-		}
-		return fmt.Errorf("the host daemon answered %s", resp.Status)
 	}
 	if out == nil {
 		return nil
@@ -938,6 +958,49 @@ func (c *hostClient) do(ctx context.Context, method, path string, body, out any)
 		return fmt.Errorf("the host daemon's answer: %w", err)
 	}
 	return nil
+}
+
+// send sends a request with body (of type ct, when set) and answers the daemon's answer, its body
+// to read and close; an answer of 400 or more is its error (a refusal one), the body closed.
+func (c *hostClient) send(ctx context.Context, method, path, ct string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, "http://hostd"+path, body)
+	if err != nil {
+		return nil, err
+	}
+	if ct != "" {
+		req.Header.Set("Content-Type", ct)
+	}
+	resp, err := c.http.Do(req)
+	if me := (madeErr{}); errors.As(err, &me) {
+		return nil, me.error // the daemon of this process failed to be made: its error as it is
+	}
+	if err != nil {
+		var op *net.OpError
+		if errors.As(err, &op) && errors.Is(err, os.ErrPermission) {
+			return nil, fmt.Errorf("the host daemon's socket: permission denied (are you root or in the %s group?)", AdminGroup)
+		}
+		return nil, unreachable{fmt.Errorf("the host daemon is not reachable (systemctl status of its service tells why): %w", err)}
+	}
+	if resp.StatusCode < 400 {
+		return resp, nil
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, unreachable{fmt.Errorf("the host daemon stopped before it answered: %w", err)}
+	}
+	var e struct {
+		Error, Fix      string
+		Refused, Absent bool
+	}
+	switch {
+	case json.Unmarshal(raw, &e) != nil || e.Error == "":
+	case e.Refused: // the daemon's refusal, with its fix or without: nothing changed
+		return nil, Refused{Reason: e.Error, Fix: e.Fix, Absent: e.Absent}
+	default:
+		return nil, errors.New(e.Error)
+	}
+	return nil, fmt.Errorf("the host daemon answered %s", resp.Status)
 }
 
 // textOut is where a verb prints its text for people: standard output, or log under --json

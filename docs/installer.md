@@ -58,8 +58,9 @@ refusal is the verb's Result.
 <short>-stow rollback [--dir D] [--offline] [--dry-run] [--json]         # the installer the install keeps
 <short>-stow reset-db [--dir D] [--yes] [--no-input] [--accessible] [--dry-run] [--no-provision]
           [--new-baseline]                                               # the NEW release's installer, across a baseline
-<short>-stow backup config|run|status|list|verify [--dir D] [the VM's flags]   # a pg-age-rclone or volumes-age-rclone backup
+<short>-stow backup config|run|status|list|verify|export [--dir D] [the VM's flags]   # a pg-age-rclone or volumes-age-rclone backup
 <short>-stow restore OBJECT [--dir D] [--identity FILE|-] [--yes] [--accessible] [--unrecorded]
+<short>-stow restore --input FILE|- --identity FILE [--dir D] [--yes] [--unrecorded]   # an archive backup export or backup run --output streamed out
 <short>-stow script                                                      # print the bootstrap script
 <short>-stow tune [--check | --print] [--profile default|network]        # the host's network tuning
 <short>-stow tune --apply | --revert [--profile default|network] [--yes] [--restart-docker] [--no-input] [--accessible]
@@ -1299,15 +1300,21 @@ refusal is the verb's Result.
 the Docker installer's process for one command (no daemon stays): run by the installer the install
 keeps (`<dir>/<short>-stow`, the release it runs; another is refused).
 
-- `backup config|run|status|list|verify` and `restore OBJECT` (`--dir D`, the other flags as on
-  the VM — see "Backups" under the installer on the Kairos VM) take a project's `pg-age-rclone`
+- `backup config|run|status|list|verify|export`, `restore OBJECT` and `restore --input` (`--dir
+  D`, the other flags as on the VM — see "Backups" and "Backups kept on the host, and pulled over
+  SSH" under the installer on the Kairos VM: `--keep-local N`, `backup run --output FILE|-`,
+  `backup export`, `restore --input FILE|-`, the archive they stream) take a project's `pg-age-rclone`
   or `volumes-age-rclone` backup: the settings in `backup.yaml` (root's alone), the last run in `backup-last.json` and
   the uploaded objects' digests a restore checks in `backup-digests.json` in the install directory, the volumes' archives and the dump encrypted to the recipients as they
   stream to the backup runner
   (`<name>-backup`, pulled with the stack's images, by digest, since a release of a project with
   the `docker` shape and a `pg-age-rclone` or `volumes-age-rclone` backup publishes one, and pulled again when the engine
   lost it), and the restore into a database
-  of its own, swapped in only once it loaded, then the stack up and provisioned. The schedule is
+  of its own, swapped in only once it loaded, then the stack up and provisioned. The backups
+  kept on the host are in the install directory's `backups/` (`.output/` there for the one
+  `backup run --output` streams out; `.stowage-restore-input/` beside them for an archive
+  `restore --input` was given, removed as that restore ends and as the next one starts):
+  `uninstall` keeps them with the directory, and `--data` deletes them with it. The schedule is
   a systemd timer of the install's own, `<name>-backup-<8 hex of the install directory's
   digest>.timer` and its `.service` (`ExecStart="<dir>/<short>-stow" backup run --if-configured
   --dir "<dir>"`: each path quoted, its `%` and `$` doubled and a control character escaped, as in
@@ -1316,7 +1323,7 @@ keeps (`<dir>/<short>-stow`, the release it runs; another is refused).
   `RestartSec=15min`, `StartLimitIntervalSec=3h`, `StartLimitBurst=6`) in `/etc/systemd/system`, written, enabled and started by `backup config` (and
   `--remove` removes them); on a host without systemd, or a run not as root, there is none (a
   backup runs when `backup run` is), and the schedule is kept unchecked. One process at a time
-  runs the jobs (`backup run`, `verify`, `restore`): it holds `.stowage-host.lock` in the install
+  runs the jobs (`backup run`, `verify`, `restore`, `restore --input`): it holds `.stowage-host.lock` in the install
   directory, and another waits for it, saying so; the reads and the settings (`backup status`,
   `list`, `config`, a settings change holding `.stowage-settings.lock` alone) never wait for a job, and `backup status` says `running` while another process runs a
   job (a backup, a verify or a restore). A signal stops the job the command runs.

@@ -6,7 +6,9 @@
 #
 # Walks examples/minimal, with a real Postgres, through: ship 1.0.0 → the bootstrap one-liner
 # installs it → a re-run changes nothing → `--given` replaces an input, a kit issued and taken by --kit too → backups to a WebDAV server through the release's
-# runner (the dump and the uploads volume's archive), and a restore that brings both back → ship 2.0.0 (a migration) → `notes-stow upgrade --version
+# runner (the dump and the uploads volume's archive), and a restore that brings both back → a backup pulled as
+# a tool over SSH would (`backup run --output -` with no settings, given back with `restore --input -`;
+# cut short, refused; another install's, --unrecorded) and one kept on the host, exported and restored → ship 2.0.0 (a migration) → `notes-stow upgrade --version
 # 2.0.0` fetches its installer and upgrades → rollback is allowed (1.0.0 reads the newer schema) →
 # ship 3.0.0 (a migration that is a rollback barrier) → upgrade → going back to 1.0.0 by upgrade
 # is refused, and rollback is refused naming the snapshot → `reset-db` wipes the data volumes and
@@ -229,6 +231,45 @@ docker exec "$(api)" sh -c 'echo since >/data/uploads/e2e.txt && echo later >/da
 # The volume as it was at the backup, its file's owner kept; what came after is gone.
 [[ $(docker exec "$(api)" sh -c 'cat /data/uploads/e2e.txt; stat -c %u /data/uploads/e2e.txt; test -e /data/uploads/later.txt || echo gone') == $'at-the-backup\n1000\ngone' ]] ||
 	{ docker exec "$(api)" ls -lan /data/uploads; fail "the restore did not bring the uploads volume back as it was"; }
+running 1.0.0 1
+"${CTL[@]}" backup config --dir "$D" --remove >/dev/null 2>&1 || fail "backup config --remove"
+
+step "backups pulled over SSH: run --output to standard output with no settings, restore --input from standard input, a truncated archive refused, backups kept on the host"
+# No settings: the recipient is given; the archive alone on standard output, its name on standard error.
+"${CTL[@]}" backup run --dir "$D" --output - --recipient "$AGE_RECIPIENT" --json >"$WORK/pull.tar" 2>"$WORK/pull.log" || { cat "$WORK/pull.log"; fail "backup run --output -"; }
+jq -e --arg s "$(sha256sum "$WORK/pull.tar" | cut -d' ' -f1)" --argjson b "$(stat -c %s "$WORK/pull.tar")" \
+	'.sha256 == $s and .bytes == $b and .release == {version: "1.0.0", revision: 1} and (.object | test("^notes-full-[0-9]{8}T[0-9]{6}Z-1\\.0\\.0-r1\\.pgdump\\.age$"))' \
+	<<<"$(tail -n1 "$WORK/pull.log")" >/dev/null || { cat "$WORK/pull.log"; fail "backup run --output --json did not name the archive streamed out"; }
+pulled=$(jq -r .object <<<"$(tail -n1 "$WORK/pull.log")")
+tar -tf "$WORK/pull.tar" >"$WORK/pull.list" || fail "the archive streamed out is no tar"
+[[ $(cat "$WORK/pull.list") == "${pulled%.pgdump.age}.uploads.tar.age"$'\n'"$pulled" ]] || { cat "$WORK/pull.list"; fail "the archive does not hold the uploads volume's archive, then the dump"; }
+rc=0; "${CTL[@]}" backup run --dir "$D" --output - >/dev/null 2>"$WORK/pull-none.log" || rc=$?
+[[ $rc == 3 ]] && grep -q 'no recipient to encrypt the backup to' "$WORK/pull-none.log" || { cat "$WORK/pull-none.log"; fail "a backup streamed out without a recipient exited $rc, not refused"; }
+docker exec "$(pg)" psql -U notes -d notes -c 'INSERT INTO e2e_backup VALUES (3)' >/dev/null || fail "a row after the backup streamed out"
+# Given back on standard input: this install recorded it, so it restores as it is.
+"${CTL[@]}" restore --dir "$D" --input - --identity "$AGE_KEY" --yes <"$WORK/pull.tar" >"$WORK/pull-restore.txt" 2>&1 || { cat "$WORK/pull-restore.txt"; fail "restore --input -"; }
+[[ $(docker exec "$(pg)" psql -U notes -d notes -tAc 'SELECT count(*) FROM e2e_backup') == 1 ]] || fail "restore --input did not bring the backup's data back"
+# Cut short, it restores nothing.
+docker exec "$(pg)" psql -U notes -d notes -c 'INSERT INTO e2e_backup VALUES (4)' >/dev/null || fail "a row after the restore"
+rc=0; head -c "$(($(stat -c %s "$WORK/pull.tar") / 2))" "$WORK/pull.tar" | "${CTL[@]}" restore --dir "$D" --input - --identity "$AGE_KEY" --yes >"$WORK/pull-cut.txt" 2>&1 || rc=$?
+[[ $rc == 3 ]] && grep -q 'the archive: .*: nothing restored' "$WORK/pull-cut.txt" || { cat "$WORK/pull-cut.txt"; fail "a truncated archive exited $rc, not refused"; }
+[[ $(docker exec "$(pg)" psql -U notes -d notes -tAc 'SELECT count(*) FROM e2e_backup') == 2 ]] || fail "a truncated archive changed the data"
+# Another install's (its records gone): --unrecorded alone restores it.
+mv "$D/backup-digests.json" "$WORK/backup-digests.json" || fail "the backups' digests"
+rc=0; "${CTL[@]}" restore --dir "$D" --input "$WORK/pull.tar" --identity "$AGE_KEY" --yes >"$WORK/pull-unrec.txt" 2>&1 || rc=$?
+[[ $rc != 0 ]] && grep -q 'this install recorded no digest of it' "$WORK/pull-unrec.txt" || { cat "$WORK/pull-unrec.txt"; fail "an archive this install has no record of was restored without --unrecorded"; }
+"${CTL[@]}" restore --dir "$D" --input "$WORK/pull.tar" --identity "$AGE_KEY" --yes --unrecorded >"$WORK/pull-unrec.txt" 2>&1 || { cat "$WORK/pull-unrec.txt"; fail "restore --input --unrecorded"; }
+[[ $(docker exec "$(pg)" psql -U notes -d notes -tAc 'SELECT count(*) FROM e2e_backup') == 1 ]] || fail "restore --input --unrecorded did not bring the backup's data back"
+# Kept on the host (no destination): listed as local, exported, restored.
+"${CTL[@]}" backup config --dir "$D" --keep-local 1 --recipient "$AGE_RECIPIENT" >"$WORK/keep-config.txt" 2>&1 || { cat "$WORK/keep-config.txt"; fail "backup config --keep-local"; }
+"${CTL[@]}" backup run --dir "$D" >"$WORK/keep-run.txt" 2>&1 || { cat "$WORK/keep-run.txt"; fail "backup run kept on the host"; }
+kept=$("${CTL[@]}" backup list --dir "$D" | awk '/local: kept on the host/ {print $1}')
+[[ $kept == notes-full-*-1.0.0-r1.pgdump.age && -f $D/backups/$kept && $(stat -c %a "$D/backups") == 700 ]] || { "${CTL[@]}" backup list --dir "$D"; ls -la "$D/backups"; fail "the backup kept on the host is not listed as local"; }
+"${CTL[@]}" backup export "$kept" --dir "$D" -o "$WORK/kept.tar" >"$WORK/kept-export.txt" 2>&1 || { cat "$WORK/kept-export.txt"; fail "backup export"; }
+[[ $(tar -tf "$WORK/kept.tar" | tail -n1) == "$kept" ]] || fail "backup export does not end with the dump"
+docker exec "$(pg)" psql -U notes -d notes -c 'INSERT INTO e2e_backup VALUES (5)' >/dev/null || fail "a row after the kept backup"
+"${CTL[@]}" restore "$kept" --dir "$D" --identity "$AGE_KEY" --yes >"$WORK/keep-restore.txt" 2>&1 || { cat "$WORK/keep-restore.txt"; fail "restore of a backup kept on the host"; }
+[[ $(docker exec "$(pg)" psql -U notes -d notes -tAc 'SELECT count(*) FROM e2e_backup') == 1 ]] || fail "the restore of a backup kept on the host did not bring its data back"
 running 1.0.0 1
 "${CTL[@]}" backup config --dir "$D" --remove >/dev/null 2>&1 || fail "backup config --remove"
 

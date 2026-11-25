@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,23 +144,106 @@ func (in *Installer) dockerRoot(ctx context.Context) string {
 	return strings.TrimSpace(string(out))
 }
 
-// handlerTransport answers an HTTP request with a handler in this process.
+// handlerTransport answers an HTTP request with a handler in this process, as a server would:
+// the request's body is read by the handler as it comes; the answer is held whole until the
+// handler returns, unless the handler flushes it (a backup streamed out), from which point it
+// streams, and a handler that then aborts (http.ErrAbortHandler) leaves it cut short, which its
+// reader sees as an unexpected EOF — never as a whole answer.
 type handlerTransport struct{ h http.Handler }
 
 func (t handlerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	rec := httptest.NewRecorder()
-	// As a server gives it: a request without a body reads as empty.
 	if r.Body == nil {
-		r.Body = http.NoBody
-	} else {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			return nil, err
-		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.Body = http.NoBody // as a server gives it: a request without a body reads as empty
 	}
-	t.h.ServeHTTP(rec, r)
-	return rec.Result(), nil
+	pr, pw := io.Pipe()
+	sw := &streamWriter{header: http.Header{}, pw: pw, ready: make(chan struct{})}
+	go func() {
+		defer r.Body.Close()
+		aborted := false
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					if p != http.ErrAbortHandler {
+						panic(p)
+					}
+					aborted = true
+				}
+			}()
+			t.h.ServeHTTP(sw, r)
+		}()
+		sw.end(aborted)
+	}()
+	<-sw.ready
+	if sw.err != nil {
+		return nil, sw.err
+	}
+	resp := &http.Response{
+		Status: fmt.Sprintf("%d %s", sw.code, http.StatusText(sw.code)), StatusCode: sw.code,
+		Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: sw.sent, Request: r,
+		ContentLength: int64(sw.buf.Len()),
+		Body:          io.NopCloser(bytes.NewReader(sw.buf.Bytes())),
+	}
+	if sw.streaming {
+		resp.ContentLength = -1
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(sw.buf.Bytes()), pr), pr}
+	}
+	return resp, nil
+}
+
+// streamWriter is handlerTransport's ResponseWriter: it buffers the answer until Flush, then
+// writes it through pw. ready closes once the answer can be read: at the first Flush, or as the
+// handler ends.
+type streamWriter struct {
+	header, sent http.Header
+	code         int
+	buf          bytes.Buffer
+	pw           *io.PipeWriter
+	streaming    bool
+	ready        chan struct{}
+	err          error // the handler aborted before anything was sent
+}
+
+func (w *streamWriter) Header() http.Header { return w.header }
+
+func (w *streamWriter) WriteHeader(code int) {
+	if w.sent == nil {
+		w.code, w.sent = code, w.header.Clone()
+	}
+}
+
+func (w *streamWriter) Write(p []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	if w.streaming {
+		return w.pw.Write(p)
+	}
+	return w.buf.Write(p)
+}
+
+func (w *streamWriter) Flush() {
+	w.WriteHeader(http.StatusOK)
+	if !w.streaming {
+		w.streaming = true
+		close(w.ready)
+	}
+}
+
+func (w *streamWriter) end(aborted bool) {
+	w.WriteHeader(http.StatusOK)
+	switch {
+	case w.streaming && aborted:
+		w.pw.CloseWithError(io.ErrUnexpectedEOF)
+	case w.streaming:
+		w.pw.Close()
+	default:
+		if aborted {
+			w.err = errors.New("the host daemon of this process aborted its answer")
+		}
+		w.pw.Close()
+		close(w.ready)
+	}
 }
 
 // systemdHost reports whether this host runs systemd and the run may write its units.
@@ -351,7 +433,7 @@ func startsJob(r *http.Request) bool {
 		return false
 	}
 	switch r.URL.Path {
-	case "/v1/backup", "/v1/backup/verify", "/v1/restore":
+	case "/v1/backup", "/v1/backup/verify", "/v1/restore", "/v1/restore/input":
 		return true
 	}
 	return false

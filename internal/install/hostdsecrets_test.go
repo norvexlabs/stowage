@@ -378,7 +378,7 @@ func TestARestoreReadsTheInstallAgainUnderTheLock(t *testing.T) {
 	if err := changed.WriteFile(filepath.Join(e.dir, ".env")); err != nil {
 		t.Fatal(err)
 	}
-	err = d.runRestore(in, obj, []age.Identity{key}, false, func(string, ...any) {})
+	err = d.runRestore(in, "", obj, []age.Identity{key}, false, func(string, ...any) {})
 	if err == nil || !strings.Contains(err.Error(), "the install runs notes 0.9.0 (revision 1)") || e.docker.restored != "" {
 		t.Errorf("%v, restored %q", err, e.docker.restored)
 	}
@@ -1152,11 +1152,21 @@ func TestADigestIsTheDestinations(t *testing.T) {
 	if err := d.recordDigests(map[string]string{"store:a/o.age": "s"}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if sums, err := d.checkDigests("store:a", []string{"o.age"}, false, func(string) string { return "trusted" }, t.Logf); err != nil || sums["o.age"] != "s" {
+	if sums, err := d.checkDigests(rcloneStore{dest: "store:a"}, []string{"o.age"}, false, func(string) string { return "trusted" }, t.Logf); err != nil || sums["o.age"] != "s" {
 		t.Errorf("%v %v", sums, err)
 	}
-	if _, err := d.checkDigests("store:b", []string{"o.age"}, false, func(string) string { return "trusted" }, t.Logf); err == nil || !strings.Contains(err.Error(), "store:b/o.age: this install recorded no digest of it") {
+	if _, err := d.checkDigests(rcloneStore{dest: "store:b"}, []string{"o.age"}, false, func(string) string { return "trusted" }, t.Logf); err == nil || !strings.Contains(err.Error(), "store:b/o.age: this install recorded no digest of it") {
 		t.Errorf("%v", err)
+	}
+	// One held on the host is recorded by its name alone, whichever of its directories holds it:
+	// a backup streamed out and given back is the one recorded.
+	if err := d.recordDigests(map[string]string{localPrefix + "o.age": "l"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"/kept", "/input"} {
+		if sums, err := d.checkDigests(localStore{dir: dir}, []string{"o.age"}, false, func(string) string { return "trusted" }, t.Logf); err != nil || sums["o.age"] != "l" {
+			t.Errorf("%s: %v %v", dir, sums, err)
+		}
 	}
 }
 

@@ -15,6 +15,7 @@ share; each shape's own fields and verbs are on its page:
 | `--json` on the verbs that change an install; the Result object; `absent` | [below](#--json-on-the-verbs-that-change-an-install) |
 | `updates --json` on Docker and Kubernetes (the VM's object, `follows` theirs alone) | [below](#updates---json) |
 | `kit create --json` on every shape: a kit issued as one JSON object, no file | [kits.md](kits.md) |
+| A backup streamed out (`backup run --output`, `backup export`) and given back (`restore --input`) | [below](#a-backup-streamed-out) |
 | Exit status: `0` done, `1` failed, `2` unknown (`kit check`), `3` refused | [below](#exit-status) |
 | `k8s status --json` and the `k8s` verbs' `--json` | [kubernetes.md](kubernetes.md) |
 | `vm seed --json`, `vm host-key --json`, `<short>-stow host-key --json` | [vm-create.md](vm-create.md) |
@@ -303,6 +304,23 @@ share; each shape's own fields and verbs are on its page:
   fails prints no object, only its error. `upgrade --version --json` passes `--json` to the
   installer it fetches, which prints the object; the run that fetched it prints none and exits
   with that installer's status (an installer from before 0.34.0 refuses the flag).
+## A backup streamed out
+
+`backup run --output FILE|-` and `backup export OBJECT -o FILE|-` (Docker and the VM; the full
+description is [vm.md](vm.md)'s "Backups kept on the host, and pulled over SSH") write one archive
+to FILE or standard output, which then holds the archive alone: a tar of the backup's objects as
+stored, age-encrypted, the volumes' archives first and the dump (or a `volumes-age-rclone`
+backup's manifest) last. Under `--json`, standard error ends with one JSON line naming it:
+
+```json
+{"object": "notes-full-20261010T030000Z-1.0.0-r1.pgdump.age", "sha256": "…", "bytes": 1048576, "release": {"version": "1.0.0", "revision": 1}}
+```
+
+`sha256` and `bytes` are the archive's, as written; `release` is the one the backup was taken
+from, which `restore --input` requires the install to run. A run that exits `0` wrote the archive
+whole; one cut short exits `1`. `restore --input FILE|- --identity FILE` takes it back, refused
+(`3`) unless it is exactly one whole backup of the release the install runs.
+
 ## Following a VM's boot
 
 - A program following a VM's `upgrade` or `rollback` (or any reboot) reads the VM's `status
@@ -354,7 +372,11 @@ share; each shape's own fields and verbs are on its page:
   `--yes`, `--stage` with `--finish`, and `--yes`, `--no-input` or `--accessible` on a key with no
   one pass; `secrets set` of a key without `settable: true`, or a value it cannot record (empty,
   over 4096 bytes, a quote or a line break), or with no terminal to ask it on and nothing piped;
-  `secrets show` to no terminal; `secrets export` without `--recipient`, or with one that is not an age public key; a required input missing, or a value its
+  `secrets show` to no terminal; `secrets export` without `--recipient`, or with one that is not an age public key; `backup run --output` with no
+  recipient given or set, `backup export` of a backup the host does not keep; `restore` of a backup not of the project,
+  not taken from the release installed or of a profile leaving rows out, a release confirmed that
+  is not the one installed, an identity that is not one, and `restore --input` of an archive
+  that is not exactly one whole backup of the release installed; a required input missing, or a value its
   input refuses; ports in use, a front port that is an L4 route's, an L4 route bound to an
   address the host does not have, an existing `tls/`, and `--ports`/`--address` or
   `--http-port`/`--https-port` in the wrong TLS mode; an operator's "no" at a prompt (`aborted`);

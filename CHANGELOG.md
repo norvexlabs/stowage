@@ -3,6 +3,36 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.47.0]
+
+### Added
+
+- Backups pulled over SSH, with no credential to any storage on the host: `backup run --output
+  FILE|-` takes a backup with or without settings, encrypted to the `--recipient` keys given (else
+  the settings'), and streams it out as one archive — a tar of its encrypted objects, the dump
+  last — to a file or standard output, nothing else there; `--json` names it in one line on
+  standard error (its object, the archive's SHA-256 and size, its release). `restore --input
+  FILE|- --identity FILE` restores such an archive, recorded by the install that streamed it out
+  (another install's needs `--unrecorded`); an archive cut short, or not exactly one backup of the
+  release installed, is refused, nothing restored. On Docker and the VM.
+- Backups kept on the host: `backup config --keep-local N --recipient age1…` (no destination)
+  keeps the profile's N latest backups on the host, in the install's directory — the scheduled
+  ones, and on the VM the one an upgrade takes first. `backup list` lists them as `local`,
+  `backup export OBJECT -o FILE|-` streams one out as the same archive, and `restore OBJECT`
+  restores one in place.
+
+### Changed
+
+- `backup list` with no settings lists the backups kept on the host, and none, rather than
+  refusing; `backup verify` with `keep_local` settings is refused, having no destination.
+
+### Fixed
+
+- `restore` failed with exit 1 where it refused before anything changed: an object that is not a
+  backup of the project, of the release the install runs or of a profile keeping every table's
+  rows, a release confirmed that is not the one installed, an identity that is not an age
+  identity. Each is a refusal, exit 3.
+
 ## [0.46.0] - 2026-11-25
 
 ### Added

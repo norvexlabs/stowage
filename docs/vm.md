@@ -34,6 +34,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
 <short>-stow reset-db [--yes] [--no-provision] [--accessible]   # wipe the data, start again as first installed
           [--new-baseline [--channel C] [--version V [--unordered]] [--set KEY=VALUE] [--set-file KEY=PATH] [--answers FILE]]   # instead: a later release at another schema baseline, its OS written and booted, that boot wiping the data and given the inputs that release adds
 <short>-stow restore OBJECT [--identity FILE|-] [--yes] [--accessible] [--unrecorded]   # load a backup into the database and its volumes (the volumes alone without one)
+<short>-stow restore --input FILE|- --identity FILE [--yes] [--unrecorded]   # the same, of an archive `backup export` or `backup run --output` streamed out (- : standard input, then --yes)
 <short>-stow secrets export --recipient age1…… [-o FILE|-]   # the install's secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish]   # a secret with rotation: true
 <short>-stow secrets rotate KEY [--yes] [--no-input] [--accessible]   # a secret with replace: true, in one pass, confirmed first
@@ -50,9 +51,12 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
 sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none] [--address A/P]   # a NIC the release names, from the next boot
 <short>-stow backup config [--json] [--destination REMOTE:PATH] [--rclone-config FILE|-] [--recipient age1…]…
           [--retention-days N] [--schedule CALENDAR] [--profile P] [--remove]   # show, change or drop the backup settings
+          [--keep-local N]   # instead of a destination: keep the profile's N latest backups on the host
           [--lock | --unlock]   # the app socket may (not) change the settings
 <short>-stow backup run [--profile P] [--if-configured]   # back up now, and wait for it
-<short>-stow backup status|list [--json]   # the settings, the next and the last backup; the destination's backups
+<short>-stow backup run --output FILE|- [--recipient age1…]… [--profile P] [--json]   # back up now and stream it out as one archive, no settings needed
+<short>-stow backup export OBJECT -o FILE|- [--json]   # stream a backup kept on the host out as one archive
+<short>-stow backup status|list [--json]   # the settings, the next and the last backup; the destination's backups and those kept on the host
 <short>-stow backup verify [--destination REMOTE:PATH] [--rclone-config FILE|-] [--recipient age1…]…   # write a probe file, as a job it waits for; the flags try settings unsaved
 <short>-stow reboot|shutdown [--drain-secs N]   # 0 to 600, default 30
 ```
@@ -630,8 +634,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `<short>-stow`'s. An unknown service is 404, no command 400. As on Docker it takes no lock: it
   runs beside a job (an upgrade, a restore) as `docker exec` would. Interrupting `<short>-stow`
   stops the `docker compose exec`, not always the command in the container.
-- `restore OBJECT` loads a backup into the install's database (the VM's destination and rclone
-  config, so backups must be configured): `<short>-stow` reads the age identity that decrypts it
+- `restore OBJECT` loads a backup into the install's database — one kept on the host (`backup
+  list` marks it `local`), else the destination's (the VM's destination and rclone config, so
+  backups must be configured; with `keep_local` settings an object the host does not keep is
+  refused, 404, `<object> is not among the backups kept on the host (\`backup list\` lists them)`): `<short>-stow` reads the age identity that decrypts it
   from standard input (`--identity FILE` instead), asks to confirm on a terminal (without one,
   `--yes` is required) naming the release the install runs, which the request carries, and
   follows the job. For a backup with `volumes` it is refused (409, `reboot first, then restore`)
@@ -1229,9 +1235,13 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `backup config` and its JSON say only that it is set), `recipients` (1 to 16 age public keys,
   `age1…`, X25519 or post-quantum, one per flag; given, they replace the list), `retention_days`
   (default 30; 0 keeps every backup; at most 3650), `schedule` (a systemd calendar event, checked
-  with `systemd-analyze calendar`, without `%` or `\`; default `*-*-* 03:00:00 UTC`) and `profile`
-  (one of the release's, default its `default_profile`). A change gives the flags given and keeps
-  the rest; the first needs a destination, the rclone config and a recipient; `--remove` drops the
+  with `systemd-analyze calendar`, without `%` or `\`; default `*-*-* 03:00:00 UTC`), `profile`
+  (one of the release's, default its `default_profile`) and `keep_local` (`--keep-local N`, 1 to
+  100: no destination, the backups kept on the host, below; given, it drops the destination and
+  the rclone config, and a destination given drops it; with a destination or an rclone config
+  beside it, refused: `keep_local keeps the backups on the host, without a destination: drop the
+  destination and its rclone config, or keep_local`; `retention_days` is a destination's). A change gives the flags given and keeps
+  the rest; the first needs a destination and the rclone config (or `keep_local`) and a recipient; `--remove` drops the
   settings. A value it cannot take, or a schedule `systemd-analyze` rejects, is refused (exit 3),
   nothing saved; a `systemd-analyze` that cannot run fails it (exit 1). `<name>-backup.timer` (`RandomizedDelaySec` 15 min, `Persistent`: a run missed while
   the VM was off runs once the timer starts again) is never enabled: the daemon starts it once
@@ -1256,18 +1266,99 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   hand is refused at once (409) while a job runs. `backup list` lists the destination's backups of
   the project — `<name>-<letters and digits>-<UTC time>-…`, a profile a later release dropped
   included and marked `a profile the release dropped: never pruned`, another project's in a
-  shared destination not — (name, size, time); `backup verify` writes `<destination>/<name>-verify.txt` (again each time)
+  shared destination not — (name, size, time), and those kept on the host, whatever the settings
+  (none: those alone; `no backup in the destination or on the host`), marked `local: kept on the
+  host (backup export)` (`"local": true` in JSON); `backup verify` writes `<destination>/<name>-verify.txt` (again each time)
   and reads its size back. Given `--destination`, `--rclone-config` or `--recipient`, it tries
   those over the saved settings (or, with none saved, as the whole settings; checked as `backup
   config` checks a change) and saves nothing; the answer says the settings were proposed. It is a
   job (`backup-verify`, its target the destination, one at a time with the others), which the
   verb follows and waits for: done, it prints that the destination is reachable and writable;
-  failed, it fails with the destination's reason. A release whose spec has no `pg-age-rclone` backup refuses every
+  failed, it fails with the destination's reason; with `keep_local` settings it is refused (409,
+  `the backups are kept on the host (keep_local): there is no destination to verify`). A release whose spec has no `pg-age-rclone` backup refuses every
   `backup` verb (409), but the timer's run. `backup status` shows a backup running, the one an
   `upgrade` takes first included.
 - `upgrade` takes a backup first, in its job, when settings exist (`--skip-backup`: none) with the
-  settings' profile; a backup that fails is logged and the upgrade goes on (the boot still dumps
+  settings' profile — kept on the host with `keep_local` settings, where it stays until pulled;
+  a backup that fails is logged and the upgrade goes on (the boot still dumps
   the database to `snapshots/` before it migrates).
+- Backups kept on the host, and pulled over SSH: a tool that reaches the VM over SSH pulls each
+  backup into a store of its own (through its own credentials) and gives one back to restore,
+  while the VM holds no credential to any storage.
+  - `backup config --keep-local N --recipient age1…` (no destination): the scheduled backups and
+    an upgrade's first one are written to `/usr/local/<name>/backups/` (root's, 0700, on the
+    persistent partition, whose disk the stack's data shares: it must hold them), each object
+    0600, named as in a destination, written as `<object>.partial` and renamed once whole (what a
+    backup cut off left goes at the next backup kept there and as the daemon starts). A write on
+    the host leaves a twentieth of that disk free: a backup finding less, or reaching it as it
+    writes (read every 64 MiB), fails (`the disk of <dir> has N bytes available, and … would leave
+    it less than the M kept free for the stack's data (free space or grow the disk)`), what it
+    wrote removed. `keep_local` is the operator's: the app socket is refused it (403), as it drops
+    the destination and the rclone config. After each
+    backup, the profile's N latest (by the time their names give) are kept and the others
+    deleted with their volumes' archives; an archive whose backup is gone goes once two hours
+    past its time. While an export streams (it holds `backups/.export.lock` shared), the pruning
+    is skipped, never waited for: the backup stands, its pruning error says `a backup kept on the
+    host is streaming out (backup export): the next backup prunes them`. Each object's digest is recorded as `local:<object>` (`backup-digests.json`).
+    `restore OBJECT` reads one kept there first, then the destination.
+  - `backup export OBJECT -o FILE|-` streams a backup kept there out as one archive (below), to
+    FILE or standard output, then says so on standard error as `backup run --output` does (a
+    client that takes no write for 10 minutes ends it, cut short); one not kept is refused (exit 3, 404, `<object> is not among the backups kept on the host (\`backup
+    list\` marks them local), nor one streamed out still there`).
+  - `backup run --output FILE|-` takes a backup now, as a scheduled one does (`--profile`, else
+    the settings', else the release's default), with or without settings, encrypted to the
+    `--recipient` keys given (repeatable, 1 to 16; they replace the settings'), else the
+    settings' recipients, else refused (exit 3, `no recipient to encrypt the backup to: give one or
+    more (recipients, --recipient age1…), or set them with \`<short>-stow backup config
+    --recipient\``); `--recipient` or `--json` without `--output` is refused, and through the
+    API `output` with `if_configured`, or `recipients` without `output` (400, `recipients are a
+    backup streamed out's (output): the others are encrypted to the settings'`); the operator's
+    socket alone (403 from the app's). It is a `backup` job (its log on standard error), held in
+    `/usr/local/<name>/backups/.output/<the backup's name>/` — kept until the next one's job sweeps
+    it, or the daemon starts (while any export streams, nothing is swept: that job fails at once,
+    `a backup is streaming out now (backup export): back up again once it is done`), never listed nor pruned, nor recorded as the last backup `backup status`
+    shows —, then streamed (`GET /v1/backup/export?object=O&output=1`; one swept meanwhile is
+    refused, 404, `the backup <object> taken to be streamed out is gone (another was taken since,
+    or the host daemon restarted): back up again`) to FILE (`FILE.partial`, 0600, made before the
+    backup is taken, so a file that cannot be written fails at once, `--output: …`, a FILE that is
+    a directory is refused, `--output: <FILE> is a directory: name a file`, and one that
+    exists — another run's, or one cut off — is refused, `--output: <FILE.partial> exists: another
+    run writes it, or one cut off left it; remove it, or write elsewhere`; renamed once whole,
+    removed otherwise) or standard output, which holds the archive alone.
+    Standard error ends with `<short>-stow: <object> streamed to <FILE | standard output> (<bytes>
+    bytes, sha256 <hex>)`, or under `--json` with one JSON line, `{"object", "sha256", "bytes",
+    "release": {"version", "revision"}}` (the archive's SHA-256 and size as written; the release
+    its name gives). Its digests are recorded, so this install restores it given back without
+    `--unrecorded`. A stream that stops (a read of the backup failing, the connection) fails the
+    command (exit 1, `streaming <object> out stopped after N bytes: …; the backup stays on the host
+    until the next backup run --output, or the host daemon's restart: \`<short>-stow backup export
+    <object> -o FILE\` streams it out again`; a FILE that cannot be written once the stream is
+    whole, `writing FILE: …`, the same), its `FILE.partial` removed: the daemon cuts its answer short, never ending it as
+    whole. `backup export OBJECT` streams a backup kept there, else one streamed out still there.
+  - The archive is a tar (ustar; PAX for a name over 100 bytes) of the backup's objects as stored,
+    encrypted: the volumes' archives first, in the release's order, the dump (or the manifest)
+    last; each 0600, owned by 0:0, timed as its name says, so the same backup always exports the
+    same bytes. `tar -t` lists it, and each object extracts and decrypts with `age -d` as a
+    destination's does.
+  - `restore --input FILE|- --identity FILE` restores such an archive, confirmed as `restore
+    OBJECT` is (`--input -`: standard input is the archive, so an identity file and `--yes` are
+    required, refused before anything is sent; `restore OBJECT` and `--input` together, or
+    neither, or an empty `--input`, are refused). The daemon (`POST /v1/restore/input`, the operator's socket alone:
+    the request's JSON on one line, without `object`, which is the archive's — given, refused, 400,
+    `object is the archive's: give none` —, then the archive) checks the request as for `restore
+    OBJECT`, refuses it while a job runs before it reads the archive,
+    then reads the archive into `/usr/local/<name>/.stowage-restore-input/` (root's alone; one
+    such restore at a time, 409 `another restore of an archive given is running`; removed as the
+    restore ends, after a refusal, and as the daemon starts) and refuses it (exit 3, `the archive:
+    …: nothing restored`) unless it is exactly one backup of this project taken from the release
+    the install runs (its first object names it, refused as `restore OBJECT` refuses an object),
+    its objects in order, each a regular file the disk has room for (leaving it the twentieth
+    above), and nothing after its end but
+    zeros: an empty one, one cut short (`it ends before <object>: it is cut short`, `<object> is
+    cut short`), one holding another object or one more. The restore is then `restore OBJECT`'s,
+    reading the objects where they are, their digests checked against `local:<object>`: an
+    archive this install streamed out restores as it is, another install's only with
+    `--unrecorded`.
 - One job runs at a time; none starts once a reboot or a shutdown is scheduled, and neither is
   scheduled during a job.
 - The event journal: the host daemon and the health gate append what happened to

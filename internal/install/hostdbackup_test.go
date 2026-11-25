@@ -654,9 +654,10 @@ func TestListAndVerifyUseTheDestination(t *testing.T) {
 	t.Parallel()
 	_, d, f, key := backupVM(t)
 	h := d.Handler()
-	var e409 errOf
-	if code := call(t, h, "GET", "/v1/backup/list", nil, &e409); code != 409 {
-		t.Errorf("unconfigured: %d", code)
+	// Unconfigured, it lists what the host keeps: nothing here.
+	var none []BackupObject
+	if code := call(t, h, "GET", "/v1/backup/list", nil, &none); code != 200 || none == nil || len(none) != 0 {
+		t.Errorf("unconfigured: %d %v", code, none)
 	}
 	configure(t, d, validConfig(key))
 	f.objects["store:backups/notes/notes-full-20261009T030000Z-1.0.0-r1.pgdump.age"] = []byte("abc")

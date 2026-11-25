@@ -32,21 +32,24 @@ import (
 
 // The VM's backups (a pg-age-rclone or volumes-age-rclone `backup`): the host daemon dumps the
 // database inside its own service (pg_dump of the server's own version) and archives the volumes
-// the backup lists, encrypts each to the operator's age recipients as it streams, and hands it to
-// the backup runner (rclone, preloaded with the release), which uploads it to the destination:
-// nothing is written to the VM's disk, and the VM holds no key that decrypts a backup. Without a
-// database (volumes-age-rclone), a manifest takes the dump's place as the backup's last object. The settings are the operator's, on the persistent
-// partition; a systemd timer runs a backup on their schedule.
+// the backup lists, encrypts each to the operator's age recipients as it streams, and writes it
+// to a store (hostdstore.go): the destination, through the backup runner (rclone, preloaded with
+// the release), nothing written to the VM's disk; or, with keep_local and no destination, a
+// directory of the install's on the host, which a tool reaching it over SSH pulls (hostdpull.go).
+// The VM holds no key that decrypts a backup. Without a database (volumes-age-rclone), a manifest
+// takes the dump's place as the backup's last object. The settings are the operator's, on the
+// persistent partition; a systemd timer runs a backup on their schedule.
 //
 //	GET    /v1/backup/config  the settings, the rclone config only said to be set
 //	POST   /v1/backup/config  {destination, rclone_config, recipients, retention_days, schedule,
-//	                          profile}: change them; a field left out keeps its value
+//	                          profile, keep_local}: change them; a field left out keeps its value
 //	DELETE /v1/backup/config  drop them: no backup runs
-//	POST   /v1/backup         {profile, if_configured}: a backup job (202, {job, target}); with
-//	                          if_configured, nothing (200, {skipped}) without settings, before
-//	                          the install, or when the release runs no backup
+//	POST   /v1/backup         {profile, if_configured, output, recipients}: a backup job (202,
+//	                          {job, target}); with if_configured, nothing (200, {skipped}) without
+//	                          settings, before the install, or when the release runs no backup;
+//	                          with output, one taken to be streamed out, settings or none
 //	GET    /v1/backup/status  the settings, the timer's next run, the last backup
-//	GET    /v1/backup/list    the destination's backups of this project
+//	GET    /v1/backup/list    the destination's backups of this project, and those kept on the host
 //	POST   /v1/backup/verify  write a probe to the destination: the settings reach it; a body of
 //	                          /v1/backup/config's fields tries those over the saved settings (or
 //	                          none), saving nothing
@@ -95,6 +98,9 @@ type BackupConfig struct {
 	Schedule string `yaml:"schedule"`
 	// Profile is the profile a scheduled backup takes.
 	Profile string `yaml:"profile"`
+	// KeepLocal, without a destination, keeps the profile's KeepLocal latest backups on the host
+	// (LocalBackupsDir), which a tool reaching it over SSH pulls (`backup export`); 0 with one.
+	KeepLocal int `yaml:"keep_local,omitempty"`
 }
 
 // BackupSettings is what GET /v1/backup/config answers: the settings, the rclone config's secrets
@@ -110,6 +116,9 @@ type BackupSettings struct {
 	RetentionDays    int      `json:"retention_days"`
 	Schedule         string   `json:"schedule"`
 	Profile          string   `json:"profile"`
+	// KeepLocal is how many of a profile's backups are kept on the host; 0: they go to the
+	// destination.
+	KeepLocal int `json:"keep_local,omitempty"`
 	// Locked: the settings are the operator's; the app socket may not change them.
 	Locked bool `json:"locked"`
 	// Profiles are the ones the release declares.
@@ -125,6 +134,9 @@ type BackupConfigRequest struct {
 	RetentionDays *int     `json:"retention_days,omitempty"`
 	Schedule      *string  `json:"schedule,omitempty"`
 	Profile       *string  `json:"profile,omitempty"`
+	// KeepLocal above 0 keeps backups on the host, dropping the destination and its rclone config;
+	// a destination given drops it.
+	KeepLocal *int `json:"keep_local,omitempty"`
 	// Lock locks (true) or unlocks the settings against the app socket; the operator's alone,
 	// kept apart from the settings (BackupLockFile).
 	Lock *bool `json:"lock,omitempty"`
@@ -135,6 +147,11 @@ type BackupRequest struct {
 	Profile string `json:"profile,omitempty"` // default: the settings'
 	// IfConfigured: without settings, do nothing rather than refuse (the timer's run).
 	IfConfigured bool `json:"if_configured,omitempty"`
+	// Output takes the backup into the host's directory a single `GET /v1/backup/export?output=1`
+	// then streams out (the operator's alone), settings or none: encrypted to Recipients, else
+	// to the settings'.
+	Output     bool     `json:"output,omitempty"`
+	Recipients []string `json:"recipients,omitempty"`
 }
 
 // BackupRun is a backup that ran, the last one kept on the persistent partition.
@@ -167,6 +184,8 @@ type BackupObject struct {
 	Size           int64     `json:"size"`
 	Time           time.Time `json:"time"`
 	DroppedProfile bool      `json:"dropped_profile,omitempty"`
+	// Local: kept on the host (keep_local), not in the destination; `backup export` streams it.
+	Local bool `json:"local,omitempty"`
 }
 
 // BackupFile and BackupLastFile hold the settings and the last backup, in the install's directory.
@@ -351,26 +370,8 @@ func (h *Hostd) writeBackup(c BackupConfig) error {
 // validBackup checks settings complete and well-formed, and returns their recipients. The
 // schedule's syntax is systemd's to judge (checkSchedule).
 func validBackup(c BackupConfig, pg *providers.AgeRclone) ([]age.Recipient, error) {
-	remote, path, ok := strings.Cut(c.Destination, ":")
-	sections := rcloneSections(c.RcloneConfig)
-	local := localTarget(sections, remote, map[string]bool{})
-	switch {
-	case c.Destination == "":
-		return nil, errors.New("destination is required: an rclone remote and a path, remote:path")
-	case !ok || !remoteName.MatchString(remote):
-		return nil, fmt.Errorf("destination %q must be an rclone remote of the rclone config and a path, remote:path", c.Destination)
-	case len(c.Destination) > 1024 || strings.ContainsFunc(path, isControl):
-		return nil, errors.New("destination: at most 1024 bytes, no control character")
-	case c.RcloneConfig == "":
-		return nil, errors.New("the rclone config is required: it defines the destination's remote and its credentials")
-	case len(c.RcloneConfig) > maxRcloneConfig || strings.ContainsRune(c.RcloneConfig, 0):
-		return nil, fmt.Errorf("the rclone config: at most %d bytes, no NUL", maxRcloneConfig)
-	case sections[remote] == nil:
-		return nil, fmt.Errorf("the rclone config defines no remote %q (its sections: %s)", remote, strings.Join(sortedKeys(sections), ", "))
-	case local != "":
-		return nil, fmt.Errorf("the remote %s writes to %s: rclone runs in a container removed after each run, so a backup there would be lost; give a destination reachable from outside the host's containers (SFTP, S3, …)", remote, local)
-	case c.RetentionDays < 0 || c.RetentionDays > maxRetentionDays:
-		return nil, fmt.Errorf("retention_days %d: 0 (keep every backup) to %d", c.RetentionDays, maxRetentionDays)
+	if err := validTarget(c); err != nil {
+		return nil, err
 	}
 	if err := validSchedule(c.Schedule); err != nil {
 		return nil, err
@@ -379,6 +380,42 @@ func validBackup(c BackupConfig, pg *providers.AgeRclone) ([]age.Recipient, erro
 		return nil, fmt.Errorf("profile %q is not one of the release's: %s", c.Profile, strings.Join(sortedKeys(pg.Profiles), ", "))
 	}
 	return parseRecipients(c.Recipients, maxRecipients)
+}
+
+// validTarget checks where the settings put backups: a destination and its rclone config, or the
+// host (keep_local), never both.
+func validTarget(c BackupConfig) error {
+	if c.KeepLocal != 0 {
+		switch {
+		case c.KeepLocal < 0 || c.KeepLocal > maxKeepLocal:
+			return fmt.Errorf("keep_local %d: 1 to %d backups kept on the host", c.KeepLocal, maxKeepLocal)
+		case c.Destination != "" || c.RcloneConfig != "":
+			return errors.New("keep_local keeps the backups on the host, without a destination: drop the destination and its rclone config, or keep_local")
+		}
+		return nil
+	}
+	remote, path, ok := strings.Cut(c.Destination, ":")
+	sections := rcloneSections(c.RcloneConfig)
+	local := localTarget(sections, remote, map[string]bool{})
+	switch {
+	case c.Destination == "":
+		return errors.New("a destination is required, an rclone remote and a path (remote:path), or keep_local, which keeps the backups on the host")
+	case !ok || !remoteName.MatchString(remote):
+		return fmt.Errorf("destination %q must be an rclone remote of the rclone config and a path, remote:path", c.Destination)
+	case len(c.Destination) > 1024 || strings.ContainsFunc(path, isControl):
+		return errors.New("destination: at most 1024 bytes, no control character")
+	case c.RcloneConfig == "":
+		return errors.New("the rclone config is required: it defines the destination's remote and its credentials")
+	case len(c.RcloneConfig) > maxRcloneConfig || strings.ContainsRune(c.RcloneConfig, 0):
+		return fmt.Errorf("the rclone config: at most %d bytes, no NUL", maxRcloneConfig)
+	case sections[remote] == nil:
+		return fmt.Errorf("the rclone config defines no remote %q (its sections: %s)", remote, strings.Join(sortedKeys(sections), ", "))
+	case local != "":
+		return fmt.Errorf("the remote %s writes to %s: rclone runs in a container removed after each run, so a backup there would be lost; give a destination reachable from outside the host's containers (SFTP, S3, …), or keep the backups on the host with keep_local", remote, local)
+	case c.RetentionDays < 0 || c.RetentionDays > maxRetentionDays:
+		return fmt.Errorf("retention_days %d: 0 (keep every backup) to %d", c.RetentionDays, maxRetentionDays)
+	}
+	return nil
 }
 
 // validSchedule refuses a schedule a unit file cannot hold as it is; its syntax is systemd's to
@@ -459,7 +496,7 @@ func backupSettings(c *BackupConfig, pg *providers.AgeRclone, locked bool, from 
 	s := BackupSettings{Recipients: []string{}, RetentionDays: defaultRetentionDays, Schedule: defaultBackupSchedule, Profile: pg.Default, Profiles: sortedKeys(pg.Profiles), Locked: locked}
 	if c != nil {
 		s = BackupSettings{Configured: true, Destination: c.Destination, RcloneConfigSet: c.RcloneConfig != "", RcloneConfigFrom: from, Recipients: c.Recipients,
-			RetentionDays: c.RetentionDays, Schedule: c.Schedule, Profile: c.Profile, Profiles: s.Profiles, Locked: locked}
+			RetentionDays: c.RetentionDays, Schedule: c.Schedule, Profile: c.Profile, KeepLocal: c.KeepLocal, Profiles: s.Profiles, Locked: locked}
 	}
 	return s
 }
@@ -505,7 +542,7 @@ func (h *Hostd) setLock(on bool) error {
 
 // setsAny is whether req changes a setting (Lock is none).
 func (req BackupConfigRequest) setsAny() bool {
-	return req.Destination != nil || req.RcloneConfig != nil || len(req.Recipients) > 0 || req.RetentionDays != nil || req.Schedule != nil || req.Profile != nil
+	return req.Destination != nil || req.RcloneConfig != nil || len(req.Recipients) > 0 || req.RetentionDays != nil || req.Schedule != nil || req.Profile != nil || req.KeepLocal != nil
 }
 
 // sameRecipients is whether a and b are one set of keys, whatever their order.
@@ -625,11 +662,19 @@ func mergeBackup(cur *BackupConfig, req BackupConfigRequest, pg *providers.AgeRc
 	if cur != nil {
 		c = *cur
 	}
+	// One target at a time: a destination given drops keep_local, keep_local given drops the
+	// destination and its rclone config.
 	if req.Destination != nil {
-		c.Destination = *req.Destination
+		c.Destination, c.KeepLocal = *req.Destination, 0
 	}
 	if req.RcloneConfig != nil {
 		c.RcloneConfig, c.operator = *req.RcloneConfig, true
+	}
+	if req.KeepLocal != nil {
+		c.KeepLocal = *req.KeepLocal
+		if c.KeepLocal != 0 && req.Destination == nil && req.RcloneConfig == nil {
+			c.Destination, c.RcloneConfig = "", ""
+		}
 	}
 	if len(req.Recipients) > 0 {
 		c.Recipients = req.Recipients
@@ -660,7 +705,7 @@ func backupChanges(cur *BackupConfig, c BackupConfig) string {
 	}{
 		{"destination", was.Destination != c.Destination}, {"rclone_config", was.RcloneConfig != c.RcloneConfig},
 		{"recipients", !sameRecipients(was.Recipients, c.Recipients)}, {"retention_days", was.RetentionDays != c.RetentionDays},
-		{"schedule", was.Schedule != c.Schedule}, {"profile", was.Profile != c.Profile},
+		{"schedule", was.Schedule != c.Schedule}, {"profile", was.Profile != c.Profile}, {"keep_local", was.KeepLocal != c.KeepLocal},
 	} {
 		if f.changed {
 			out = append(out, f.name)
@@ -975,6 +1020,17 @@ func (h *Hostd) startBackup(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
+	switch {
+	case req.Output && fromApp(r):
+		replyErr(w, refuseAs(http.StatusForbidden, "", "a backup streamed out is the operator's: backup run --output over SSH"))
+		return
+	case req.Output && req.IfConfigured:
+		replyErr(w, refuseAs(http.StatusBadRequest, "", "output and if_configured: a backup streamed out is asked for, never the timer's"))
+		return
+	case len(req.Recipients) > 0 && !req.Output:
+		replyErr(w, refuseAs(http.StatusBadRequest, "", "recipients are a backup streamed out's (output): the others are encrypted to the settings'"))
+		return
+	}
 	// The timer's run waits for a job running (a backup verify, a restore…) to end rather than
 	// lose the day's backup; asked by hand, a busy daemon refuses at once. Everything the backup
 	// reads is read again once the slot is free: a job that ran meanwhile (a secrets rotate) or a
@@ -1005,10 +1061,15 @@ func (h *Hostd) startBackup(w http.ResponseWriter, r *http.Request) {
 	h.backups.Add(1)
 	go func() {
 		defer h.backups.Done()
-		run := h.takeBackup(p.in, p.env, *p.c, p.pg, p.profile, p.obj, func(format string, a ...any) { h.logf(j, format, a...) })
+		run := h.takeBackup(p.in, p.env, p.t, p.pg, p.profile, p.obj, func(format string, a ...any) { h.logf(j, format, a...) })
 		var err error
 		if run.Error != "" {
 			err = errors.New(run.Error)
+		} else if p.t.output {
+			// The follower streams it out by this name (GET /v1/backup/export?output=1).
+			h.mu.Lock()
+			j.Result = p.obj
+			h.mu.Unlock()
 		}
 		h.finish(j, err)
 	}()
@@ -1019,7 +1080,7 @@ func (h *Hostd) startBackup(w http.ResponseWriter, r *http.Request) {
 type backupPlan struct {
 	in      *Installer
 	env     *EnvFile
-	c       *BackupConfig
+	t       backupTarget
 	pg      *providers.AgeRclone
 	profile string
 	obj     string
@@ -1063,13 +1124,37 @@ func (h *Hostd) planBackup(ctx context.Context, req BackupRequest) (*backupPlan,
 	h.backupMu.Lock()
 	c, err := h.readBackup(pg)
 	h.backupMu.Unlock()
+	t := backupTarget{c: c, output: req.Output}
 	switch {
+	case req.Output:
+		// Settings are not needed: given recipients, those that do not read are left alone;
+		// without, theirs are the ones, so they must read.
+		if err != nil && len(req.Recipients) == 0 {
+			return nil, err
+		}
+		if err != nil {
+			c, t.c = nil, nil
+		}
+		list := req.Recipients
+		if len(list) == 0 && c != nil {
+			list = c.Recipients
+		}
+		if len(list) == 0 {
+			return nil, refuseAs(http.StatusConflict, "", "no recipient to encrypt the backup to: give one or more (recipients, --recipient age1…), or set them with `%s backup config --recipient`", h.R.Ctl())
+		}
+		if t.recips, err = parseRecipients(list, maxRecipients); err != nil {
+			return nil, refuseRequest(err)
+		}
 	case err != nil:
 		return nil, err
 	case c == nil:
-		return nil, skippable(fail(http.StatusConflict, "no backup is configured: `%s backup config` sets the destination", h.R.Ctl()), "no backup is configured")
+		return nil, skippable(fail(http.StatusConflict, "no backup is configured: `%s backup config` sets the destination, or keep_local", h.R.Ctl()), "no backup is configured")
 	}
-	profile := cmp.Or(req.Profile, c.Profile)
+	profile := req.Profile
+	if profile == "" && c != nil {
+		profile = c.Profile
+	}
+	profile = cmp.Or(profile, pg.Default)
 	if _, ok := pg.Profiles[profile]; !ok {
 		return nil, fail(http.StatusBadRequest, "profile %q is not one of the release's: %s", profile, strings.Join(sortedKeys(pg.Profiles), ", "))
 	}
@@ -1078,7 +1163,7 @@ func (h *Hostd) planBackup(ctx context.Context, req BackupRequest) (*backupPlan,
 	}
 	m := h.R.Manifest
 	obj := backupObject(h.R.Spec.Name, profile, time.Now(), Version{m.ProjectVersion, m.Revision}, pg)
-	return &backupPlan{in: in, env: env, c: c, pg: pg, profile: profile, obj: obj}, nil
+	return &backupPlan{in: in, env: env, t: t, pg: pg, profile: profile, obj: obj}, nil
 }
 
 // preflightBackup takes a backup before an upgrade, when one is configured: one that fails is
@@ -1124,29 +1209,37 @@ func (h *Hostd) preflightBackup(in *Installer, logf func(string, ...any)) {
 	defer h.backingUp.Store(false)
 	h.backups.Add(1)
 	defer h.backups.Done()
-	if run := h.takeBackup(in, env, *c, pg, c.Profile, obj, logf); run.Error != "" {
+	if run := h.takeBackup(in, env, backupTarget{c: c}, pg, c.Profile, obj, logf); run.Error != "" {
 		logf("the backup failed, the upgrade goes on: %s", run.Error)
 	}
 }
 
 // takeBackup runs one backup and records it as the last.
-func (h *Hostd) takeBackup(in *Installer, env *EnvFile, c BackupConfig, pg *providers.AgeRclone, profile, obj string, logf func(string, ...any)) BackupRun {
+func (h *Hostd) takeBackup(in *Installer, env *EnvFile, t backupTarget, pg *providers.AgeRclone, profile, obj string, logf func(string, ...any)) BackupRun {
 	m := h.R.Manifest
 	run := BackupRun{Object: obj, Profile: profile, Release: Version{m.ProjectVersion, m.Revision}, Started: time.Now().UTC()}
 	ctx, cancel := context.WithTimeout(h.ctx, backupTimeout)
 	defer cancel()
-	n, prune, err := h.dumpUpload(ctx, in, env, c, pg, profile, obj, logf)
+	var n int64
+	var prune error
+	st, done, err := h.backupStore(in, t, obj)
+	if err == nil {
+		defer done()
+		n, prune, err = h.dumpUpload(ctx, in, env, st, t, pg, profile, obj, logf)
+	}
 	run.Finished, run.Bytes = time.Now().UTC(), n
 	if err != nil {
 		run.Error = err.Error()
 	} else {
-		logf("backed up: %s (%d bytes)", within(c.Destination, obj), n)
+		logf("backed up: %s (%d bytes)", st.shown(obj), n)
 		if prune != nil {
 			run.PruneError = prune.Error()
 			logf("the older backups were not pruned: %v", prune)
 		}
 	}
-	if raw, err := json.Marshal(run); err == nil {
+	// The last backup is the settings' (scheduled, an upgrade's, run by hand): one streamed out,
+	// asked for apart, would hide how they go.
+	if raw, err := json.Marshal(run); err == nil && !t.output {
 		if err := writePrivate(BackupLastFile(h.O.Dir), raw); err != nil {
 			logf("the backup's record: %v", err)
 		}
@@ -1154,25 +1247,67 @@ func (h *Hostd) takeBackup(in *Installer, env *EnvFile, c BackupConfig, pg *prov
 	return run
 }
 
+// backupTarget is where a backup goes: the settings' destination or the host (keep_local), or,
+// output, the host's directory `backup export` streams it out of, encrypted to recips.
+type backupTarget struct {
+	c      *BackupConfig
+	output bool
+	recips []age.Recipient
+}
+
+// backupStore opens t's store for the backup obj, and what closes it.
+func (h *Hostd) backupStore(in *Installer, t backupTarget, obj string) (backupStore, func(), error) {
+	name := h.R.Spec.Name
+	switch {
+	case t.output:
+		// The one an earlier run left goes, unless it is streaming out (one job at a time: none
+		// is being written): never waited for, as the job holds the slot meanwhile.
+		if err := os.MkdirAll(LocalBackupsDir(h.O.Dir), 0o700); err != nil {
+			return nil, nil, err
+		}
+		unlock, err := lockFile(exportLock(LocalBackupsDir(h.O.Dir)))
+		if errors.Is(err, errLocked) {
+			return nil, nil, errors.New("a backup is streaming out now (backup export): back up again once it is done")
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		err = os.RemoveAll(outputBackups(h.O.Dir))
+		unlock()
+		if err != nil {
+			return nil, nil, err
+		}
+		return localStore{name: name, dir: outputOf(h.O.Dir, obj), disk: h.diskAt}, func() {}, nil
+	case t.c.KeepLocal > 0:
+		dir := LocalBackupsDir(h.O.Dir)
+		sweepPartial(dir) // one job at a time: what is half written was cut off
+		return localStore{name: name, dir: dir, keep: t.c.KeepLocal, disk: h.diskAt}, func() {}, nil
+	}
+	conf, done, err := h.rcloneConf(*t.c)
+	if err != nil {
+		return nil, nil, err
+	}
+	return rcloneStore{h: h, in: in, conf: conf, dest: t.c.Destination, retention: t.c.RetentionDays}, done, nil
+}
+
 // dumpUpload streams each volume's encrypted archive, then the encrypted dump (a volumes-age-rclone
-// backup's manifest), to the destination, checking the size each reached, then prunes the
-// profile's backups past the retention; it returns the bytes uploaded and the pruning's error
+// backup's manifest), to the store (the destination, checking the size each reached, or the host),
+// then prunes the profile's backups the settings no longer keep (none for a backup streamed out);
+// it returns the bytes written and the pruning's error
 // apart. The dump or the manifest is the backup's last object: one that failed leaves none of
 // them.
-func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c BackupConfig, pg *providers.AgeRclone, profile, obj string, logf func(string, ...any)) (int64, error, error) {
-	recips, err := validBackup(c, pg)
-	if err != nil {
-		return 0, nil, err
+func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, st backupStore, t backupTarget, pg *providers.AgeRclone, profile, obj string, logf func(string, ...any)) (int64, error, error) {
+	recips := t.recips
+	if recips == nil {
+		var err error
+		if recips, err = validBackup(*t.c, pg); err != nil {
+			return 0, nil, err
+		}
 	}
 	// A backup of volumes half restored would pass for a whole one (an upgrade's first too).
 	if err := in.volumesSplit(); err != nil {
 		return 0, nil, err
 	}
-	conf, done, err := h.rcloneConf(c)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer done()
 	var dump []string
 	if pg.Dump {
 		d := h.R.Spec.DB()
@@ -1196,14 +1331,15 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 	}
 	var sent []string
 	discard := func() {
-		for _, dest := range sent {
-			h.discard(ctx, in, conf, dest, logf)
+		for _, o := range sent {
+			st.discard(ctx, o, logf)
 		}
 	}
 	var total int64
 	sums := map[string]string{}
 	var image string
 	if len(pg.Volumes) > 0 {
+		var err error
 		if image, err = h.runnerImage(ctx, in); err != nil {
 			return 0, nil, err
 		}
@@ -1214,9 +1350,9 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 			discard()
 			return 0, nil, err
 		}
-		dest := within(c.Destination, volumeObject(obj, v))
-		logf("archiving the volume %s, encrypted to %d recipient(s), to %s", v, len(recips), dest)
-		n, sum, err := h.encryptUpload(ctx, in, conf, recips, dest, func(w io.Writer) error {
+		o := volumeObject(obj, v)
+		logf("archiving the volume %s, encrypted to %d recipient(s), to %s", v, len(recips), st.shown(o))
+		n, sum, err := st.put(ctx, o, ageEncrypt(recips, func(w io.Writer) error {
 			if vol == "" {
 				// Never created (no service of it ran): an archive of nothing.
 				return tar.NewWriter(w).Close()
@@ -1226,15 +1362,14 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 				err = fmt.Errorf("the archive of the volume %s: %w", v, err)
 			}
 			return err
-		}, logf)
+		}), logf)
 		if err != nil {
 			discard()
 			return 0, nil, err
 		}
-		sent, total = append(sent, dest), total+n
-		sums[dest] = sum
+		sent, total = append(sent, o), total+n
+		sums[st.key(o)] = sum
 	}
-	dest := within(c.Destination, obj)
 	produce := func(w io.Writer) error {
 		_, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), dump...), Env: env.Environ(in.O.environ()), Stdout: w})
 		if err != nil {
@@ -1243,7 +1378,7 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 		return err
 	}
 	if pg.Dump {
-		logf("dumping %s's database (profile %s), encrypted to %d recipient(s), to %s", h.R.Spec.Name, profile, len(recips), dest)
+		logf("dumping %s's database (profile %s), encrypted to %d recipient(s), to %s", h.R.Spec.Name, profile, len(recips), st.shown(obj))
 	} else {
 		m := h.R.Manifest
 		raw, err := json.Marshal(BackupManifest{Project: h.R.Spec.Name, Release: Version{m.ProjectVersion, m.Revision}, Volumes: pg.Volumes})
@@ -1251,34 +1386,28 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 			discard()
 			return 0, nil, err
 		}
-		logf("writing the backup's manifest, encrypted to %d recipient(s), to %s", len(recips), dest)
+		logf("writing the backup's manifest, encrypted to %d recipient(s), to %s", len(recips), st.shown(obj))
 		produce = func(w io.Writer) error {
 			_, err := w.Write(append(raw, '\n'))
 			return err
 		}
 	}
-	n, sum, err := h.encryptUpload(ctx, in, conf, recips, dest, produce, logf)
+	n, sum, err := st.put(ctx, obj, ageEncrypt(recips, produce), logf)
 	if err != nil {
 		discard()
 		return 0, nil, err
 	}
-	sent, total = append(sent, dest), total+n
-	sums[dest] = sum
+	sent, total = append(sent, obj), total+n
+	sums[st.key(obj)] = sum
 	// A backup whose digests are not recorded would restore only unchecked: it is no backup.
 	if err := h.recordDigests(sums, time.Now()); err != nil {
 		discard()
 		return 0, nil, fmt.Errorf("recording the backup's digests: %w", err)
 	}
-	var prune error
-	if c.RetentionDays != 0 {
-		_, prune = h.rclone(ctx, in, conf, nil, "delete", "--min-age", fmt.Sprintf("%dd", c.RetentionDays), "--max-depth", "1", "--include", ownBackups(h.R.Spec.Name, profile), c.Destination)
+	if t.output {
+		return total, nil, nil // streamed out, kept until the next one or the daemon's start: nothing to prune
 	}
-	// Orphan archives go whatever the retention and the volumes now listed: a failed backup whose
-	// cleanup failed left them, or retention took a dump an earlier release archived volumes with.
-	if prune == nil {
-		prune = h.pruneArchives(ctx, in, conf, c.Destination, profile)
-	}
-	return total, prune, nil
+	return total, st.prune(ctx, profile), nil
 }
 
 // pruneArchives deletes the profile's volume archives whose dump is gone: retention goes by the
@@ -1315,62 +1444,6 @@ func (h *Hostd) pruneArchives(ctx context.Context, in *Installer, conf, dest, pr
 		}
 	}
 	return errors.Join(errs...)
-}
-
-// encryptUpload streams what produce writes, encrypted to recips, to dest, and checks the size it
-// reached: its bytes and their SHA-256, hex. One that fails leaves nothing under its name.
-func (h *Hostd) encryptUpload(ctx context.Context, in *Installer, conf string, recips []age.Recipient, dest string, produce func(io.Writer) error, logf func(string, ...any)) (int64, string, error) {
-	pr, pw := io.Pipe()
-	// The producer's own error does not say whether the upload stopped first (the CLI reports
-	// its exit, not the broken pipe): its writes do.
-	watched := &pipeWatch{w: pw}
-	produced := make(chan error, 1)
-	go func() {
-		enc, err := age.Encrypt(watched, recips...)
-		if err == nil {
-			if err = produce(enc); err == nil {
-				err = enc.Close()
-			}
-		}
-		pw.CloseWithError(err)
-		produced <- err
-	}()
-	// What rclone read is what it uploaded: its SHA-256 is the object's, which the destination holds.
-	sum := sha256.New()
-	sent := &counter{r: io.TeeReader(pr, sum)}
-	_, upErr := h.rcloneNamed(ctx, in, conf, h.runnerName(), sent, "rcat", dest)
-	// An upload that stopped early leaves the producer nothing to write to.
-	pr.CloseWithError(errUploadEnded)
-	prodErr := <-produced
-	ctxErr := ctx.Err() // before the cleanup, which may outlast the deadline
-	// A failed upload leaves nothing under its name: rclone may have taken the stream's end for
-	// the file's, or a backend kept what it was sent.
-	if prodErr != nil || upErr != nil {
-		h.discard(ctx, in, conf, dest, logf)
-		switch {
-		case errors.Is(ctxErr, context.DeadlineExceeded):
-			return 0, "", fmt.Errorf("the backup did not finish within %s", backupTimeout)
-		case ctxErr != nil:
-			return 0, "", errors.New("the backup was stopped: the host daemon is stopping")
-		case prodErr != nil && !watched.ended.Load():
-			// The producer failed on its own: the upload's error is its echo.
-			return 0, "", prodErr
-		}
-		// The upload ended first (rclone may exit 0 before reading to the end).
-		return 0, "", fmt.Errorf("the upload: %w", cmp.Or(upErr, errUploadEnded))
-	}
-	n := sent.n.Load()
-	out, err := h.rclone(ctx, in, conf, nil, "lsjson", "--files-only", "--no-mimetype", dest)
-	if err != nil {
-		h.discard(ctx, in, conf, dest, logf)
-		return n, "", fmt.Errorf("the uploaded backup could not be checked: %w", err)
-	}
-	var found []struct{ Size int64 }
-	if err := json.Unmarshal(out, &found); err != nil || len(found) != 1 || found[0].Size != n {
-		h.discard(ctx, in, conf, dest, logf)
-		return n, "", fmt.Errorf("the destination holds %s, not the %d bytes sent", strings.TrimSpace(string(out)), n)
-	}
-	return n, hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 // discard deletes dest, an object a failed backup sent. The run's context may be over (the
@@ -1624,10 +1697,16 @@ func (h *Hostd) runnerCallBackup(r *http.Request) (*Installer, *BackupConfig, *p
 // credentials, is the operator's to give, over SSH. Even the saved one is refused: answering
 // whether a config is it would let the app test guesses of its secrets (GET never shows it).
 func appRclone(app bool, req BackupConfigRequest) error {
-	if !app || req.RcloneConfig == nil {
+	switch {
+	case !app:
 		return nil
+	case req.RcloneConfig != nil:
+		return fail(http.StatusForbidden, "rclone_config is the operator's: rclone runs the programs its options name, as root on the host; backup config over SSH")
+	case req.KeepLocal != nil:
+		// It drops the destination and its rclone config, which the app could not give back.
+		return fail(http.StatusForbidden, "keep_local is the operator's: it drops the destination and the rclone config; backup config over SSH")
 	}
-	return fail(http.StatusForbidden, "rclone_config is the operator's: rclone runs the programs its options name, as root on the host; backup config over SSH")
+	return nil
 }
 
 // proposedBackup is verify's run with settings proposed over the saved ones (or none), checked
@@ -1659,39 +1738,53 @@ func (h *Hostd) proposedBackup(req BackupConfigRequest, app bool) (*Installer, *
 }
 
 func (h *Hostd) listBackups(w http.ResponseWriter, r *http.Request) {
-	in, c, pg, err := h.runnerCallBackup(r)
+	pg, err := h.pgBackup()
 	if err != nil {
 		replyErr(w, err)
 		return
 	}
-	conf, done, err := h.rcloneConf(*c)
+	in, _ := h.run()
+	if _, err := h.installed(in); err != nil {
+		replyErr(w, err)
+		return
+	}
+	h.backupMu.Lock()
+	c, err := h.readBackup(pg)
+	h.backupMu.Unlock()
 	if err != nil {
 		replyErr(w, err)
 		return
 	}
-	defer done()
-	ctx, cancel := context.WithTimeout(r.Context(), rcloneTimeout)
-	defer cancel()
-	out, err := h.rclone(ctx, in, conf, nil, "lsjson", "--files-only", "--no-mimetype", "--max-depth", "1", "--include", ownBackups(h.R.Spec.Name, anyProfile), c.Destination)
+	// The backups kept on the host are listed whatever the settings: they may predate them.
+	list, err := localStore{name: h.R.Spec.Name, dir: LocalBackupsDir(h.O.Dir)}.list(r.Context())
 	if err != nil {
-		replyErr(w, fail(http.StatusBadGateway, "the destination: %v", err))
+		replyErr(w, err)
 		return
 	}
-	var found []struct {
-		Name    string
-		Size    int64
-		ModTime time.Time
+	if c != nil && c.KeepLocal == 0 {
+		conf, done, err := h.rcloneConf(*c)
+		if err != nil {
+			replyErr(w, err)
+			return
+		}
+		defer done()
+		ctx, cancel := context.WithTimeout(r.Context(), rcloneTimeout)
+		defer cancel()
+		remote, err := rcloneStore{h: h, in: in, conf: conf, dest: c.Destination}.list(ctx)
+		if err != nil {
+			replyErr(w, failAs(http.StatusBadGateway, err))
+			return
+		}
+		list = append(list, remote...)
 	}
-	if err := json.Unmarshal(out, &found); err != nil {
-		replyErr(w, fail(http.StatusBadGateway, "the destination's list: %v", err))
-		return
-	}
-	list := []BackupObject{}
-	for _, f := range found {
-		_, kept := pg.Profiles[backupProfile(h.R.Spec.Name, f.Name)]
-		list = append(list, BackupObject{f.Name, f.Size, f.ModTime, !kept})
+	for i := range list {
+		_, kept := pg.Profiles[backupProfile(h.R.Spec.Name, list[i].Name)]
+		list[i].DroppedProfile = !kept
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	if list == nil {
+		list = []BackupObject{}
+	}
 	reply(w, http.StatusOK, list)
 }
 
@@ -1728,6 +1821,10 @@ func (h *Hostd) verifyBackup(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		replyErr(w, err)
+		return
+	}
+	if c.KeepLocal > 0 {
+		replyErr(w, refuseAs(http.StatusConflict, "", "the backups are kept on the host (keep_local): there is no destination to verify"))
 		return
 	}
 	j, err := h.startJob("backup-verify", c.Destination, nil)

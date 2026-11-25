@@ -68,6 +68,7 @@ import (
 //	POST /v1/reboot, /v1/shutdown        {drain_secs}: after the drain (202)
 //	GET, POST /v1/network, POST /v1/network/{confirm,revert,reset}: the network override (hostdnet.go)
 //	/v1/backup, /v1/backup/{config,status,list,verify}: the backups (hostdbackup.go)
+//	/v1/backup/export, /v1/restore/input: a backup pulled over SSH, one given back (hostdpull.go)
 //	/v1/secrets/{export,rotate,set,show}, /v1/restore: the install's secrets and a backup's restore (hostdsecrets.go)
 //
 // An error is {"error": "..."} with a 4xx or 5xx status. One job runs at a time, and none starts
@@ -192,6 +193,9 @@ type Hostd struct {
 	backingUp atomic.Bool
 	// backups counts the backups running: Serve waits for them to clean up as it stops.
 	backups sync.WaitGroup
+	// inputMu is held from the read of an archive `restore --input` gives until its restore
+	// ends: one at a time uses restoreInput.
+	inputMu sync.Mutex
 	// rollbacks counts the rollbacks running, each counted under mu as its job is claimed: Serve
 	// waits for one stopped in its grace to journal that its reboot does not come. stopping, under
 	// mu, refuses every job once Serve stops, so no rollback is counted once it waits.
@@ -548,8 +552,15 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 	}
 	dir := filepath.Dir(path)
 	h.Run = dir
-	// No job runs before the daemon serves: every rclone config a killed run left goes.
+	// No job runs before the daemon serves: every rclone config a killed run left goes, and what
+	// a backup or a restore cut off left on the host.
 	sweepRclone(dir, 0)
+	sweepPartial(LocalBackupsDir(h.O.Dir))
+	for _, d := range []string{outputBackups(h.O.Dir), filepath.Join(h.O.Dir, restoreInput)} {
+		if err := os.RemoveAll(d); err != nil {
+			h.O.logf("%s, which a backup or a restore cut off left: %v", d, err)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
@@ -795,6 +806,7 @@ func (h *Hostd) routes(app bool) http.Handler {
 	both("GET /v1/backup/status", h.backupStatus)
 	both("GET /v1/backup/list", h.listBackups)
 	both("POST /v1/backup/verify", h.verifyBackup)
+	operator("GET /v1/backup/export", h.exportBackup)
 	operator("POST /v1/secrets/export", h.exportSecrets)
 	operator("POST /v1/kits", h.createKit)
 	operator("POST /v1/kits/check", h.checkKit)
@@ -802,6 +814,7 @@ func (h *Hostd) routes(app bool) http.Handler {
 	operator("POST /v1/secrets/set", h.setSecret)
 	operator("POST /v1/secrets/show", h.showSecret)
 	operator("POST /v1/restore", h.restoreBackup)
+	operator("POST /v1/restore/input", h.restoreInput)
 	return mux
 }
 

@@ -1741,9 +1741,13 @@ func TestUploadLeaves(t *testing.T) {
 }
 
 // The staged file is emptied only once no upload of it runs: one RUNNING is followed to its end,
-// and one still running after the watch leaves the file, named to delete on the host.
+// and one still running after the watch leaves the file, named to delete on the host. Not
+// parallel: it sets the watch's window, long while the upload ends (never waited out, so a slow
+// run's reads all fit), short for the one still running.
 func TestEmptyStagedWaitsForItsUpload(t *testing.T) {
-	t.Parallel()
+	st := settleTimeout
+	t.Cleanup(func() { settleTimeout = st })
+	settleTimeout = 30 * time.Second
 	f, s := newFake(t)
 	c, err := dial(t, s, "k3y")
 	if err != nil {
@@ -1783,7 +1787,8 @@ func TestEmptyStagedWaitsForItsUpload(t *testing.T) {
 	f.mu.Lock()
 	f.polled, f.upload = nil, nil
 	f.mu.Unlock()
-	// Still running: left.
+	// Still running: left, once the watch's window is out.
+	settleTimeout = st
 	job = put("/s/b")
 	err = c.emptyStaged(ctx, "/s/b", putFile)
 	if want := fmt.Sprintf("the staged file /s/b not emptied (TrueNAS's API deletes no file: delete it on the host): its upload's job %d is still RUNNING on TrueNAS after ", job); err == nil || !strings.HasPrefix(err.Error(), want) || f.staged("/s/b") != "part" {

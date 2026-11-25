@@ -15,8 +15,9 @@
 # issued, with a `byo` certificate and a secret input over the pinned SSH, in no seed; `reset-db` wipes the data and provisions again without a reboot; a
 # backup goes, encrypted, to a WebDAV server on this host — the database and the uploads volume —
 # and `restore` loads both back over newer data; `secrets export` writes the install's secrets encrypted to the operator's key; a newer release crosses the same way and the VM upgrades from the
-# mirror (a backup first), its health gate marking the boot
-# good; `rollback` takes the VM back to the passive system; a release that never becomes ready
+# mirror (a backup first, kept on the host and pulled over SSH), its health gate marking the boot
+# good; `rollback` takes the VM back to the passive system, where that backup, given back over SSH
+# (`restore --input -`), restores; a release that never becomes ready
 # fails its health gate, and Kairos falls back to the passive system, whose boot goes back; one that
 # fails it past a rollback barrier is kept, as going back would leave nothing serving;
 # the root gives the VM a NIC for the role 1.0.1 adds (truenas_vm_power power-cycles it), which
@@ -736,6 +737,8 @@ step_upgrade() {
 	on_vm sudo notes-stow upgrade --dry-run --set RELAY_TOKEN=x --set NOT_AN_INPUT=x >"$WORK/upgrade-dry.txt" 2>&1 || code=$?
 	[[ $code == 3 ]] && grep -qE 'no input this release adds is named NOT_AN_INPUT \(it adds: ([A-Z_]+, )*RELAY_TOKEN[,)]' "$WORK/upgrade-dry.txt" ||
 		{ cat "$WORK/upgrade-dry.txt"; fail "a dry run giving an input 1.0.1 does not add is not refused (exit $code)"; }
+	# The backup first is kept on the host (no destination), as a tool pulling backups over SSH has it.
+	on_vm sudo notes-stow backup config --keep-local 2 >"$WORK/keep-config.txt" 2>&1 || { cat "$WORK/keep-config.txt"; fail "backup config --keep-local"; }
 	local relay=relay-$RANDOM$RANDOM
 	printf 'RELAY_TOKEN: %s\n' "$relay" | on_vm "umask 077; cat >/tmp/relay.yaml" || fail "writing the answers file on the VM"
 	boot=$(boot_id)
@@ -749,12 +752,19 @@ step_upgrade() {
 	rc=0; on_vm sudo notes-stow reboot --drain-secs 0 >"$WORK/upgrade-reboot.txt" 2>&1 || rc=$?
 	[[ $rc == 0 || $rc == 255 ]] || { cat "$WORK/upgrade-reboot.txt"; fail "reboot into 1.0.1 exited $rc"; }
 	vm_result "$WORK/upgrade.json" "done" 1.0.0
-	grep -q 'a backup first: notes-full-' "$WORK/upgrade.txt" && grep -q 'backed up: dav:backups/notes-full-' "$WORK/upgrade.txt" ||
-		{ cat "$WORK/upgrade.txt"; fail "the upgrade took no backup first"; }
+	grep -q 'a backup first: notes-full-' "$WORK/upgrade.txt" && grep -q 'backed up: /usr/local/notes/backups/notes-full-' "$WORK/upgrade.txt" ||
+		{ cat "$WORK/upgrade.txt"; fail "the upgrade took no backup first, kept on the host"; }
 	# The VM reboots into 1.0.1, whose boot upgrades the install, given the staged input, then
 	# removes it; the gate marks the boot good.
 	back_on 1.0.1 active "after the upgrade" "$boot"
 	healthy_postgres "after the upgrade"
+	# The backup the upgrade took first survives on the host, listed as local, pulled over SSH.
+	pre_upgrade=$(on_vm notes-stow backup list | awk '/local: kept on the host/ {print $1}')
+	[[ $pre_upgrade == notes-full-*-1.0.0-r1.pgdump.age ]] || { on_vm notes-stow backup list; fail "the backup the upgrade took first is not listed as kept on the host"; }
+	on_vm sudo notes-stow backup export "$pre_upgrade" -o - >"$WORK/pre-upgrade.tar" 2>"$WORK/pre-upgrade.log" || { cat "$WORK/pre-upgrade.log"; fail "backup export over SSH"; }
+	[[ $(tar -tf "$WORK/pre-upgrade.tar" | tail -n1) == "$pre_upgrade" ]] || fail "the backup pulled over SSH does not end with its dump"
+	tar -xOf "$WORK/pre-upgrade.tar" "$pre_upgrade" >"$WORK/pre-upgrade.pgdump.age" || fail "the dump of the backup pulled over SSH"
+	check_backup "$WORK/pre-upgrade.pgdump.age" "$PG" e2e_backup_all
 	on_vm sudo cat /usr/local/notes/.env >"$WORK/upgraded.env" || fail "reading the VM's .env"
 	[[ $(sed -n "s/^RELAY_TOKEN='\{0,1\}\([^']*\)'\{0,1\}\$/\1/p" "$WORK/upgraded.env") == "$relay" ]] || { rm -f "$WORK/upgraded.env"; fail "the install does not record the input the upgrade gave"; }
 	rm -f "$WORK/upgraded.env"
@@ -902,6 +912,15 @@ step_rollback() {
 	back_on 1.0.0 passive "after rollback" "$boot"
 	! ran nic || edge_v6_clean "after rollback"
 	healthy_postgres "after rollback"
+	# The backup pulled before the upgrade, given back over SSH on standard input, the identity a
+	# root-only file: this install recorded it, so it restores as it is.
+	if ran upgrade && [[ -s $WORK/pre-upgrade.tar ]]; then
+		on_vm "sudo sh -c 'umask 077; cat >/run/restore.key'" <"$AGE_KEY" || fail "writing the identity on the VM"
+		on_vm sudo notes-stow restore --input - --identity /run/restore.key --yes <"$WORK/pre-upgrade.tar" >"$WORK/restore-input.txt" 2>&1 || { on_vm sudo rm -f /run/restore.key; cat "$WORK/restore-input.txt"; fail "restore --input over SSH"; }
+		on_vm sudo rm -f /run/restore.key
+		grep -q "restored $pre_upgrade" "$WORK/restore-input.txt" || { cat "$WORK/restore-input.txt"; fail "restore --input did not say it restored the backup pulled"; }
+		healthy_postgres "after the restore of the backup pulled"
+	fi
 	vm_status_json "$WORK/vm-status3.json" 1.0.0 -
 	# A refusal: exit 3, and under --json a Result of nothing, its reason and its fix.
 	rc=0; on_vm sudo notes-stow rollback --yes --json >"$WORK/rollback2.json" 2>"$WORK/rollback2.txt" || rc=$?

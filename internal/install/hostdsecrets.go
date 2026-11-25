@@ -5,8 +5,6 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -262,31 +260,7 @@ func (h *Hostd) restoreBackup(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	if req.Confirm == nil {
-		replyErr(w, fail(http.StatusBadRequest, "restore replaces the install's data: confirm the release it runs (\"confirm\": {\"version\", \"revision\"})"))
-		return
-	}
-	in, _, err := h.runnerCall(r) // refuses before the job: no settings, no install
-	if err != nil {
-		replyErr(w, err)
-		return
-	}
-	env, err := in.open()
-	if err != nil {
-		replyErr(w, err)
-		return
-	}
-	m := h.R.Manifest
-	target := Version{m.ProjectVersion, m.Revision}
-	if err := h.osRelease(env, "restore"); err != nil {
-		replyErr(w, err)
-		return
-	}
-	if *req.Confirm != target {
-		replyErr(w, fail(http.StatusConflict, "the install runs %s %s, not %s, which was confirmed: look again", m.Name, target, *req.Confirm))
-		return
-	}
-	pg, err := h.pgBackup()
+	in, pg, target, ids, err := h.restoreChecks(r, req)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -295,15 +269,62 @@ func (h *Hostd) restoreBackup(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	ids, err := age.ParseIdentities(strings.NewReader(req.Identity))
-	if err != nil {
-		replyErr(w, fail(http.StatusBadRequest, "the identity is not an age identity (AGE-SECRET-KEY-…)"))
+	// A backup kept on the host needs no settings; any other is the destination's.
+	if _, err := (localStore{name: h.R.Spec.Name, dir: LocalBackupsDir(h.O.Dir)}).size(r.Context(), req.Object); errors.Is(err, errObjectAbsent) {
+		_, c, err := h.runnerCall(r)
+		if err == nil && c.KeepLocal > 0 {
+			err = refuseAs(http.StatusNotFound, "", "%s is not among the backups kept on the host (`backup list` lists them)", req.Object)
+		}
+		if err != nil {
+			replyErr(w, err)
+			return
+		}
+	} else if err != nil {
+		replyErr(w, err)
 		return
 	}
 	if err := h.judged(r.Context()); err != nil {
 		replyErr(w, err)
 		return
 	}
+	h.startRestore(w, in, pg, req, ids, "", nil)
+}
+
+// restoreChecks refuses a restore before its job, whatever its backup: the install, the release
+// confirmed, the identity. It answers the install, the release's backup, the release and the
+// identity's keys.
+func (h *Hostd) restoreChecks(r *http.Request, req RestoreRequest) (*Installer, *providers.AgeRclone, Version, []age.Identity, error) {
+	if req.Confirm == nil {
+		return nil, nil, Version{}, nil, refuseAs(http.StatusBadRequest, "", "restore replaces the install's data: confirm the release it runs (\"confirm\": {\"version\", \"revision\"})")
+	}
+	pg, err := h.pgBackup()
+	if err != nil {
+		return nil, nil, Version{}, nil, err
+	}
+	in, _ := h.run()
+	env, err := h.installed(in)
+	if err != nil {
+		return nil, nil, Version{}, nil, err
+	}
+	m := h.R.Manifest
+	target := Version{m.ProjectVersion, m.Revision}
+	if err := h.osRelease(env, "restore"); err != nil {
+		return nil, nil, Version{}, nil, err
+	}
+	if *req.Confirm != target {
+		return nil, nil, Version{}, nil, refuseAs(http.StatusConflict, "", "the install runs %s %s, not %s, which was confirmed: look again", m.Name, target, *req.Confirm)
+	}
+	ids, err := age.ParseIdentities(strings.NewReader(req.Identity))
+	if err != nil {
+		return nil, nil, Version{}, nil, refuseAs(http.StatusBadRequest, "", "the identity is not an age identity (AGE-SECRET-KEY-…)")
+	}
+	return in, pg, target, ids, nil
+}
+
+// startRestore starts the restore job of req.Object, from the directory input (an archive given;
+// empty: a backup kept on the host or the destination's), and answers it; done, when set, runs
+// as the job ends, or at once when it does not start.
+func (h *Hostd) startRestore(w http.ResponseWriter, in *Installer, pg *providers.AgeRclone, req RestoreRequest, ids []age.Identity, input string, done func()) {
 	// Not while an upgrade waits in the passive slot: a restore that left the volumes half
 	// restored would strand it, its boot refusing them.
 	j, err := h.startJob("restore", req.Object, func() error {
@@ -313,19 +334,56 @@ func (h *Hostd) restoreBackup(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		replyErr(w, err)
 		return
 	}
 	h.backups.Add(1)
 	go func() {
 		defer h.backups.Done()
+		if done != nil {
+			defer done()
+		}
 		jw := &jobWriter{h: h, j: j}
 		in.O.Out, in.O.Log = jw, jw
-		err := h.runRestore(in, req.Object, ids, req.Unrecorded, func(format string, a ...any) { h.logf(j, format, a...) })
+		err := h.runRestore(in, input, req.Object, ids, req.Unrecorded, func(format string, a ...any) { h.logf(j, format, a...) })
 		jw.flush()
 		h.finish(j, err)
 	}()
 	accepted(w, j)
+}
+
+// restoreStore is where the restore of object reads it: the directory input when given, else
+// the backups kept on the host when they hold it, else the settings' destination.
+func (h *Hostd) restoreStore(ctx context.Context, in *Installer, input, object string, pg *providers.AgeRclone) (backupStore, func(), error) {
+	name := h.R.Spec.Name
+	if input != "" {
+		return localStore{name: name, dir: input}, func() {}, nil
+	}
+	kept := localStore{name: name, dir: LocalBackupsDir(h.O.Dir)}
+	if _, err := kept.size(ctx, object); err == nil {
+		return kept, func() {}, nil
+	} else if !errors.Is(err, errObjectAbsent) {
+		return nil, nil, err
+	}
+	h.backupMu.Lock()
+	c, err := h.readBackup(pg)
+	h.backupMu.Unlock()
+	switch {
+	case err != nil:
+		return nil, nil, err
+	case c == nil:
+		return nil, nil, fmt.Errorf("%s is not among the backups kept on the host, and the backup settings were removed meanwhile: nothing restored", object)
+	case c.KeepLocal > 0:
+		return nil, nil, fmt.Errorf("%s is not among the backups kept on the host (%s): nothing restored", object, kept.dir)
+	}
+	conf, done, err := h.rcloneConf(*c)
+	if err != nil {
+		return nil, nil, err
+	}
+	return rcloneStore{h: h, in: in, conf: conf, dest: c.Destination}, done, nil
 }
 
 // ownBackup refuses an object that is not a backup of name taken from the release v (a backup
@@ -334,20 +392,20 @@ func (h *Hostd) restoreBackup(w http.ResponseWriter, r *http.Request) {
 // table's structure, so the rows it left out would be lost.
 func ownBackup(name, object string, v Version, pg *providers.AgeRclone) error {
 	if !matchesOwnBackup(name, object) {
-		return fail(http.StatusBadRequest, "%q is not a backup of %s (`backup list` shows them)", object, name)
+		return refuseAs(http.StatusBadRequest, "", "%q is not a backup of %s (`backup list` shows them)", object, name)
 	}
 	if !strings.HasSuffix(object, lastSuffix(pg)) {
-		return fail(http.StatusConflict, "%s is not a %s backup, which %s takes: its backups end in %s", object, backupProvider(pg), name, lastSuffix(pg))
+		return refuseAs(http.StatusConflict, "", "%s is not a %s backup, which %s takes: its backups end in %s", object, backupProvider(pg), name, lastSuffix(pg))
 	}
 	profile, _, _ := strings.Cut(strings.TrimPrefix(object, name+"-"), "-")
 	if _, ok := pg.Profiles[profile]; !ok && !pg.Dump {
-		return fail(http.StatusConflict, "%s is a backup of the profile %s: a %s backup's profile is %s", object, profile, providers.VolumesBackup, providers.VolumesProfile)
+		return refuseAs(http.StatusConflict, "", "%s is a backup of the profile %s: a %s backup's profile is %s", object, profile, providers.VolumesBackup, providers.VolumesProfile)
 	}
 	if tables, ok := pg.Profiles[profile]; !ok || tables != nil || len(pg.Exclude[profile]) > 0 {
-		return fail(http.StatusConflict, "%s is a backup of the profile %s, which does not keep every table's rows: restoring it would empty the others (restore a backup of a profile `all`: %s)", object, profile, strings.Join(fullProfiles(pg), ", "))
+		return refuseAs(http.StatusConflict, "", "%s is a backup of the profile %s, which does not keep every table's rows: restoring it would empty the others (restore a backup of a profile `all`: %s)", object, profile, strings.Join(fullProfiles(pg), ", "))
 	}
 	if want := fmt.Sprintf("-%s-r%d%s", v.Version, v.Revision, lastSuffix(pg)); !strings.HasSuffix(object, want) {
-		return fail(http.StatusConflict, "%s was not taken from %s %s, which the install runs: a backup restores onto the release it was taken from", object, name, v)
+		return refuseAs(http.StatusConflict, "", "%s was not taken from %s %s, which the install runs: a backup restores onto the release it was taken from", object, name, v)
 	}
 	return nil
 }
@@ -470,7 +528,7 @@ func (h *Hostd) provisionRestored(ctx context.Context, in *Installer, env *EnvFi
 
 // runRestore stops the services but the database, streams the backup into pg_restore, and brings
 // the stack up again whatever happened.
-func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, unrecorded bool, logf func(string, ...any)) (err error) {
+func (h *Hostd) runRestore(in *Installer, input, object string, ids []age.Identity, unrecorded bool, logf func(string, ...any)) (err error) {
 	ctx, cancel := context.WithTimeout(h.ctx, backupTimeout)
 	defer cancel()
 	unlock, err := in.lockNow()
@@ -498,16 +556,7 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, unr
 	if err != nil {
 		return err
 	}
-	h.backupMu.Lock()
-	c, err := h.readBackup(pg)
-	h.backupMu.Unlock()
-	switch {
-	case err != nil:
-		return err
-	case c == nil:
-		return errors.New("the backup settings were removed meanwhile")
-	}
-	conf, done, err := h.rcloneConf(*c)
+	st, done, err := h.restoreStore(ctx, in, input, object, pg)
 	if err != nil {
 		return err
 	}
@@ -541,42 +590,34 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, unr
 		names = append(names, volumeObject(object, v))
 	}
 	for i, name := range names {
-		src := within(c.Destination, name)
-		out, err := h.rclone(ctx, in, conf, nil, "lsjson", "--files-only", "--no-mimetype", src)
-		var found []struct {
-			Name string
-			Size int64
-		}
-		if err == nil {
-			err = json.Unmarshal(out, &found)
-		}
+		size, err := st.size(ctx, name)
 		switch {
-		case (err != nil || len(found) != 1) && i == 0:
-			return fmt.Errorf("%s is not in %s (%v): nothing restored", object, c.Destination, cmp.Or(err, errors.New("not found")))
-		case err != nil || len(found) != 1:
-			return fmt.Errorf("%s has no archive of the volume %s to restore with it (%s: %v): nothing restored", object, pg.Volumes[i-1], src, cmp.Or(err, errors.New("not found")))
+		case err != nil && i == 0:
+			return fmt.Errorf("%s is not in %s (%v): nothing restored", object, st.where(), err)
+		case err != nil:
+			return fmt.Errorf("%s has no archive of the volume %s to restore with it (%s: %v): nothing restored", object, pg.Volumes[i-1], st.shown(name), err)
 		}
 		if i > 0 {
 			objects = append(objects, name)
 		}
-		if found[0].Size > largest {
-			largest, largestName = found[0].Size, name
+		if size > largest {
+			largest, largestName = size, name
 		}
 	}
 	// The recorded digest of each object, before anything stops: one without a record is refused
 	// unless unrecorded.
-	sums, err := h.checkDigests(c.Destination, objects, unrecorded, restoreTrust(pg, object, d.Roles.Migrate), logf)
+	sums, err := h.checkDigests(st, objects, unrecorded, restoreTrust(pg, object, d.Roles.Migrate), logf)
 	if err != nil {
 		return fmt.Errorf("%w: nothing restored", err)
 	}
 	// One object at a time is held: the disk holds the largest, or nothing stops.
-	if dk := h.diskAt(stage); dk != nil && largest > 0 && uint64(largest) > dk.Available {
+	if dk := h.diskAt(stage); st.copies() && dk != nil && largest > 0 && uint64(largest) > dk.Available {
 		return fmt.Errorf("restoring %s holds each of its objects in %s while it loads, and the largest, %s, is %d bytes: the disk has %d available (free space or grow the disk): nothing restored", object, stage, largestName, largest, dk.Available)
 	}
 	// A volumes-age-rclone backup's manifest is read before anything stops: the identity decrypts
 	// it, and it is a whole backup of this release's volumes.
 	if !pg.Dump {
-		if err := h.checkManifest(ctx, in, conf, stage, within(c.Destination, object), sums[object], ids, pg); err != nil {
+		if err := h.checkManifest(ctx, st, stage, object, sums[object], ids, pg); err != nil {
 			return fmt.Errorf("%w: nothing restored", err)
 		}
 	}
@@ -674,9 +715,8 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, unr
 			return fmt.Errorf("%w %s", err, asWas("data"))
 		}
 		staged[v] = vol
-		src := within(c.Destination, volumeObject(object, v))
-		logf("restoring %s into the volume %s", src, v)
-		if err := h.fetchVerified(ctx, in, conf, stage, src, sums[volumeObject(object, v)], ids, func(plain io.Reader) error {
+		logf("restoring %s into the volume %s", st.shown(volumeObject(object, v)), v)
+		if err := h.fetchVerified(ctx, st, stage, volumeObject(object, v), sums[volumeObject(object, v)], ids, func(plain io.Reader) error {
 			_, err := h.runnerShell(ctx, in, image, vol, false, plain, nil, stageScript)
 			return err
 		}); err != nil {
@@ -685,9 +725,8 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, unr
 		}
 	}
 	if pg.Dump {
-		src := within(c.Destination, object)
-		logf("restoring %s into %s's database", src, in.R.Spec.Name)
-		if err := h.fetchVerified(ctx, in, conf, stage, src, sums[object], ids, func(plain io.Reader) error {
+		logf("restoring %s into %s's database", st.shown(object), in.R.Spec.Name)
+		if err := h.fetchVerified(ctx, st, stage, object, sums[object], ids, func(plain io.Reader) error {
 			load := []string{"exec", "-T", d.Service, "sh", "-c", loadScript, "restore", d.Roles.Migrate, d.Name, maintenanceDB(d.Name)}
 			if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), load...), Env: env.Environ(in.O.environ()), Stdin: plain, Stream: in.O.Log}); err != nil {
 				return fmt.Errorf("loading %s: %w", object, err)
@@ -818,9 +857,10 @@ const maxManifest = 64 << 10
 
 // checkManifest reads the volumes-age-rclone backup's manifest src, decrypted by ids (its
 // SHA-256 sum when not empty), and refuses one that is not of this release's project, release and volumes.
-func (h *Hostd) checkManifest(ctx context.Context, in *Installer, conf, stage, src, sum string, ids []age.Identity, pg *providers.AgeRclone) error {
+func (h *Hostd) checkManifest(ctx context.Context, st backupStore, stage, obj, sum string, ids []age.Identity, pg *providers.AgeRclone) error {
+	src := st.shown(obj)
 	var raw []byte
-	if err := h.fetchVerified(ctx, in, conf, stage, src, sum, ids, func(plain io.Reader) error {
+	if err := h.fetchVerified(ctx, st, stage, obj, sum, ids, func(plain io.Reader) error {
 		var err error
 		raw, err = io.ReadAll(io.LimitReader(plain, maxManifest+1))
 		return err
@@ -883,26 +923,18 @@ const restoreObjects = ".stowage-restore-objects"
 // decrypts that copy into use: what use reads is the copy that was checked, never a second
 // download. The copy is removed once use is done; a failure says whether the download, the
 // digest or the identity was why.
-func (h *Hostd) fetchVerified(ctx context.Context, in *Installer, conf, stage, src, sum string, ids []age.Identity, use func(io.Reader) error) error {
-	f, err := os.CreateTemp(stage, "object-*")
+func (h *Hostd) fetchVerified(ctx context.Context, st backupStore, stage, obj, sum string, ids []age.Identity, use func(io.Reader) error) error {
+	f, got, done, err := st.fetch(ctx, stage, obj)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	hash := sha256.New()
-	if _, err := h.rcloneTo(ctx, in, conf, h.runnerName(), nil, io.MultiWriter(f, hash), "cat", src); err != nil {
-		return fmt.Errorf("downloading %s: %w", src, err)
-	}
-	if got := hex.EncodeToString(hash.Sum(nil)); sum != "" && got != sum {
-		return changedObject(src, got, sum)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return err
+	defer done()
+	if sum != "" && got != sum {
+		return changedObject(st.shown(obj), got, sum)
 	}
 	plain, err := age.Decrypt(bufio.NewReader(f), ids...)
 	if err != nil {
-		return fmt.Errorf("decrypting %s: %w (is the identity one of the backup's recipients?)", src, err)
+		return fmt.Errorf("decrypting %s: %w (is the identity one of the backup's recipients?)", st.shown(obj), err)
 	}
 	return use(plain)
 }
@@ -917,7 +949,7 @@ func changedObject(src, got, want string) error {
 // name, which fetchVerified compares each download with. An object without a record is refused,
 // unless unrecorded: then it is loaded unchecked (said in the log, absent from the result). The
 // refusal and the log say what --unrecorded vouches for in that object: trust's sentence of it.
-func (h *Hostd) checkDigests(dest string, objects []string, unrecorded bool, trust func(object string) string, logf func(string, ...any)) (map[string]string, error) {
+func (h *Hostd) checkDigests(st backupStore, objects []string, unrecorded bool, trust func(object string) string, logf func(string, ...any)) (map[string]string, error) {
 	h.backupMu.Lock()
 	rec, err := readDigests(h.O.Dir)
 	h.backupMu.Unlock()
@@ -926,8 +958,8 @@ func (h *Hostd) checkDigests(dest string, objects []string, unrecorded bool, tru
 	}
 	sums := map[string]string{}
 	for _, o := range objects {
-		src := within(dest, o)
-		d, ok := rec[src]
+		src := st.shown(o)
+		d, ok := rec[st.key(o)]
 		switch {
 		case !ok && !unrecorded:
 			return nil, fmt.Errorf("%s: this install recorded no digest of it, so nothing proves it is what one of its backups uploaded (a backup taken on another machine, or one past the newest %d objects): with restore --unrecorded, %s; give it only for a backup you made", src, maxDigests, trust(o))
