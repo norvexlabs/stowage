@@ -13,18 +13,14 @@ Batched by the gate they share: a batch is one slice, one review, one gate run. 
 Must above Blocked (user, 2026-11-15): the clouds under Blocked ship in it as preview, Google
 Cloud alone proven.
 
-- **A lint warning a project has weighed, accepted with its reason**: `lint` (and `ship`'s) repeat
-  at every run the warnings a stack cannot avoid — a VPN's `cap_add: [NET_ADMIN]`, host
-  `sysctls` meant for the host's namespace alone (warned though each carries a `reason`) — so a
-  new warning is lost among the old. `audit-allow.yaml` already does this for findings: an
-  allowance file (or a key beside the warned one) naming the warning's path and text, its reason
-  and its last day, listed as accepted rather than warned, an expired one warned again, one
-  matching no warning logged "remove it", as the audit's are.
-- **A VM's `reset-db --new-baseline` gives the inputs the release adds**: a crossing to a release
-  at a new schema baseline that adds a required input with no default is refused on the VM
-  (`… which reset-db --new-baseline cannot give on the VM`), as the crossing's boot takes no input
-  and an upgrade cannot cross a baseline. `reset-db --new-baseline` takes `--set`, `--set-file`
-  and `--answers` as `upgrade` does, staged the same way for the boot that crosses.
+- **`describe --json` names each secret's `secrets rotate` way** (`rotate`: `passes` for
+  `rotation: true`, `replace` for `replace: true`, `none`): the provider's `secret_rotations`
+  refuses at plan only from it (its TODO, Should 3). An additive field of the machine interface.
+- **e2e-vm crosses a schema baseline for real**: no suite crosses one on the VM; the crossing and
+  0.45.0's inputs for it are proven by unit tests alone. Ship a release at a new baseline adding a
+  required input, `reset-db --new-baseline --set` over SSH, the boot that crosses (data wiped, the
+  input recorded, the staged file gone), and the refusal without `--set` naming that command; run
+  with the next slice that runs e2e-vm.
 
 ### Supply chain — stopgaps back to canonical
 
@@ -286,10 +282,12 @@ Cloud alone proven.
 - **The Docker disk-pressure check end to end**: `disk-check` and its timer are unit-tested; no
   suite runs the check against a filled volume on a Docker host.
 
-- **`schema` on the VM and Kubernetes, `secrets set` on Kubernetes**: Docker's `schema` has no
-  VM verb (the host daemon would run it, as it runs `exec`) nor `k8s schema` (a query pod, as the
-  rollback check runs); `secrets set` has no `k8s` verb (the release's Secret changed and its
-  readers restarted, as `k8s secrets rotate` does).
+- **`schema` on the VM and Kubernetes, `secrets set` and the one-pass `secrets rotate` on
+  Kubernetes**: Docker's `schema` has no VM verb (the host daemon would run it, as it runs
+  `exec`) nor `k8s schema` (a query pod, as the rollback check runs); `secrets set` has no `k8s`
+  verb, and `k8s secrets rotate` takes a secret with `rotation: true` alone (the release's Secret
+  — its secret files' one for an `as_file` secret — changed and its readers restarted, as its
+  three passes do).
 
 - **Cloud images, account identity**: an image's working directory is keyed by the cloud's
   settings, not by the account the credentials reach; two accounts on the same settings (a

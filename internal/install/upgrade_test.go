@@ -441,7 +441,7 @@ func TestUpgradeAddsATLSRoute(t *testing.T) {
 		t.Errorf("an empty domain: %v", err)
 	}
 	// On the VM, where the shape asks it, its value is checked first: the VM's upgrade names
-	// itself as the way to give it; a crossing (reset-db --new-baseline) gives none.
+	// itself as the way to give it; a run given no input says so.
 	env4, err := ReadEnvFile(filepath.Join(e.dir, envName))
 	if err != nil {
 		t.Fatal(err)
@@ -449,10 +449,13 @@ func TestUpgradeAddsATLSRoute(t *testing.T) {
 	const upgradeFix = "give each a value its input accepts: `sudo notes-stow upgrade --set KEY=VALUE` (or --set-file KEY=PATH, --answers FILE) gives it to the boot into the release"
 	for vmUpgrade, fix := range map[bool]string{true: upgradeFix, false: ""} {
 		in := e.installer(func(o *Options) { o.Preloaded = true })
-		in.vmUpgrade = vmUpgrade
+		if vmUpgrade {
+			in.vmGives = &vmGiving{run: "the upgrade", cmd: "upgrade"}
+		}
 		err := in.upgradeCheck(context.Background(), env4, nil)
 		// A run prints the reason alone: it names the command too.
-		if r, ok := Refusal(err); !ok || r.Fix != fix || !strings.Contains(err.Error(), `WIKI_HOST: "" is not a domain name`) || strings.Contains(err.Error(), "upgrade --set") != vmUpgrade {
+		if r, ok := Refusal(err); !ok || r.Fix != fix || !strings.Contains(err.Error(), `WIKI_HOST: "" is not a domain name`) || strings.Contains(err.Error(), "upgrade --set") != vmUpgrade ||
+			!vmUpgrade && !strings.HasSuffix(err.Error(), ": this run is given no input") {
 			t.Errorf("the VM's upgrade %v: %v (fix %q)", vmUpgrade, err, r.Fix)
 		}
 	}

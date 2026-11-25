@@ -111,7 +111,7 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 		}
 		return "", failAs(http.StatusConflict, baselineRefused("stay on this release, or cross to it with its data wiped (reset-db --new-baseline)", m, to, fmt.Sprintf("the install runs %s %s", m.Name, v), from, way+"; its OS is not written"))
 	}
-	return h.valuesCheck(ctx, in, env, m, k, "this upgrade", args, given)
+	return h.valuesCheck(ctx, in, env, m, k, "this upgrade", &vmGiving{run: "the upgrade", cmd: "upgrade" + args, since: stagedInputsSince}, given)
 }
 
 // valuesCheck judges the install's values against target release m, as its installer carries it
@@ -121,15 +121,16 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 // answers why, logged: the boot into m judges, with its own rules, and falls back to the release
 // the install runs on a refusal; where it reads m's spec, what this Stowage's rules would refuse is
 // answered with it, so a dry run names it. what names the run a refusal stops ("this upgrade",
-// "it"); upgrade, when that run is an upgrade, its arguments (upgradeArgs), with which a refusal
-// of an input the release adds names `upgrade --set` (vmUpgrade) — or says why it gives none, when
-// m's boot does not take what an upgrade stages.
-func (h *Hostd) valuesCheck(ctx context.Context, in *Installer, env *EnvFile, m *release.Manifest, k *keptRelease, what, upgrade string, given map[string]string) (string, error) {
+// "it"); gives the command that gives the boot the inputs the release adds (the upgrade, the
+// crossing), which a refusal of one names — or says why it gives none, when m's boot does not
+// take what that command stages.
+func (h *Hostd) valuesCheck(ctx context.Context, in *Installer, env *EnvFile, m *release.Manifest, k *keptRelease, what string, gives *vmGiving, given map[string]string) (string, error) {
 	check := func() error {
-		c := &Installer{R: k.Release, O: in.O, vmUpgrade: upgrade != "", vmUpgradeArgs: upgrade}
-		if c.vmUpgrade && !h.takesStaged(m) {
-			c.vmNoInputs = fmt.Sprintf("%s was published by Stowage %s, whose boot takes no input an upgrade gives: it is reached only by a release that requires none", m.Tag, cmp.Or(m.StowageVersion, "of no recorded version"))
+		g := *gives
+		if !stagedInputsBy(m.StowageVersion, h.Stowage, g.since) {
+			g.none = fmt.Sprintf("%s was published by Stowage %s, whose boot takes no input %s gives: it is reached only by a release that requires none", m.Tag, cmp.Or(m.StowageVersion, "of no recorded version"), g.run)
 		}
+		c := &Installer{R: k.Release, O: in.O, vmGives: &g}
 		return c.upgradeCheck(ctx, env, given)
 	}
 	note := ""
@@ -153,7 +154,7 @@ func (h *Hostd) valuesCheck(ctx context.Context, in *Installer, env *EnvFile, m 
 		// A refusal stays one, with the fix it was raised with on the VM (or none).
 		gets := "it is given no input"
 		if len(given) > 0 {
-			gets = "it is given only the inputs this upgrade gives"
+			gets = "it is given only the inputs " + gives.run + " gives"
 		}
 		return "", failAs(http.StatusConflict, fmt.Errorf("%w\nthe boot into %s would refuse %s (%s), so its OS is not written", err, m.Tag, what, gets))
 	}

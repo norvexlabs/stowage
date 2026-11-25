@@ -1,7 +1,9 @@
 package install
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -36,6 +38,15 @@ func rotating(s *spec.Spec) {
 	for i := range s.Secrets {
 		if s.Secrets[i].Key == "SESSION_SECRET" {
 			s.Secrets[i].Rotation = true
+		}
+	}
+}
+
+// replacing makes SESSION_SECRET a secret the one pass replaces.
+func replacing(s *spec.Spec) {
+	for i := range s.Secrets {
+		if s.Secrets[i].Key == "SESSION_SECRET" {
+			s.Secrets[i].Replace = true
 		}
 	}
 }
@@ -77,9 +88,11 @@ func TestASecretRotatesInThreePassesOnDocker(t *testing.T) {
 		return n
 	}
 	refused(RotateSwap, "no new SESSION_SECRET is staged")
-	if err := e.installer(nil).RotateSecret(context.Background(), "POSTGRES_PASSWORD", RotateStage); err == nil || !strings.Contains(err.Error(), "POSTGRES_PASSWORD is no secret with rotation: true (rotated: SESSION_SECRET)") {
-		t.Fatalf("a secret without rotation: %v", err)
+	if err := e.installer(nil).RotateSecret(context.Background(), "POSTGRES_PASSWORD", RotateStage); err == nil ||
+		err.Error() != "POSTGRES_PASSWORD has neither rotation: true nor replace: true: its release lets `secrets rotate` change it in no way (rotated or replaced: SESSION_SECRET)" {
+		t.Fatalf("a secret with neither: %v", err)
 	}
+	refused(RotateReplace, "SESSION_SECRET has rotation: true: it is replaced in three passes, `notes-stow secrets rotate SESSION_SECRET --stage` first")
 	if err := rotate(RotateStage); err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +125,134 @@ func TestASecretRotatesInThreePassesOnDocker(t *testing.T) {
 	}
 	if !strings.Contains(e.log.String(), "dropped the previous SESSION_SECRET: the rotation is done") {
 		t.Fatalf("log:\n%s", e.log)
+	}
+}
+
+// A secret with replace: true is replaced in one pass: a new value by its gen, the stack up once
+// with it; refused, changing nothing, for a key the spec does not hold and for one with neither
+// replace nor rotation (lint keeps replace off what the database reads).
+func TestASecretWithoutRotationIsReplacedOnDocker(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	replacing(e.r.Spec)
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	old, pw := get(e.readEnv(), "SESSION_SECRET"), get(e.readEnv(), "POSTGRES_PASSWORD")
+	for key, want := range map[string]string{
+		"POSTGRES_PASSWORD": "POSTGRES_PASSWORD has neither rotation: true nor replace: true: its release lets `secrets rotate` change it in no way (rotated or replaced: SESSION_SECRET)",
+		"NO_SUCH_SECRET":    "NO_SUCH_SECRET is no secret of notes (secrets: SESSION_SECRET, POSTGRES_PASSWORD)",
+	} {
+		before := e.file(".env")
+		if err := e.installer(nil).RotateSecret(context.Background(), key, RotateReplace); err == nil || err.Error() != want {
+			t.Errorf("%s: %v", key, err)
+		}
+		if e.file(".env") != before {
+			t.Errorf("a refused replace of %s changed .env", key)
+		}
+	}
+	for _, pass := range []string{RotateStage, RotateSwap, RotateFinish} {
+		if err := e.installer(nil).RotateSecret(context.Background(), "SESSION_SECRET", pass); err == nil ||
+			err.Error() != "SESSION_SECRET has replace: true: `notes-stow secrets rotate SESSION_SECRET` replaces it in one pass, without --stage or --finish" {
+			t.Errorf("%s: %v", pass, err)
+		}
+	}
+	e.docker.calls = nil
+	if err := e.installer(nil).RotateSecret(context.Background(), "SESSION_SECRET", RotateReplace); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	f := e.readEnv()
+	ups := 0
+	for _, c := range e.docker.calls {
+		if slices.Contains(c.Args, "--detach") {
+			ups++
+		}
+	}
+	if v := get(f, "SESSION_SECRET"); len(v) != 64 || v == old || get(f, "POSTGRES_PASSWORD") != pw || ups != 1 {
+		t.Fatalf("after the replace: %q (was %q), %d ups", v, old, ups)
+	}
+	for _, k := range []string{"SESSION_SECRET_NEXT", "SESSION_SECRET_PREVIOUS"} {
+		if _, ok := f.Get(k); ok {
+			t.Errorf("%s recorded for a secret without rotation", k)
+		}
+	}
+	if !strings.Contains(e.log.String(), "recorded a new SESSION_SECRET: the services reading it are recreated") || strings.Contains(e.log.String(), get(f, "SESSION_SECRET")) {
+		t.Fatalf("log:\n%s", e.log)
+	}
+}
+
+// `secrets rotate` is offered on Docker only when a secret takes a way of it: the three passes'
+// flags with a secret of rotation: true, the one pass with one it refuses nothing of; and the
+// secrets help names only the verbs there.
+func TestDockersRotateIsOfferedWhereASecretTakesIt(t *testing.T) {
+	t.Parallel()
+	help := func(t *testing.T, edit func(*spec.Spec), args ...string) string {
+		e := newEnv(t)
+		edit(e.r.Spec)
+		var out bytes.Buffer
+		cmd := newCommand(e.r, e.self, &out, &out, K8sOptions{}, func(bool) Prompter { return nil })
+		cmd.SetArgs(append(args, "--help"))
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	settable := func(s *spec.Spec) { s.Secrets[0].Settable = true } // SESSION_SECRET; POSTGRES_PASSWORD the database reads
+	if out := help(t, settable, "secrets"); strings.Contains(out, "rotate") || !strings.Contains(out, "The install's secrets: set one, show a settable one or export them all") {
+		t.Errorf("nothing to rotate:\n%s", out)
+	}
+	if out := help(t, func(*spec.Spec) {}, "secrets"); strings.Contains(out, "rotate") {
+		t.Errorf("neither rotation nor replace:\n%s", out)
+	}
+	if out := help(t, replacing, "secrets", "rotate"); strings.Contains(out, "--stage") || !strings.Contains(out, "Replace a generated secret with replace: true in one pass, confirmed first") {
+		t.Errorf("the one pass alone:\n%s", out)
+	}
+	if out := help(t, rotating, "secrets", "rotate"); !strings.Contains(out, "--stage") || strings.Contains(out, "--yes") {
+		t.Errorf("the three passes alone:\n%s", out)
+	}
+}
+
+// On Docker the one pass refuses before it asks: no install in --dir, and --yes on a secret of
+// three passes; the question comes once every check of its own passed.
+func TestDockersReplaceRefusesBeforeItAsks(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	rotating(e.r.Spec)
+	e.r.Spec.Secrets = append(e.r.Spec.Secrets, spec.Secret{Key: "OTHER_TOKEN", Gen: "hex32", Replace: true})
+	run := func(args ...string) error {
+		cmd := newCommand(e.r, e.self, io.Discard, io.Discard, K8sOptions{}, func(bool) Prompter { t.Fatal("asked"); return nil })
+		cmd.SetArgs(append(args, "--dir", e.dir))
+		return cmd.Execute()
+	}
+	if err := run("secrets", "rotate", "OTHER_TOKEN"); err == nil || !strings.Contains(err.Error(), "holds no install") {
+		t.Errorf("no install: %v", err)
+	}
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	for args, want := range map[string]string{
+		"SESSION_SECRET --yes":   "--yes, --no-input and --accessible confirm the one pass of a secret with replace: true, which SESSION_SECRET is not: leave them out",
+		"SESION_SECRET --yes":    "SESION_SECRET is no secret of notes (secrets: SESSION_SECRET, POSTGRES_PASSWORD, OTHER_TOKEN)",
+		"OTHER_TOKEN --no-input": "secrets rotate OTHER_TOKEN replaces it at once, and --no-input asks nothing: give --yes",
+	} {
+		if err := run(append([]string{"secrets", "rotate"}, strings.Fields(args)...)...); err == nil || err.Error() != want {
+			t.Errorf("%s: %v", args, err)
+		}
+	}
+}
+
+// Kubernetes takes the three passes alone: a secret with replace: true is refused, saying where
+// the one pass runs.
+func TestKubernetesRefusesTheOnePass(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.release = e.at("1.0.0", 1, func(s *spec.Spec) {
+		rotating(s)
+		s.Secrets = append(s.Secrets, spec.Secret{Key: "OTHER_TOKEN", Gen: "hex32", Replace: true})
+	})
+	if err := e.installer(nil).K8sRotateSecret(context.Background(), "OTHER_TOKEN", RotateSwap); err == nil ||
+		err.Error() != "OTHER_TOKEN has replace: true, which `secrets rotate` replaces in one pass on Docker and the VM: `k8s secrets rotate` takes a secret with rotation: true alone" {
+		t.Errorf("%v", err)
 	}
 }
 

@@ -159,7 +159,7 @@ data:
 
 secrets:
   - { key: ENCRYPTION_KEY,          gen: hex32, as_file: true }   # a file the api mounts, never a variable
-  - { key: SESSION_SECRET,          gen: hex32 }
+  - { key: SESSION_SECRET,          gen: hex32, replace: true }    # secrets rotate, in one pass
   - { key: INTERNAL_SERVICE_SECRET, gen: hex32, rotation: true }   # secrets rotate
   - { key: POSTGRES_PASSWORD,       gen: pass18 }
   - { key: APP_DB_PASSWORD,         gen: pass18 }

@@ -87,6 +87,32 @@ func TestASecretDeliveredAsAFileIsWrittenForTheStack(t *testing.T) {
 	}
 }
 
+// A secret delivered as a file that `secrets rotate` replaces gets a new file, at a new path its
+// services are recreated on; the old one goes once the stack started.
+func TestAReplacedSecretFileMovesToANewPath(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	for i := range e.r.Spec.Secrets {
+		e.r.Spec.Secrets[i].AsFile = e.r.Spec.Secrets[i].Key == "SESSION_SECRET"
+		e.r.Spec.Secrets[i].Replace = e.r.Spec.Secrets[i].AsFile
+	}
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	first := get(e.readEnv(), spec.SecretFileVar("SESSION_SECRET"))
+	if err := e.installer(nil).RotateSecret(context.Background(), "SESSION_SECRET", RotateReplace); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	env := e.readEnv()
+	second := get(env, spec.SecretFileVar("SESSION_SECRET"))
+	if got, _ := os.ReadFile(filepath.Join(e.dir, second)); second == first || string(got) != get(env, "SESSION_SECRET") {
+		t.Fatalf("at %q (was %q): %q", second, first, got)
+	}
+	if names := inputFiles(t, e.dir); len(names) != 1 || "./"+InputFilesDir+"/"+names[0] != second {
+		t.Errorf("after the start: %v", names)
+	}
+}
+
 // What a dry run shows of a secret delivered as a file: its path holds its digest, so it is redacted.
 func TestADryRunRedactsTheFileOfASecret(t *testing.T) {
 	t.Parallel()

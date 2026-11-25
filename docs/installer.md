@@ -46,6 +46,7 @@ refusal is the verb's Result.
 <short>-stow registry-login FILE|-|--remove [--dir D]                     # record or remove this install's own registry login
 <short>-stow secrets export --recipient AGE_KEY… [-o FILE|-] [--dir D]   # the secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish] [--dir D]           # a secret with rotation: true
+<short>-stow secrets rotate KEY [--yes] [--no-input] [--accessible] [--dir D]   # a secret with replace: true, in one pass, confirmed first
 <short>-stow secrets set KEY [--accessible] [--dir D] < value            # a secret with settable: true; asked, unechoed, on a terminal
 <short>-stow secrets show KEY [--dir D]                                   # a settable secret's value, printed on a terminal only
 <short>-stow provision [--dir D] [--set KEY=VALUE]…                      # run the provision hook again; --set an input only it reads, or a value it returned or declares it returns
@@ -726,8 +727,8 @@ refusal is the verb's Result.
   exists (it keeps its own). A key that is no secret of the release is left out, and said.
   Docker and the Kairos VM; on Kubernetes, `k8s secrets export` writes the same file and `k8s
   install --secrets` takes it (see [kubernetes](kubernetes.md)), so a file restores on any shape.
-- `secrets rotate KEY` replaces a generated secret whose spec entry has `rotation: true` (any
-  other is refused, naming the ones that have it), in three passes, each recorded in `.env` and
+- `secrets rotate KEY` replaces a generated secret whose spec entry has `rotation: true` (a key
+  that is no secret of the release is refused, naming them) in three passes, each recorded in `.env` and
   followed by the stack brought up again (the services reading a changed value are recreated)
   and the provision hook run, under the install's lock:
   - `--stage` records a new value as `KEY_NEXT`, which the services accept and do not use
@@ -743,6 +744,29 @@ refusal is the verb's Result.
   while one is staged, else `KEY_PREVIOUS`; empty outside a rotation, as the two are never both
   set), each pass and each upgrade writing it again: a service that accepts one more value beside
   `KEY` reads `${KEY_ACCEPTED}` alone. It is a secret, as the two are.
+- `secrets rotate KEY` replaces a generated secret whose spec entry has `replace: true` (the
+  publisher's word that nothing the data keeps is made with it: a session signing key, an
+  internal client secret, one delivered as a file) in one pass, without `--stage` or `--finish`
+  (refused, `KEY has replace: true: `<short>-stow secrets rotate KEY` replaces it in one pass,
+  without --stage or --finish`): a new value made by its `gen`, recorded in `.env` (a file
+  secret's file written at a new path, the old one removed once the stack started), then the
+  stack brought up again (the services reading it are recreated) and the provision hook run,
+  under the install's lock; the value is never printed, and `secrets export` carries it from then
+  on. Nothing of the old value is kept, so whatever was made with it no longer matches: it asks
+  first on a terminal (`--accessible`: a plain line prompt), `--yes` confirms without asking,
+  `--no-input` never asks (without `--yes`, refused), and without a terminal and `--yes` it is
+  refused before anything changes (`secrets rotate KEY
+  replaces it at once and asks first, and there is no terminal to answer: give --yes`);
+  `secrets export` first keeps the old value. It asks only once its own checks passed (an install
+  in `--dir`, the key's way). A secret with neither `rotation: true` nor `replace: true` is
+  refused, naming those with one (`KEY has neither rotation: true nor replace: true: its release
+  lets `secrets rotate` change it in no way (rotated or replaced: …)`); `--yes` or `--accessible`
+  on a secret of three passes is refused (`--yes and --accessible confirm the one pass of a
+  secret with replace: true, which KEY is not: leave them out`). A run again after a failed start
+  makes another value. `secrets rotate` is there only when a secret takes it (`--stage` and
+  `--finish` only with a secret of `rotation: true`, `--yes` and `--accessible` only with one of
+  `replace: true`), and `secrets --help` names only the verbs there. Docker and the Kairos VM;
+  `k8s secrets rotate` has the three passes alone, and refuses a `replace: true` secret saying so.
 - `secrets set KEY` records a value the operator chooses for a generated secret whose spec entry
   has `settable: true` (any other is refused, naming the ones that have it): a login's password,
   a local identity provider's user, set to a known value or reset after a leak. The value is read
@@ -757,8 +781,9 @@ refusal is the verb's Result.
   the stack up again. `secrets export` carries it from then on. A secret the database or the
   data was made with (a database password, an encryption key) is never `settable`: the
   database keeps the password it was created with (lint refuses `settable` on a secret the
-  database's service reads in its `environment` — by name or interpolated, an `env_file` not
-  read: `secrets[N].settable: KEY is read by the database's service …`). Docker and the Kairos VM; on Kubernetes,
+  database's service reads, as it refuses `replace` and `rotation` there (what it reads: see
+  `secrets[]` in the [spec](spec.md), an `env_file` reading every key): `secrets[N].settable: KEY
+  is read by the database's service …`). Docker and the Kairos VM; on Kubernetes,
   not yet.
 - `secrets show KEY` prints the value the install records for a secret with `settable: true` (a
   login an operator signs in with; any other is refused, naming the ones that have it), one line

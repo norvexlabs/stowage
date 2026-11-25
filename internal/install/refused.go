@@ -132,31 +132,38 @@ func (in *Installer) flagFix(fix string) string {
 	return fix
 }
 
-// vmUpgradeWith is the VM's `upgrade` given flag (`--set KEY=VALUE`), as a fix names it, when the
-// run is the VM's upgrade and that upgrade gives the inputs the release adds to the boot into it;
-// else "".
-func (in *Installer) vmUpgradeWith(flag string) string {
-	if !in.vmUpgrade || in.vmNoInputs != "" {
-		return ""
+// vmGiving is the VM's command that gives the inputs a release adds to the boot into it: run names
+// it in a reason ("the upgrade", "reset-db --new-baseline"), cmd is it as the operator types it
+// after the installer ("upgrade --version 1.0.1": upgradeArgs, the release it reaches), none says
+// why it gives none ("" when it does: the release's boot, or the OS the VM goes back to, built
+// before the Stowage that gives them), which a refusal says instead.
+// since is the first Stowage whose boot takes what that command stages.
+type vmGiving struct{ run, cmd, none, since string }
+
+// vmGivesWith is the VM's command that gives the inputs (vmGives) given flag (`--set KEY=VALUE`),
+// as a fix names it, when it gives them; else "".
+func (in *Installer) vmGivesWith(flag string) string {
+	if g := in.vmGives; g != nil && g.none == "" {
+		return "`" + in.vmCtl() + " " + g.cmd + " " + flag + "`"
 	}
-	return "`" + in.vmCtl() + " upgrade" + in.vmUpgradeArgs + " " + flag + "`"
+	return ""
 }
 
 // valueRefusal refuses the inputs given or defaulted a value their check refuses (bad, one "KEY:
-// why" each). On the VM's upgrade, which gives the inputs the release adds, its fix names that
-// command, in its reason too (the text a person reads: a run prints it alone); one that can give
-// none says why instead.
+// why" each). On the VM's upgrade or crossing, which gives the inputs the release adds, its fix
+// names that command, in its reason too (the text a person reads: a run prints it alone); one that
+// can give none says why instead.
 func (in *Installer) valueRefusal(bad []string) error {
 	why := strings.Join(bad, "; ")
-	up := in.vmUpgradeWith("--set KEY=VALUE")
+	up := in.vmGivesWith("--set KEY=VALUE")
 	switch {
 	case up != "":
 		fix := "give each a value its input accepts: " + up + " (or --set-file KEY=PATH, --answers FILE) gives it to the boot into the release"
 		return refusal(fix, fmt.Errorf("%s: %s", why, fix))
-	case in.vmUpgrade && in.vmNoInputs != "":
-		return refusal("", fmt.Errorf("%s: %s", why, in.vmNoInputs))
-	case in.givenNothing && !in.vmUpgrade:
-		return refusal("", fmt.Errorf("%s: reset-db --new-baseline cannot give one on the VM", why))
+	case in.vmGives != nil:
+		return refusal("", fmt.Errorf("%s: %s", why, in.vmGives.none))
+	case in.givenNothing:
+		return refusal("", fmt.Errorf("%s: this run is given no input", why))
 	}
 	return refusal("give each a value its input accepts", errors.New(why))
 }

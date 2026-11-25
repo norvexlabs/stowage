@@ -771,6 +771,7 @@ func (h *Hostd) routes(app bool) http.Handler {
 	operator("POST /v1/services/{service}/exec", h.execService)
 	operator("POST /v1/provision", h.provision)
 	both("GET /v1/reset-db", h.resetDBPlan)
+	operator("POST /v1/reset-db/plan", h.resetDBPlanWith)
 	operator("POST /v1/reset-db", h.resetDB)
 	both("GET /v1/health", h.health)
 	both("GET /v1/updates", h.updates)
@@ -1455,6 +1456,30 @@ type ResetRequest struct {
 	// Unordered, with Version, takes a version a `command` scheme would order, which the daemon
 	// cannot run (unorderedTo): the operator checked the order.
 	Unordered bool `json:"unordered,omitempty"`
+	// Inputs, with NewBaseline, are values of inputs the release adds, KEY: value (a file input's
+	// as --set-file encodes it), staged root-only for the boot that crosses, which takes them as
+	// given and removes them: those the plan was asked with (POST /v1/reset-db/plan), or refused.
+	Inputs map[string]string `json:"inputs,omitempty"`
+}
+
+// ResetPlanRequest is POST /v1/reset-db/plan's body: GET /v1/reset-db's query, with the inputs a
+// crossing gives the release it installs (reset-db --new-baseline --set), which no URL carries.
+type ResetPlanRequest struct {
+	NewBaseline bool              `json:"new_baseline,omitempty"`
+	Channel     string            `json:"channel,omitempty"`
+	Version     string            `json:"version,omitempty"`
+	Unordered   bool              `json:"unordered,omitempty"`
+	Inputs      map[string]string `json:"inputs,omitempty"`
+}
+
+// inputsDigest is a digest of the inputs a reset-db plan was asked with, which its POST must give
+// again: none and empty are one.
+func inputsDigest(inputs map[string]string) [32]byte {
+	if len(inputs) == 0 {
+		return [32]byte{}
+	}
+	raw, _ := json.Marshal(inputs) // a map of strings, its keys sorted
+	return sha256.Sum256(raw)
 }
 
 // ResetPlan is what GET /v1/reset-db answers: the release the job resets and what it does.
@@ -1496,24 +1521,47 @@ func (h *Hostd) resetCheck(ctx context.Context, in *Installer) (ResetPlan, error
 }
 
 func (h *Hostd) resetDBPlan(w http.ResponseWriter, r *http.Request) {
-	in, _ := h.run()
 	q := r.URL.Query()
-	nb := q.Get("new_baseline") == "true"
-	// The app may look at a plan, not one the operator alone vouches for (POST reset-db is the
-	// operator's); unordered without a version is resetPlan's refusal, whoever asks.
-	if q.Get("unordered") == "true" && q.Get("version") != "" && fromApp(r) {
-		replyErr(w, unorderedOperators(in, verbNewBaseline, q.Get("channel"), q.Get("version")))
+	h.showResetPlan(w, r, ResetPlanRequest{NewBaseline: q.Get("new_baseline") == "true", Channel: q.Get("channel"), Version: q.Get("version"), Unordered: q.Get("unordered") == "true"})
+}
+
+// resetDBPlanWith is POST /v1/reset-db/plan: GET /v1/reset-db's plan, asked with the inputs the
+// crossing gives — the operator's alone, as they may be secrets.
+func (h *Hostd) resetDBPlanWith(w http.ResponseWriter, r *http.Request) {
+	var req ResetPlanRequest
+	// The inputs may hold a file input's content.
+	if err := decodeBodyUpTo(w, r, &req, maxSecretsFile+64<<10); err != nil {
+		replyErr(w, err)
 		return
 	}
-	p, _, _, err := h.resetPlan(r.Context(), in, nb, q.Get("channel"), q.Get("version"), q.Get("unordered") == "true", fromApp(r), "", true)
+	h.showResetPlan(w, r, req)
+}
+
+// showResetPlan answers the reset-db plan req asks for, with the token its POST uses once.
+func (h *Hostd) showResetPlan(w http.ResponseWriter, r *http.Request, req ResetPlanRequest) {
+	in, _ := h.run()
+	nb := req.NewBaseline
+	// The app may look at a plan, not one the operator alone vouches for (POST reset-db is the
+	// operator's); unordered without a version is resetPlan's refusal, whoever asks.
+	if req.Unordered && req.Version != "" && fromApp(r) {
+		replyErr(w, unorderedOperators(in, verbNewBaseline, req.Channel, req.Version))
+		return
+	}
+	// The app looks, and never confirms (POST reset-db is the operator's): its plan carries no token
+	// and leaves the operator's as it was.
+	p, _, _, err := h.resetPlan(r.Context(), in, req, fromApp(r), "", !fromApp(r))
 	if err != nil {
 		replyErr(w, err)
+		return
+	}
+	if fromApp(r) {
+		reply(w, http.StatusOK, p)
 		return
 	}
 	// The token, the plan it shows and that plan's check, set together: a later GET replaces all.
 	p.Token = rand.Text()
 	h.mu.Lock()
-	h.resetToken, h.resetShown = p.Token, shownReset{nb, p.Target}
+	h.resetToken, h.resetShown = p.Token, shownReset{nb, p.Target, inputsDigest(req.Inputs)}
 	if c := h.checkedPlan; nb && c != nil {
 		c.token = p.Token
 		h.crossPlan, h.checkedPlan = c, nil
@@ -1529,10 +1577,16 @@ func (h *Hostd) resetDBPlan(w http.ResponseWriter, r *http.Request) {
 // must come after this OS's and start another schema baseline, both told, and take the install's
 // values as its boot takes them (upgradeCheck); prefix is the registry it comes from. A version
 // named under a `command` scheme is taken only with unordered, as an upgrade's (unorderedTo);
-// asked by the app (app), its refusal names the operator's command over SSH (unorderedCmd).
-func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, channel, version string, unordered, app bool, token string, shown bool) (p ResetPlan, m *release.Manifest, prefix string, err error) {
-	if !newBaseline && (channel != "" || version != "") {
+// asked by the app (app), its refusal names the operator's command over SSH (unorderedCmd). The
+// inputs the request gives are judged with the install's values, given to m's boot, which must
+// take what a reset-db stages.
+func (h *Hostd) resetPlan(ctx context.Context, in *Installer, req ResetPlanRequest, app bool, token string, shown bool) (p ResetPlan, m *release.Manifest, prefix string, err error) {
+	newBaseline, channel, version, unordered := req.NewBaseline, req.Channel, req.Version, req.Unordered
+	switch {
+	case !newBaseline && (channel != "" || version != ""):
 		return ResetPlan{}, nil, "", fail(http.StatusBadRequest, "a channel or a version names the release new_baseline installs: reset-db resets the release the OS carries")
+	case !newBaseline && len(req.Inputs) > 0:
+		return ResetPlan{}, nil, "", fail(http.StatusBadRequest, "inputs are what the release new_baseline installs adds: reset-db resets the release the OS carries with the values the install records")
 	}
 	if unordered && version == "" {
 		return ResetPlan{}, nil, "", failAs(http.StatusBadRequest, unorderedAlone(verbNewBaseline))
@@ -1566,6 +1620,11 @@ func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, 
 		return ResetPlan{}, nil, "", fail(http.StatusConflict, "%s %s (revision %d) does not come after %s (revision %d), which this OS runs: --new-baseline installs a later release", m.Name, m.ProjectVersion, m.Revision, h.R.Manifest.ProjectVersion, h.R.Manifest.Revision)
 	case m.Artifacts.OS == "":
 		return ResetPlan{}, nil, "", fail(http.StatusConflict, "%s %s was published without an OS bundle", m.Name, m.Tag)
+	}
+	// A boot that does not read what a reset-db stages would leave it there, unused.
+	if len(req.Inputs) > 0 && !stagedInputsBy(m.StowageVersion, h.Stowage, crossedInputsSince) {
+		return ResetPlan{}, nil, "", refuseAs(http.StatusConflict, "cross without the inputs, with a release that requires none it adds: only a release published with Stowage "+crossedInputsSince+" or later is given them",
+			"%s was published by Stowage %s, whose crossing's boot takes no input a reset-db gives: nothing is staged", m.Tag, cmp.Or(m.StowageVersion, "of no recorded version"))
 	}
 	prefix, _ = env.Get("STOWAGE_REGISTRY")
 	key := crossPlanned{installer: m.Artifacts.Installer, install: sha256.Sum256([]byte(strings.Join(env.Environ(nil), "\x00")))}
@@ -1602,7 +1661,8 @@ func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, 
 	if len(keep) > 0 {
 		kept = " (keeping " + strings.Join(keep, ", ") + ")"
 	}
-	unchecked, err := h.valuesCheck(ctx, in, env, m, k, "it", "", nil)
+	gives := &vmGiving{run: verbNewBaseline, cmd: verbNewBaseline + upgradeArgs(channel, m.ProjectVersion, unordered || needsUnordered(m, h.runsVersion(env))), since: crossedInputsSince}
+	unchecked, err := h.valuesCheck(ctx, in, env, m, k, "it", gives, req.Inputs)
 	if err != nil {
 		return ResetPlan{}, nil, "", err
 	}
@@ -1620,15 +1680,17 @@ func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, 
 	return key.plan, m, prefix, nil
 }
 
-// shownReset is the plan a reset-db GET showed: a crossing or not, and its target.
+// shownReset is the plan a reset-db GET showed: a crossing or not, its target, and the inputs it was
+// asked with (inputsDigest).
 type shownReset struct {
 	newBaseline bool
 	target      Version
+	inputs      [32]byte
 }
 
 // crossPlanned is a crossing resetPlan checked: the target's installer (its digest), the install
 // it was checked against (its .env's digest), the plan, and the token of the GET that showed it,
-// whose POST alone takes it as it is.
+// whose POST alone takes it as it is — with the inputs that GET was asked with (shownReset).
 type crossPlanned struct {
 	installer string
 	install   [32]byte
@@ -1639,7 +1701,8 @@ type crossPlanned struct {
 // resetDB runs reset-db as a job: the install back to its first setup, without a reboot.
 func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 	var req ResetRequest
-	if err := decodeBody(r, &req); err != nil {
+	// The inputs may hold a file input's content.
+	if err := decodeBodyUpTo(w, r, &req, maxSecretsFile+64<<10); err != nil {
 		replyErr(w, err)
 		return
 	}
@@ -1656,7 +1719,7 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 	if req.NewBaseline {
 		h.mu.Lock()
 		known := req.Token != "" && subtle.ConstantTimeCompare([]byte(req.Token), []byte(h.resetToken)) == 1
-		other := h.resetShown.newBaseline != req.NewBaseline
+		other := h.resetShown.newBaseline != req.NewBaseline || h.resetShown.inputs != inputsDigest(req.Inputs)
 		h.mu.Unlock()
 		switch {
 		case !known:
@@ -1668,7 +1731,7 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	in, _ := h.run()
-	p, m, prefix, err := h.resetPlan(r.Context(), in, req.NewBaseline, req.Channel, req.Version, req.Unordered, false, req.Token, false)
+	p, m, prefix, err := h.resetPlan(r.Context(), in, ResetPlanRequest{NewBaseline: req.NewBaseline, Channel: req.Channel, Version: req.Version, Unordered: req.Unordered, Inputs: req.Inputs}, false, req.Token, false)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -1684,7 +1747,7 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 		}
 		shown := h.resetShown
 		h.resetToken, h.resetShown = "", shownReset{}
-		if shown != (shownReset{req.NewBaseline, p.Target}) {
+		if shown != (shownReset{req.NewBaseline, p.Target, inputsDigest(req.Inputs)}) {
 			return fail(http.StatusConflict, "reset-db's token is the GET's that showed another plan: look again")
 		}
 		if m == nil {
@@ -1705,8 +1768,9 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 	if m != nil {
 		src := fmt.Sprintf("%s/%s-os@%s", prefix, m.Name, m.Artifacts.OS)
 		go h.osJob(j, in, m.Tag, prefix, src, true, "wipes the data and installs it", func() error {
-			// What an upgrade staged was for the OS this one replaces in the passive slot.
-			if err := stageInputs(in.O.Dir, m, "", nil); err != nil {
+			// What an upgrade staged was for the OS this one replaces in the passive slot: replaced by
+			// what this crossing gives its boot, or removed.
+			if err := stageInputs(in.O.Dir, m, req.Channel, req.Inputs); err != nil {
 				return err
 			}
 			return writeAtomic(newBaselineFile(in.O.Dir), strings.NewReader(releaseMark(m.ProjectVersion, m.Revision)+"\n"), 0o600, nil)

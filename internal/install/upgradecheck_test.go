@@ -161,7 +161,7 @@ func TestUpgradeStagesTheInputsTheReleaseAddsForItsBoot(t *testing.T) {
 	} {
 		var e errOf
 		if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true, Inputs: c.inputs}, &e); code != 409 || !e.Refused ||
-			!strings.Contains(e.Error, c.want) || !strings.Contains(e.Error, "(it is given only the inputs this upgrade gives)") || (c.fix != "" && e.Fix != c.fix) {
+			!strings.Contains(e.Error, c.want) || !strings.Contains(e.Error, "(it is given only the inputs the upgrade gives)") || (c.fix != "" && e.Fix != c.fix) {
 			t.Errorf("%s: %d %s (fix %q)", name, code, e.Error, e.Fix)
 		}
 	}
@@ -211,7 +211,7 @@ func TestUpgradeInputsNeedABootThatTakesThem(t *testing.T) {
 			var plan UpgradePlan
 			call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true}, &plan)
 			if strings.Contains(plan.Unchecked, "upgrade --channel stable --version 2.0.0 --set") == refused ||
-				strings.Contains(plan.Unchecked, "whose boot takes no input an upgrade gives: it is reached only by a release that requires none") != refused {
+				strings.Contains(plan.Unchecked, "whose boot takes no input the upgrade gives: it is reached only by a release that requires none") != refused {
 				t.Errorf("published by Stowage %q, no input: %q", stowage, plan.Unchecked)
 			}
 		}
@@ -236,7 +236,7 @@ func TestTheUpgradesBodyIsBounded(t *testing.T) {
 	}
 	// The client refuses inputs past what one request carries, before it asks.
 	// Measured as sent: JSON escapes "<" to 6 bytes.
-	if _, err := upgradeInputs([]string{"K=" + strings.Repeat("<", maxSecretsFile/6+1)}, nil, ""); err == nil || !strings.Contains(err.Error(), "over the 1048576 an upgrade carries") {
+	if _, err := upgradeInputs([]string{"K=" + strings.Repeat("<", maxSecretsFile/6+1)}, nil, ""); err == nil || !strings.Contains(err.Error(), "over the 1048576 an upgrade or a reset-db carries") {
 		t.Errorf("inputs past the cap: %v", err)
 	}
 	if _, err := upgradeInputs([]string{"K=" + strings.Repeat("x", maxSecretsFile-len(`{"K":""}`))}, nil, ""); err != nil {
@@ -423,7 +423,8 @@ func TestTheDaemonResetsToANewBaselineByItsOS(t *testing.T) {
 	if planned == 0 {
 		t.Fatal("the plan read no installer")
 	}
-	// What an earlier upgrade staged was for the OS the crossing's replaces: removed.
+	// What an earlier upgrade staged was for the OS the crossing's replaces: replaced by what the
+	// crossing gives its boot, the channel it was asked on alone.
 	if err := os.WriteFile(stagedInputsFile(p.env.dir), []byte(`{"release":"1.5.0 1","inputs":{"K":"v"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -442,8 +443,8 @@ func TestTheDaemonResetsToANewBaselineByItsOS(t *testing.T) {
 	if raw, err := os.ReadFile(mark); err != nil || strings.TrimSpace(string(raw)) != "2.0.0 1" {
 		t.Fatalf("mark %q %v (job %+v)", raw, err, j)
 	}
-	if _, err := os.Stat(stagedInputsFile(p.env.dir)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("an upgrade's staged inputs outlive the crossing: %v", err)
+	if raw, err := os.ReadFile(stagedInputsFile(p.env.dir)); err != nil || string(raw) != `{"release":"2.0.0 1","channel":"stable"}` {
+		t.Errorf("an upgrade's staged inputs outlive the crossing: %s %v", raw, err)
 	}
 	if n := len(p.env.docker.ran("volume rm")); n != 0 {
 		t.Errorf("wiped before the boot into the new release")
@@ -469,6 +470,102 @@ func TestTheDaemonResetsToANewBaselineByItsOS(t *testing.T) {
 	}
 	if _, err := os.Stat(qm); !os.IsNotExist(err) {
 		t.Errorf("the upgrade kept the crossing's mark: %v", err)
+	}
+}
+
+// The app may look at a reset-db plan, never confirm one: its plan carries no token, and the
+// operator's plan shown meanwhile is still confirmed.
+func TestTheAppsResetPlanLeavesTheOperatorsToken(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.releaseOf("2.0.0", atBaseline(2))
+	const token = "app-token"
+	f := p.env.readEnv()
+	f.Set(HostTokenVar, token)
+	if err := f.WriteFile(filepath.Join(p.env.dir, envName)); err != nil {
+		t.Fatal(err)
+	}
+	d := daemon(p.env, &fakeHost{})
+	op, appH := d.Handler(), d.AppHandler()
+	app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+token)
+		appH.ServeHTTP(w, r)
+	})
+	var plan, seen ResetPlan
+	if code := call(t, op, "POST", "/v1/reset-db/plan", ResetPlanRequest{NewBaseline: true, Channel: "stable"}, &plan); code != 200 || plan.Token == "" {
+		t.Fatalf("the operator's plan: %d %+v", code, plan)
+	}
+	if code := call(t, app, "GET", "/v1/reset-db?new_baseline=true&channel=stable", nil, &seen); code != 200 || seen.Token != "" || seen.Target != plan.Target {
+		t.Fatalf("the app's plan: %d %+v", code, seen)
+	}
+	var e errOf
+	if code := call(t, op, "POST", "/v1/reset-db", ResetRequest{Confirm: &plan.Target, Token: plan.Token, NewBaseline: true, Channel: "stable"}, &e); code != 202 {
+		t.Fatalf("the operator's confirmation: %d %s", code, e.Error)
+	}
+	waitJob(t, op)
+}
+
+// A crossing to a release adding a required input is given it: its plan, asked with the inputs by
+// POST (no URL carries them), judges them as the boot takes them, its refusal naming the reset-db
+// that gives them; the POST must give the plan's inputs again, and stages them root-only for the
+// boot, never logged. Inputs without a crossing, and for a release whose crossing's boot reads none
+// (published by a Stowage before 0.45.0), are refused.
+func TestACrossingStagesTheInputsTheReleaseAdds(t *testing.T) {
+	t.Parallel()
+	const secret = "s3cret-mail-password"
+	adds := func(s *spec.Spec) {
+		atBaseline(2)(s)
+		s.Inputs = append(s.Inputs, spec.Input{Key: "SMTP_PASSWORD", Prompt: "Mail password", Secret: true, Required: true})
+	}
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.releaseOf("2.0.0", adds)
+	host := &fakeHost{}
+	hh := daemon(p.env, host).Handler()
+	var e errOf
+	const fix = "`sudo notes-stow reset-db --new-baseline --channel stable --version 2.0.0 --set KEY=VALUE` (or --set-file KEY=PATH, --answers FILE) gives each to the boot into the release"
+	if code := call(t, hh, "GET", "/v1/reset-db?new_baseline=true&channel=stable", nil, &e); code != 409 || !e.Refused ||
+		!strings.Contains(e.Error, "missing required input(s) the release adds, which reset-db --new-baseline did not give: SMTP_PASSWORD (Mail password)") || e.Fix != fix ||
+		!strings.Contains(e.Error, "(it is given no input)") {
+		t.Fatalf("no input: %d %s (fix %q)", code, e.Error, e.Fix)
+	}
+	if code := call(t, hh, "POST", "/v1/reset-db/plan", ResetPlanRequest{Inputs: map[string]string{"SMTP_PASSWORD": secret}}, &e); code != 400 || !strings.Contains(e.Error, "inputs are what the release new_baseline installs adds") {
+		t.Fatalf("inputs without a crossing: %d %s", code, e.Error)
+	}
+	given := map[string]string{"SMTP_PASSWORD": secret}
+	var plan ResetPlan
+	if code := call(t, hh, "POST", "/v1/reset-db/plan", ResetPlanRequest{NewBaseline: true, Channel: "stable", Inputs: given}, &plan); code != 200 || plan.Target != (Version{"2.0.0", 1}) {
+		t.Fatalf("plan with the input: %d %+v", code, plan)
+	}
+	// The POST gives the plan's inputs again: other ones, or none, are another plan.
+	for _, other := range []map[string]string{nil, {"SMTP_PASSWORD": "another"}} {
+		if code := call(t, hh, "POST", "/v1/reset-db", ResetRequest{Confirm: &plan.Target, Token: plan.Token, NewBaseline: true, Channel: "stable", Inputs: other}, &e); code != 409 || !strings.Contains(e.Error, "showed another plan") {
+			t.Fatalf("inputs %v: %d %s", other, code, e.Error)
+		}
+	}
+	if code := call(t, hh, "POST", "/v1/reset-db", ResetRequest{Confirm: &plan.Target, Token: plan.Token, NewBaseline: true, Channel: "stable", Inputs: given}, &e); code != 202 {
+		t.Fatalf("%d %s", code, e.Error)
+	}
+	j := waitJob(t, hh)
+	if j.State != "done" || strings.Contains(strings.Join(j.Log, "\n"), secret) {
+		t.Fatalf("%+v", j)
+	}
+	at := stagedInputsFile(p.env.dir)
+	var st staged
+	fi, err := os.Stat(at)
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("staged: %v %v", fi, err)
+	}
+	if raw, err := os.ReadFile(at); err != nil || json.Unmarshal(raw, &st) != nil || st.Release != "2.0.0 1" || st.Channel != "stable" || !maps.Equal(st.Inputs, given) {
+		t.Fatalf("staged %+v: %v", st, err)
+	}
+	for stowage, refused := range map[string]bool{"0.44.0": true, "": true, crossedInputsSince: false} {
+		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+		p.releaseOf("2.0.0", adds, func(m *release.Manifest) { m.StowageVersion = stowage })
+		var e errOf
+		code := call(t, daemon(p.env, &fakeHost{}).Handler(), "POST", "/v1/reset-db/plan", ResetPlanRequest{NewBaseline: true, Channel: "stable", Inputs: given}, &e)
+		if got := code == 409 && e.Refused && strings.Contains(e.Error, "whose crossing's boot takes no input a reset-db gives: nothing is staged"); got != refused || (!refused && code != 200) {
+			t.Errorf("published by Stowage %q: %d %s", stowage, code, e.Error)
+		}
 	}
 }
 

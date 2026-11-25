@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"maps"
 	"net"
 	"os"
@@ -65,6 +66,111 @@ func TestExamplesAreClean(t *testing.T) {
 				t.Errorf("Version = %q, want %q", res.Version, version)
 			}
 		})
+	}
+}
+
+// lint.accept: an acceptance in force takes a warning out of the findings into Accepted; one
+// expired leaves it warned and is warned of; one expiring soon is warned of; one matching no
+// warning (another where, another text, or an error's) says to remove it; an error is never
+// accepted.
+func TestAcceptedWarnings(t *testing.T) {
+	t.Parallel()
+	const spare = "  spare: { ref: \"postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395\" }\n"
+	setup := func(t *testing.T, accept string) *Result {
+		root := testutil.CopyExample(t, "minimal")
+		testutil.Edit(t, root, specFile, "\nstack:\n", spare+"\nstack:\n")
+		testutil.Edit(t, root, specFile, "\nimages:\n", "\nlint: { accept: lint-accept.yaml }\n\nimages:\n")
+		if err := os.WriteFile(filepath.Join(root, "lint-accept.yaml"), []byte(accept), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return run(t, root)
+	}
+	strs := func(r *Result) (out []string) {
+		for _, f := range r.Findings {
+			out = append(out, f.String())
+		}
+		return out
+	}
+	const entry = "- { where: images.spare, text: used by no compose service, reason: kept for the restore drill, expires: %s }\n"
+	r := setup(t, fmt.Sprintf(entry, "2026-12-31"))
+	if len(r.Findings) != 0 || len(r.Accepted) != 1 || r.Accepted[0].Where != "images.spare" || r.Accepted[0].Reason != "kept for the restore drill" ||
+		r.Accepted[0].String() != "accepted: images.spare: used by no compose service and no hook (kept for the restore drill; until 2026-12-31)" {
+		t.Fatalf("in force: %v %v", strs(r), r.Accepted)
+	}
+	r = setup(t, fmt.Sprintf(entry, "2026-10-07"))
+	if got := strs(r); len(r.Accepted) != 0 || !slices.Equal(got, []string{"warning: images.spare: used by no compose service and no hook",
+		`warning: lint.accept: lint-accept.yaml: acceptance of images.spare ("used by no compose service") expired on 2026-10-07: the warning counts again; renew it, fix the warning, or remove it`}) {
+		t.Fatalf("expired: %q", got)
+	}
+	// The last day still holds; within 30 days it is noted.
+	r = setup(t, fmt.Sprintf(entry, "2026-10-08"))
+	if got := strs(r); len(r.Accepted) != 1 || len(got) != 1 || !strings.Contains(got[0], "expires on 2026-10-08, within 30 days: renew it or fix the warning before then") {
+		t.Fatalf("its last day: %q", got)
+	}
+	if r = setup(t, fmt.Sprintf(entry, "2026-11-08")); len(r.Accepted) != 1 || len(r.Findings) != 0 {
+		t.Fatalf("31 days ahead: %q", strs(r))
+	}
+	for name, accept := range map[string]string{
+		"another where": "- { where: images.api, text: used by no, reason: r, expires: 2026-12-31 }\n",
+		"another text":  "- { where: images.spare, text: used by a hook, reason: r, expires: 2026-12-31 }\n",
+		"an error":      "- { where: lint.accept, text: matches no warning, reason: r, expires: 2026-12-31 }\n",
+	} {
+		r := setup(t, accept)
+		got := strs(r)
+		if len(r.Accepted) != 0 || len(got) != 2 || got[0] != "warning: images.spare: used by no compose service and no hook" || !strings.Contains(got[1], "matches no warning: correct its where or text") {
+			t.Errorf("%s: %q", name, got)
+		}
+	}
+	for accept, want := range map[string]string{
+		"- { where: images.spare, text: x, expires: 2026-12-31 }\n":                               "entry 1 (images.spare (\"x\")): reason is required",
+		"- { where: images.spare, reason: r, expires: 2026-12-31 }\n":                             "entry 1 (images.spare): text is required",
+		"- { text: x, reason: r, expires: 2026-12-31 }\n":                                         "entry 1: where is required",
+		"- { where: images.spare, text: x, reason: r, expires: 31/12/2026 }\n":                    `expires "31/12/2026": a date, YYYY-MM-DD`,
+		"- { where: images.spare, text: x, reason: r, expires: 2027-10-09 }\n":                    "expires 2027-10-09: more than a year ahead",
+		"- { where: images.spare, text: x, reason: r, expires: 2026-12-31, until: x }\n":          "field until not found",
+		strings.Repeat("- { where: images.spare, text: x, reason: r, expires: 2026-12-31 }\n", 2): `entry 2: images.spare ("x") is listed twice (entry 1)`,
+	} {
+		r := setup(t, accept)
+		if errs := errorsOf(r); len(errs) != 1 || !strings.HasPrefix(errs[0], "error: lint.accept: lint-accept.yaml: ") || !strings.Contains(errs[0], want) {
+			t.Errorf("%q: %q", accept, errs)
+		}
+	}
+	// An entry matching an error accepts nothing: the error stays, and the entry matches no warning.
+	root := testutil.CopyExample(t, "minimal")
+	testutil.Edit(t, root, specFile, "\nname: notes\n", "\nname: Notes\n")
+	testutil.Edit(t, root, specFile, "\nimages:\n", "\nlint: { accept: lint-accept.yaml }\n\nimages:\n")
+	testutil.Write(t, root, "lint-accept.yaml", "- { where: name, text: must be 2–40 lowercase, reason: r, expires: 2026-12-31 }\n")
+	if r := run(t, root); len(r.Accepted) != 0 || len(errorsOf(r)) != 1 || !strings.Contains(errorsOf(r)[0], "error: name: ") ||
+		!slices.ContainsFunc(strs(r), func(f string) bool {
+			return strings.Contains(f, "acceptance of name") && strings.Contains(f, "matches no warning")
+		}) {
+		t.Errorf("an error: %q, accepted %v", strs(r), r.Accepted)
+	}
+	// A year ahead to the day holds.
+	if r = setup(t, fmt.Sprintf(entry, "2027-10-08")); len(errorsOf(r)) != 0 || len(r.Accepted) != 1 {
+		t.Errorf("a year ahead: %q", strs(r))
+	}
+	root = testutil.CopyExample(t, "minimal")
+	testutil.Edit(t, root, specFile, "\nimages:\n", "\nlint: { accept: missing.yaml }\n\nimages:\n")
+	if errs := errorsOf(run(t, root)); len(errs) != 1 || !strings.Contains(errs[0], "lint.accept") {
+		t.Errorf("a missing file: %q", errs)
+	}
+}
+
+// A secret the database reads, given both rotation and replace, is told so once: the rotation's
+// refusal, beside the one of keeping both.
+func TestARotatedReplacedDatabaseSecretIsToldOnce(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "{ key: POSTGRES_PASSWORD,       gen: pass18 }", "{ key: POSTGRES_PASSWORD,       gen: pass18, rotation: true, replace: true }")
+	n := 0
+	for _, e := range errorsOf(run(t, root)) {
+		if strings.Contains(e, "is read by the database's service postgres") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("told %d times", n)
 	}
 }
 
@@ -175,6 +281,11 @@ func TestEachRuleFires(t *testing.T) {
 		{"unknown secret generator", []edit{{specFile, "gen: pass18", "gen: pass99"}}, nil, "unknown generator"},
 		{"duplicate key", []edit{{specFile, "key: SESSION_SECRET", "key: POSTGRES_PASSWORD"}}, nil, "already declared"},
 		{"reserved prefix", []edit{{specFile, "key: ADMIN_EMAIL", "key: STOWAGE_ADMIN"}}, nil, "reserved"},
+		{"lint accept file missing", []edit{{specFile, "\nimages:\n", "\nlint: { accept: lint-accept.yaml }\n\nimages:\n"}}, nil, "lint.accept"},
+		{"lint accept without reason", []edit{{specFile, "\nimages:\n", "\nlint: { accept: lint-accept.yaml }\n\nimages:\n"}},
+			map[string]string{"lint-accept.yaml": "- { where: images.api, text: x, expires: 2026-12-31 }\n"}, "lint.accept: lint-accept.yaml: entry 1 (images.api (\"x\")): reason is required"},
+		{"lint accept for good", []edit{{specFile, "\nimages:\n", "\nlint: { accept: lint-accept.yaml }\n\nimages:\n"}},
+			map[string]string{"lint-accept.yaml": "- { where: images.api, text: x, reason: r, expires: 2099-01-01 }\n"}, "expires 2099-01-01: more than a year ahead"},
 		// held- names the content a retired tag left: a channel's tags never start with it.
 		{"held tag prefix", []edit{{specFile, `tag: "beta-{v}"`, `tag: "held-{v}"`}}, nil, "held-"},
 		{"secret input with default", []edit{{specFile, `prompt: "Administrator email", required: true`, `prompt: "x", secret: true, default: "y"`}}, nil, "secret input"},
@@ -353,6 +464,19 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"login secret unknown", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops, secret: NOPE }"}}, nil, "front.routes[3].basic_auth.secret: NOPE is neither a secret nor an input"},
 		{"login secret not secret", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops, secret: ECHO_ADDRESS }"}}, nil, "front.routes[3].basic_auth.secret: ECHO_ADDRESS is not secret"},
 		{"settable database password", []edit{{sp, "{ key: POSTGRES_PASSWORD,       gen: pass18 }", "{ key: POSTGRES_PASSWORD,       gen: pass18, settable: true }"}}, nil, "secrets[3].settable: POSTGRES_PASSWORD is read by the database's service postgres, which keeps the value it was first made with"},
+		{"settable password the database's base reads", []edit{{sp, "{ key: POSTGRES_PASSWORD,       gen: pass18 }", "{ key: POSTGRES_PASSWORD,       gen: pass18, settable: true }"},
+			{cp, "  postgres:\n    image: ${STOWAGE_IMAGE_POSTGRES}\n", "  pgenv:\n    image: ${STOWAGE_IMAGE_POSTGRES}\n    environment: [POSTGRES_PASSWORD]\n  postgres:\n    extends: pgenv\n    image: ${STOWAGE_IMAGE_POSTGRES}\n"},
+			{cp, "      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}\n", ""}}, nil, "secrets[3].settable: POSTGRES_PASSWORD is read by the database's service postgres"},
+		{"settable password file the database mounts", []edit{{sp, "{ key: POSTGRES_PASSWORD,       gen: pass18 }", "{ key: POSTGRES_PASSWORD,       gen: pass18, as_file: true, settable: true }"},
+			{cp, "      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}\n    volumes:\n", "      POSTGRES_PASSWORD_FILE: /run/secrets/pw\n    volumes:\n      - ${STOWAGE_SECRET_FILE_POSTGRES_PASSWORD}:/run/secrets/pw:ro\n"}},
+			nil, "secrets[3].settable: POSTGRES_PASSWORD is read by the database's service postgres"},
+		{"replaced secret rotated", []edit{{sp, "gen: hex32, rotation: true }", "gen: hex32, rotation: true, replace: true }"}}, nil, "secrets[2].replace: INTERNAL_SERVICE_SECRET rotates: `secrets rotate` changes it in three passes; keep one of rotation and replace"},
+		{"replaced secret settable", []edit{{sp, "gen: pass18, settable: true }", "gen: pass18, settable: true, replace: true }"}}, nil, "secrets[5].replace: OPS_PASSWORD is settable"},
+		{"replaced database password", []edit{{sp, "{ key: POSTGRES_PASSWORD,       gen: pass18 }", "{ key: POSTGRES_PASSWORD,       gen: pass18, replace: true }"}}, nil, "secrets[3].replace: POSTGRES_PASSWORD is read by the database's service postgres, which keeps the value it was first made with: a secret the data is made with is never replaced"},
+		{"replaced database password beside a compose error", []edit{{sp, "{ key: POSTGRES_PASSWORD,       gen: pass18 }", "{ key: POSTGRES_PASSWORD,       gen: pass18, replace: true }"},
+			{cp, "  postgres:\n    image: ${STOWAGE_IMAGE_POSTGRES}\n", "  other:\n    extends: { file: base.yaml, service: x }\n  postgres:\n    image: ${STOWAGE_IMAGE_POSTGRES}\n"}}, nil, "secrets[3].replace: POSTGRES_PASSWORD is read by the database's service postgres"},
+		{"rotated database password", []edit{{sp, "{ key: POSTGRES_PASSWORD,       gen: pass18 }", "{ key: POSTGRES_PASSWORD,       gen: pass18, rotation: true }"}}, nil, "secrets[3].rotation: POSTGRES_PASSWORD is read by the database's service postgres, which keeps the value it was first made with: a secret the data is made with is never rotated"},
+		{"replaced secret the database's env_file gives", []edit{{cp, "    environment:\n      POSTGRES_DB: atlas\n", "    env_file: [.env]\n    environment:\n      POSTGRES_DB: atlas\n"}}, nil, "secrets[1].replace: SESSION_SECRET is read by the database's service postgres"},
 		{"settable secret rotated", []edit{{sp, "gen: hex32, rotation: true }", "gen: hex32, rotation: true, settable: true }"}}, nil, "secrets[2].settable: INTERNAL_SERVICE_SECRET rotates: `secrets rotate` changes it"},
 		{"login secret rotated", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops, secret: INTERNAL_SERVICE_SECRET }"}}, nil, "front.routes[3].basic_auth.secret: INTERNAL_SERVICE_SECRET rotates"},
 		{"login beside forward auth", []edit{{sp, "copy_headers: [X-Auth-Request-User] }\n", "copy_headers: [X-Auth-Request-User] }\n      basic_auth: { user: ops, secret: OPS_PASSWORD }\n"}}, nil, "front.routes[1].basic_auth: and forward_auth both ask who the client is"},
@@ -2455,6 +2579,32 @@ func TestServiceDevicesJoinTheBase(t *testing.T) {
 		"  child: { extends: base, devices: [{ source: /dev/dri/renderD128, target: /dev/dri/renderD128 }, /dev/net/tun] }\n  plain: { image: x }\n"))
 	if err != nil || !slices.Equal(d["child"], []string{"/dev/dri/renderD128", "/dev/net/tun", "/dev/ttyUSB0"}) || !slices.Equal(d["base"], []string{"/dev/ttyUSB0"}) || d["plain"] != nil {
 		t.Fatalf("%v %v", d, err)
+	}
+}
+
+// A service reads a key in its environment by name or interpolated, its base's included; another
+// service, an absent one and a literal $$ read none.
+func TestServiceReads(t *testing.T) {
+	t.Parallel()
+	raw := []byte("x-mounts: &mounts { volumes: [\"${STOWAGE_SECRET_FILE_ALIAS_PW}:/pw\"] }\nservices:\n  base: { image: x, environment: { PW: \"${DB_PW}\" } }\n  db: { extends: base }\n" +
+		"  list: { image: x, environment: [TOKEN, \"LIT=$$TOKEN2\"] }\n" +
+		"  filed: { image: x, volumes: [\"${STOWAGE_SECRET_FILE_PG_PW}:/run/secrets/pw:ro\"] }\n  child: { extends: { service: filed } }\n" +
+		"  cmd: { image: x, command: [\"--token=${CMD_TOKEN:-x}\"] }\n" +
+		"  envfiled: { image: x, env_file: [.env] }\n  labelled: { image: x, labels: { 1: \"${LABEL_PW}\" } }\n" +
+		"  secreted: { image: x, secrets: [pw, { source: other }] }\n  configured: { image: x, configs: [{ source: conf }] }\n" +
+		"  aliased: { <<: *mounts, image: x }\n" +
+		"secrets:\n  pw: { file: \"${STOWAGE_SECRET_FILE_TOP_PW}\" }\n  other: { environment: OTHER_PW }\n  unused: { file: \"${STOWAGE_SECRET_FILE_UNUSED_PW}\" }\n" +
+		"configs:\n  conf: { content: \"token=${CONF_TOKEN}\" }\n")
+	for _, c := range []struct {
+		svc, key string
+		want     bool
+	}{{"db", "DB_PW", true}, {"base", "DB_PW", true}, {"list", "TOKEN", true}, {"list", "TOKEN2", false}, {"list", "DB_PW", false}, {"none", "DB_PW", false},
+		{"filed", "PG_PW", true}, {"child", "PG_PW", true}, {"cmd", "CMD_TOKEN", true}, {"cmd", "TOKEN", false},
+		{"secreted", "TOP_PW", true}, {"secreted", "UNUSED_PW", false}, {"secreted", "OTHER_PW", true}, {"configured", "CONF_TOKEN", true}, {"aliased", "ALIAS_PW", true}, {"cmd", "ALIAS_PW", false},
+		{"envfiled", "ANY_KEY", true}, {"labelled", "LABEL_PW", true}} {
+		if got, err := ServiceReads(raw, c.svc, c.key); err != nil || got != c.want {
+			t.Errorf("%s %s: %v %v", c.svc, c.key, got, err)
+		}
 	}
 }
 

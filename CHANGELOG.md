@@ -3,6 +3,30 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.45.0]
+
+### Added
+
+- `replace: true` on a secret (a session signing key, an internal client secret, one delivered as
+  a file): `secrets rotate KEY` replaces it in one pass on Docker and the VM — a new value, the
+  services reading it recreated. It asks first, as nothing of the old value is kept (`--yes`
+  confirms without asking). Lint refuses `replace` on a secret the database's service reads, and
+  beside `rotation` or `settable`. `secrets --help` names only the verbs the release has.
+- On the VM, `reset-db --new-baseline` takes `--set`, `--set-file` and `--answers`, as `upgrade`
+  does: the inputs the release it crosses to adds, judged before its OS is written and given to
+  the boot that crosses. A release adding a required input with no default can now be crossed
+  to. Its refusals name the `reset-db` that gives them, or say why none can (a release, or the
+  OS the VM goes back to, built before this version).
+- `lint.accept`: a file of the project accepting lint warnings it weighed, each with its reason
+  and its last day. `lint` lists them as accepted rather than warned, warns again of one expired,
+  and says to remove an entry that matches no warning.
+
+### Fixed
+
+- Lint refuses `settable` (and now `rotation`) on a secret the database's service reads however
+  the service reads it: through its `extends` base, its command, a file secret's mount, a
+  top-level compose secret or config, an alias or merge key, or an `env_file`.
+
 ## [0.44.0] - 2026-11-24
 
 ### Added

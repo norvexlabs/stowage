@@ -423,10 +423,21 @@ func newCommandOn(platform string, r *Release, self string, stdout, stderr io.Wr
 	rsf.BoolVar(&o.NewBaseline, "new-baseline", false, "the install runs another schema baseline: wipe it and install this installer's release instead")
 	dirFlag(reset)
 	root.AddCommand(reset)
-	var rotate func(cmd *cobra.Command, key, pass string) error
-	if slices.ContainsFunc(r.Spec.Secrets, func(s spec.Secret) bool { return s.Rotation }) {
-		rotate = func(cmd *cobra.Command, key, pass string) error {
+	var rotate func(cmd *cobra.Command, key, pass string, confirm func() error) error
+	passes, replaces := rotations(r.Spec)
+	if passes || replaces != nil {
+		rotate = func(cmd *cobra.Command, key, pass string, confirm func() error) error {
 			if err := prepare(); err != nil {
+				return err
+			}
+			// What the install's absence refuses comes before the question.
+			if _, err := os.Stat(in.path(envName)); errors.Is(err, os.ErrNotExist) {
+				return in.noInstall(in.O.Dir)
+			}
+			if _, err := in.rotation(key, pass); err != nil {
+				return err
+			}
+			if err := confirm(); err != nil {
 				return err
 			}
 			return in.RotateSecret(cmd.Context(), key, pass)
@@ -441,7 +452,7 @@ func newCommandOn(platform string, r *Release, self string, stdout, stderr io.Wr
 			return in.SetSecret(cmd.Context(), key, value)
 		}
 	}
-	root.AddCommand(secretsCommand(name, stdout, func(c *cobra.Command) { dirFlag(c) }, rotate, set, in.checkSetValue, terminal, func(_ *cobra.Command, recipients []string) ([]byte, error) {
+	root.AddCommand(secretsCommand(name, stdout, func(c *cobra.Command) { dirFlag(c) }, rotate, passes, replaces, set, in.checkSetValue, terminal, func(_ *cobra.Command, recipients []string) ([]byte, error) {
 		if err := prepare(); err != nil {
 			return nil, err
 		}
@@ -758,6 +769,10 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 			return run(cmd, rotateTimeout, false, func(ctx context.Context) error { return in.K8sRotateSecret(ctx, key, pass) })
 		}
 	}
+	var threePasses func(cmd *cobra.Command, key, pass string, confirm func() error) error // the three passes alone: nothing to confirm
+	if rotate != nil {
+		threePasses = func(cmd *cobra.Command, key, pass string, _ func() error) error { return rotate(cmd, key, pass) }
+	}
 	show := settableShow(in.R.Spec, func(cmd *cobra.Command, key string) (v string, err error) {
 		err = run(cmd, 0, false, func(ctx context.Context) error { v, err = in.K8sShowSecret(ctx, key); return err })
 		return v, err
@@ -770,7 +785,7 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		if c.Name() == "rotate" {
 			c.Flags().DurationVar(&rotateTimeout, "timeout", 6*time.Minute, "how long kubectl waits for each restarted workload to be ready")
 		}
-	}, rotate, nil, nil, nil, export, show))
+	}, threePasses, true, nil, nil, nil, nil, export, show))
 	return k
 }
 
@@ -907,13 +922,32 @@ func pipedInput(f *os.File) bool {
 }
 
 // secretsCommand is `secrets`: `rotate KEY [--stage | --finish]`, one pass of a rotated secret's
-// rotation run by rotate (none without it), `set KEY`, the value read from standard input (asked
-// on terminal when it is one) recorded by set (none without it), and `export`, the secrets export
+// rotation run by rotate (none without it) — or, for a key replaces names (nil: none), its one
+// pass, RotateReplace, which rotate confirms (confirm) once its own checks passed; passes says a
+// secret has rotation: true, whose three passes the help and the flags offer —, `set KEY`, the value read from standard input (asked on
+// terminal when it is one) recorded by set (none without it), and `export`, the secrets export
 // returns written where --output says (none without it); flags adds the shape's own flags to each.
-func secretsCommand(name string, stdout io.Writer, flags func(*cobra.Command), rotate func(cmd *cobra.Command, key, pass string) error,
+// Its help names the verbs it has alone.
+func secretsCommand(name string, stdout io.Writer, flags func(*cobra.Command), rotate func(cmd *cobra.Command, key, pass string, confirm func() error) error, passes bool, replaces func(key string) bool,
 	set func(cmd *cobra.Command, key, value string) error, check func(key, value string) error, terminal func(accessible bool) Prompter,
 	export func(cmd *cobra.Command, recipients []string) ([]byte, error), show func(cmd *cobra.Command, key string) (string, error)) *cobra.Command {
-	s := &cobra.Command{Use: "secrets", Short: "The install's secrets: rotate one, set one, show a settable one, or export them all for a disaster recovery", Args: cobra.NoArgs}
+	var verbs []string
+	for _, v := range []struct {
+		on   bool
+		what string
+	}{{rotate != nil, "rotate one"}, {set != nil, "set one"}, {show != nil, "show a settable one"}, {export != nil, "export them all for a disaster recovery"}} {
+		if v.on {
+			verbs = append(verbs, v.what)
+		}
+	}
+	short := "The install's secrets"
+	switch n := len(verbs); {
+	case n == 1:
+		short += ": " + verbs[0]
+	case n > 1:
+		short += ": " + strings.Join(verbs[:n-1], ", ") + " or " + verbs[n-1]
+	}
+	s := &cobra.Command{Use: "secrets", Short: short, Args: cobra.NoArgs}
 	if show != nil {
 		c := &cobra.Command{
 			Use:   "show KEY",
@@ -953,13 +987,26 @@ func secretsCommand(name string, stdout io.Writer, flags func(*cobra.Command), r
 		s.AddCommand(c)
 	}
 	if rotate != nil {
-		var stage, finish bool
+		var stage, finish, yes, noInput, accessible bool
+		const three = "--stage records a new value as KEY_NEXT, then a run without a flag makes it KEY and keeps the old one as KEY_PREVIOUS, then --finish drops KEY_PREVIOUS; the stack restarts at each pass"
+		const one = "confirmed first (the services reading it are recreated, the old value is not kept)"
+		var short string
+		switch {
+		case passes && replaces != nil:
+			short = "Replace a generated secret: one with rotation: true in three passes (" + three + "), one with replace: true in one, " + one
+		case passes:
+			short = "Replace a generated secret with rotation: true in three passes: " + three
+		default:
+			short = "Replace a generated secret with replace: true in one pass, " + one
+		}
 		r := &cobra.Command{
 			Use:   "rotate KEY",
-			Short: "Replace a generated secret in three passes: --stage records a new value as KEY_NEXT, then a run without a flag makes it KEY and keeps the old one as KEY_PREVIOUS, then --finish drops KEY_PREVIOUS; the stack restarts at each pass",
+			Short: short,
 			Args:  cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				pass := RotateSwap
+				key, pass := args[0], RotateSwap
+				one := replaces != nil && replaces(key)
+				confirming := cmd.Flags().Changed("yes") || cmd.Flags().Changed("no-input") || cmd.Flags().Changed("accessible")
 				switch {
 				case stage && finish:
 					return errors.New("--stage and --finish are two passes: give one")
@@ -967,12 +1014,34 @@ func secretsCommand(name string, stdout io.Writer, flags func(*cobra.Command), r
 					pass = RotateStage
 				case finish:
 					pass = RotateFinish
+				case one:
+					pass = RotateReplace
 				}
-				return rotate(cmd, args[0], pass)
+				// Called by rotate once its own checks passed (the key among them): a flag that
+				// confirms nothing is refused only then, its fix holding.
+				return rotate(cmd, key, pass, func() error {
+					if pass != RotateReplace {
+						if confirming {
+							return fmt.Errorf("--yes, --no-input and --accessible confirm the one pass of a secret with replace: true, which %s is not: leave them out", key)
+						}
+						return nil
+					}
+					if noInput && !yes {
+						return fmt.Errorf("secrets rotate %s replaces it at once, and --no-input asks nothing: give --yes", key)
+					}
+					return confirmReplace(cmd.Context(), terminal, yes, accessible, key)
+				})
 			},
 		}
-		r.Flags().BoolVar(&stage, "stage", false, "the first pass: record a new value as KEY_NEXT, accepted but not used")
-		r.Flags().BoolVar(&finish, "finish", false, "the last pass: drop KEY_PREVIOUS")
+		if passes {
+			r.Flags().BoolVar(&stage, "stage", false, "the first pass of a secret with rotation: true: record a new value as KEY_NEXT, accepted but not used")
+			r.Flags().BoolVar(&finish, "finish", false, "the last pass of a secret with rotation: true: drop KEY_PREVIOUS")
+		}
+		if replaces != nil {
+			r.Flags().BoolVarP(&yes, "yes", "y", false, "replace a secret with replace: true without asking")
+			r.Flags().BoolVar(&noInput, "no-input", false, "never ask: without --yes, refuse")
+			r.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
+		}
 		flags(r)
 		s.AddCommand(r)
 	}
@@ -1016,6 +1085,40 @@ func secretsCommand(name string, stdout io.Writer, flags func(*cobra.Command), r
 		s.AddCommand(e)
 	}
 	return s
+}
+
+// rotations says which ways of `secrets rotate` the spec's secrets take: passes, a secret with
+// rotation: true; replaces, one that replaces (its one pass) refuses nothing.
+func rotations(sp *spec.Spec) (passes bool, replaces func(key string) bool) {
+	passes = slices.ContainsFunc(sp.Secrets, func(s spec.Secret) bool { return s.Rotation })
+	if slices.ContainsFunc(sp.Secrets, func(s spec.Secret) bool { return s.Replace }) {
+		replaces = sp.Replaces
+	}
+	return passes, replaces
+}
+
+// confirmReplace asks before `secrets rotate` replaces key in one pass, unless yes; without a
+// terminal it refuses, naming --yes.
+func confirmReplace(ctx context.Context, terminal func(accessible bool) Prompter, yes, accessible bool, key string) error {
+	if yes {
+		return nil
+	}
+	p := terminal(accessible)
+	if p == nil {
+		return fmt.Errorf("secrets rotate %s replaces it at once and asks first, and there is no terminal to answer: give --yes", key)
+	}
+	a, err := p.Ask(ctx, Form{
+		Questions: []Question{{Title: fmt.Sprintf("Replace %s now? Its services are recreated with a new value, and what was made with the old one (data it encrypted, a password another service keeps) no longer matches it; `secrets export` first keeps the old value", key),
+			Key: "confirm", Choices: []Choice{{"no", "No, keep it"}, {"yes", "Yes, replace it"}}}},
+		Defaults: func(map[string]string) map[string]string { return map[string]string{"confirm": "no"} },
+	})
+	if err != nil {
+		return err
+	}
+	if a["confirm"] != "yes" {
+		return ErrAborted
+	}
+	return nil
 }
 
 // mirrorCommand is `mirror`: a release carried, as one file, to a registry without internet.

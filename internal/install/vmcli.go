@@ -675,23 +675,21 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 				return errors.New("--no-provision is not given to the boot that crosses the baseline: `provision` runs the hook afterwards")
 			case resetUnordered && resetVersion == "":
 				return unorderedAlone(verbNewBaseline)
+			case !newBaseline && (len(sets) > 0 || len(setFiles) > 0 || answers != ""):
+				return refuse("leave out --set, --set-file and --answers, or give --new-baseline", "--set, --set-file and --answers give the inputs the release --new-baseline installs adds: reset-db resets this release with the values the install records")
 			}
-			path := "/v1/reset-db"
-			if newBaseline {
-				q := url.Values{"new_baseline": {"true"}}
-				if resetChannel != "" {
-					q.Set("channel", resetChannel)
-				}
-				if resetVersion != "" {
-					q.Set("version", resetVersion)
-				}
-				if resetUnordered {
-					q.Set("unordered", "true")
-				}
-				path += "?" + q.Encode()
+			inputs, err := upgradeInputs(sets, setFiles, answers)
+			if err != nil {
+				return err
 			}
+			// A crossing's plan is asked with the inputs it gives, which no URL carries.
 			var p ResetPlan
-			if err := c.do(ctx, http.MethodGet, path, nil, &p); err != nil {
+			if newBaseline {
+				err = c.do(ctx, http.MethodPost, "/v1/reset-db/plan", ResetPlanRequest{NewBaseline: true, Channel: resetChannel, Version: resetVersion, Unordered: resetUnordered, Inputs: inputs}, &p)
+			} else {
+				err = c.do(ctx, http.MethodGet, "/v1/reset-db", nil, &p)
+			}
+			if err != nil {
 				return err
 			}
 			var t Prompter
@@ -703,7 +701,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			}
 			var started JobStarted
 			if err := c.do(ctx, http.MethodPost, "/v1/reset-db", ResetRequest{Confirm: &p.Target, Token: p.Token, NoProvision: noProvision,
-				NewBaseline: newBaseline, Channel: resetChannel, Version: resetVersion, Unordered: resetUnordered}, &started); err != nil {
+				NewBaseline: newBaseline, Channel: resetChannel, Version: resetVersion, Unordered: resetUnordered, Inputs: inputs}, &started); err != nil {
 				return err
 			}
 			return c.follow(ctx, stderr, started)
@@ -716,9 +714,20 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	reset.Flags().StringVar(&resetChannel, "channel", "", "with --new-baseline: the channel to find the release on (default: the install's)")
 	reset.Flags().StringVar(&resetVersion, "version", "", "with --new-baseline: this version's latest revision, not the channel's latest release")
 	reset.Flags().BoolVar(&resetUnordered, "unordered", false, "with --version under a `command` version scheme, which the daemon cannot run: cross to that version, its order checked by you")
-	var rotate func(cmd *cobra.Command, key, pass string) error
-	if slices.ContainsFunc(r.Spec.Secrets, func(s spec.Secret) bool { return s.Rotation }) {
-		rotate = func(cmd *cobra.Command, key, pass string) error {
+	reset.Flags().StringArrayVar(&sets, "set", nil, "with --new-baseline, an input the release adds, KEY=VALUE (repeatable): given to the boot that crosses")
+	reset.Flags().StringArrayVar(&setFiles, "set-file", nil, "with --new-baseline, a file input the release adds, KEY=PATH (repeatable): given to the boot that crosses")
+	reset.Flags().StringVar(&answers, "answers", "", "with --new-baseline, a YAML file of the inputs the release adds, KEY: value: given to the boot that crosses")
+	var rotate func(cmd *cobra.Command, key, pass string, confirm func() error) error
+	passes, replaces := rotations(r.Spec)
+	if passes || replaces != nil {
+		rotate = func(cmd *cobra.Command, key, pass string, confirm func() error) error {
+			// What the spec refuses comes before the question; the daemon's, after.
+			if _, err := (&Installer{R: r, O: o}).rotation(key, pass); err != nil {
+				return err
+			}
+			if err := confirm(); err != nil {
+				return err
+			}
 			var started JobStarted
 			if err := c.do(cmd.Context(), http.MethodPost, "/v1/secrets/rotate", SecretRotateRequest{Key: key, Pass: pass}, &started); err != nil {
 				return err
@@ -736,7 +745,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			return c.follow(cmd.Context(), stderr, started)
 		}
 	}
-	secrets := secretsCommand(name, stdout, func(*cobra.Command) {}, rotate, set, in.checkSetValue, terminal, func(cmd *cobra.Command, recipients []string) ([]byte, error) {
+	secrets := secretsCommand(name, stdout, func(*cobra.Command) {}, rotate, passes, replaces, set, in.checkSetValue, terminal, func(cmd *cobra.Command, recipients []string) ([]byte, error) {
 		var out SecretsExport
 		err := c.do(cmd.Context(), http.MethodPost, "/v1/secrets/export", SecretsExportRequest{Recipients: recipients}, &out)
 		_, _ = io.WriteString(stderr, out.Log)

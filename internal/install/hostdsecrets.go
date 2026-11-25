@@ -28,8 +28,8 @@ import (
 //	POST /v1/secrets/export  {recipients}: {file}, the install's SecretsFile encrypted to those age
 //	                         public keys, ASCII-armored
 //	POST /v1/secrets/rotate  {key, pass}: one pass (stage, swap, finish) of a rotated secret's
-//	                         rotation, as a job (202, {job, target}): the install's .env changes,
-//	                         then the stack comes up again with it
+//	                         rotation, or another secret's replace, as a job (202, {job, target}):
+//	                         the install's .env changes, then the stack comes up again with it
 //	POST /v1/secrets/set     {key, value}: a settable secret's value recorded, as a job (202, {job,
 //	                         target}): the install's .env changes, then the stack comes up again
 //	                         with it
@@ -97,7 +97,7 @@ func (h *Hostd) osRelease(env *EnvFile, verb string) error {
 // SecretRotateRequest is POST /v1/secrets/rotate's body.
 type SecretRotateRequest struct {
 	Key  string `json:"key"`
-	Pass string `json:"pass"` // RotateStage, RotateSwap or RotateFinish
+	Pass string `json:"pass"` // RotateStage, RotateSwap or RotateFinish; RotateReplace without rotation: true
 }
 
 func (h *Hostd) rotateSecret(w http.ResponseWriter, r *http.Request) {
@@ -106,16 +106,23 @@ func (h *Hostd) rotateSecret(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	if !slices.Contains([]string{RotateStage, RotateSwap, RotateFinish}, req.Pass) {
-		replyErr(w, fail(http.StatusBadRequest, "pass %q: %s, %s or %s", req.Pass, RotateStage, RotateSwap, RotateFinish))
+	if !slices.Contains([]string{RotateStage, RotateSwap, RotateFinish, RotateReplace}, req.Pass) {
+		replyErr(w, fail(http.StatusBadRequest, "pass %q: %s, %s, %s or %s", req.Pass, RotateStage, RotateSwap, RotateFinish, RotateReplace))
 		return
 	}
 	in, _ := h.run()
-	if _, err := h.installed(in); err != nil {
+	env, err := h.installed(in)
+	if err != nil {
 		replyErr(w, err)
 		return
 	}
-	if _, err := in.rotated(req.Key); err != nil {
+	// The secrets and how each rotates are the ones the install's release names, the OS's spec the
+	// daemon reads.
+	if err := h.osRelease(env, "secrets rotate"); err != nil {
+		replyErr(w, err)
+		return
+	}
+	if _, err := in.rotation(req.Key, req.Pass); err != nil {
 		replyErr(w, fail(http.StatusBadRequest, "%v", err))
 		return
 	}

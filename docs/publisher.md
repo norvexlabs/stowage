@@ -18,6 +18,32 @@ e2e-k8s`, `make e2e-full-k8s`) and a Kairos VM on TrueNAS (`make e2e-vm`, `make 
 `stowage plan` to see what a ship would build. Lint errors block `ship` and `promote`; warnings
 do not.
 
+**Accepted warnings** (`lint.accept`): a warning a project weighed and cannot avoid (a VPN's
+`cap_add: [NET_ADMIN]`, a host sysctl meant for the host's namespace alone) is accepted for a
+while, with its reason, so a new warning is not lost among the old. `lint.accept` names a file
+of the project, a YAML list of entries:
+
+```yaml
+- where: "deploy/compose.yaml: services.vpn.cap_add"   # the warning's where, as lint prints it before its message (quoted: it holds ": ")
+  text: NET_ADMIN              # a part of its message, matched as it is (case and all)
+  reason: the tunnel's own routes; it runs on its own network alone
+  expires: 2027-03-31          # its last day (UTC), at most a year ahead
+```
+
+An entry in force accepts each warning at its `where` whose message holds its `text`: lint lists
+it after the findings (`accepted: <where>: <message> (<reason>; until <date>)`, and in `--json`
+under `accepted`, each a finding with its `reason` and `expires`), counts it apart (`N error(s),
+M warning(s), K accepted`), and neither as a warning nor as an error; an error is never accepted.
+Lint warns of an entry expired (`lint.accept: <file>: acceptance of <where> ("<text>") expired on
+<date>: the warning counts again; renew it, fix the warning, or remove it` — the warning shown
+again beside it), of one expiring within 30 days (`… expires on <date>, within 30 days: renew it
+or fix the warning before then`) and of one matching no warning (`… matches no warning: correct
+its where or text (lint prints each warning's where before its message), or remove it`), and
+refuses the file (`lint.accept: <file>: …`) when it cannot be read, holds an unknown field, an
+entry without its `where`, `text` or `reason`, a date that is not `YYYY-MM-DD` or is more than a
+year ahead, or the same `where` and `text` twice. Its own warnings are never accepted. The
+file is the publisher's alone: it enters no release.
+
 ```bash
 stowage -C <project> lint [--json]                     # exit 1 on any error finding
 stowage -C <project> project-version [--channel C] [--revision N] [--json]
@@ -333,7 +359,7 @@ release for a test run, never the project's, without editing the spec:
 
 | Command | Output |
 |---|---|
-| `lint` | `{"findings": [{"severity", "where", "message"}], "version"}`, errors first |
+| `lint` | `{"findings": [{"severity", "where", "message"}], "accepted": [{"severity", "where", "message", "reason", "expires"}], "version"}`, errors first; `accepted` only when an acceptance in force took a warning |
 | `plan` | `{"project_version", "revision", "channel", "nodes": [{"id", "kind", "deps", "inputs", "pinned", "converts", "reads_version"}]}` |
 | `project-version` | `{"name", "project_version", "revision"}`, plus `"channel"` and `"tag"` with `--channel` |
 | `changelog` | `[{"version", "text"}]` |

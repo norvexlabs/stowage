@@ -32,10 +32,11 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
 <short>-stow upgrade [--channel C] [--version V] [--set KEY=VALUE] [--set-file KEY=PATH] [--answers FILE] [--yes] [--no-reboot] [--skip-backup] [--dry-run] [--unordered] [--accessible] [--json]   # ends at the reboot it schedules: status and events after it tell how it went
 <short>-stow rollback [--yes] [--dry-run] [--accessible] [--json]   # reboot into the passive system: back to the release the last upgrade replaced; ends at that reboot
 <short>-stow reset-db [--yes] [--no-provision] [--accessible]   # wipe the data, start again as first installed
-          [--new-baseline [--channel C] [--version V [--unordered]]]   # instead: a later release at another schema baseline, its OS written and booted, that boot wiping the data
+          [--new-baseline [--channel C] [--version V [--unordered]] [--set KEY=VALUE] [--set-file KEY=PATH] [--answers FILE]]   # instead: a later release at another schema baseline, its OS written and booted, that boot wiping the data and given the inputs that release adds
 <short>-stow restore OBJECT [--identity FILE|-] [--yes] [--accessible] [--unrecorded]   # load a backup into the database and its volumes (the volumes alone without one)
 <short>-stow secrets export --recipient age1…… [-o FILE|-]   # the install's secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish]   # a secret with rotation: true
+<short>-stow secrets rotate KEY [--yes] [--no-input] [--accessible]   # a secret with replace: true, in one pass, confirmed first
 <short>-stow secrets set KEY [--accessible] < value   # a secret with settable: true
 <short>-stow secrets show KEY   # a settable secret's value, on a terminal only (the operator's socket)
 <short>-stow host-key [--json]   # as root: this VM's own SSH host key, the seed's one-time key retired
@@ -431,8 +432,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   release (logged `… holds what an upgrade gave release <v> <r>, not this OS's <v'> <r'>: left
   out` when that boot would upgrade), as does the installer of the release the install runs,
   which the boot runs first; so does a boot that cannot read it, refusing with the file's error;
-  the next upgrade replaces or removes it. A `reset-db --new-baseline` job removes it too, as the
-  OS it writes replaces the one the inputs were for; a job whose OS write fails keeps it, as
+  the next upgrade replaces or removes it. A `reset-db --new-baseline` job replaces it too, as the
+  OS it writes replaces the one the inputs were for, with the inputs it gives the boot that
+  crosses and its `--channel`, or removes it when it gives neither; a job whose OS write fails keeps it, as
   `kairos-agent` may have moved that OS to the passive slot already. A boot whose upgrade misses a
   required input the release adds refuses (``missing required input(s) the release adds, which
   the upgrade did not give: KEY (Prompt): `sudo <short>-stow upgrade [--channel C] --version <v>
@@ -448,10 +450,19 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   requires none`), and the boot on a VM whose OS, the one it goes back to, an earlier Stowage
   built (`the OS the VM goes back to was built with Stowage <s>, whose upgrade gives no input:
   upgrade it first to a release built with Stowage 0.43.0 or later that requires none`).
-  The health gate's verdict carries the boot's refusal. A `reset-db --new-baseline`, which takes
-  no input, refuses a required one the release adds without a fix (`missing required input(s)
-  the release adds, which reset-db --new-baseline cannot give on the VM: KEY (Prompt)`), and a
-  value an input's check refuses so (`KEY: …: reset-db --new-baseline cannot give one on the VM`). Inputs
+  The health gate's verdict carries the boot's refusal. A `reset-db --new-baseline` gives the
+  release it installs the inputs it adds the same way (below): its plan and the boot that crosses
+  refuse a missing one naming that command (``missing required input(s) the release adds, which
+  reset-db --new-baseline did not give: KEY (Prompt): `sudo <short>-stow reset-db --new-baseline
+  [--channel C] --version V [--unordered] --set KEY=VALUE` (or --set-file KEY=PATH, --answers
+  FILE) gives each to the boot into the release``), and a value an input's check refuses so; or
+  say why it gives none, with no fix: the daemon's check of a release another Stowage before
+  0.45.0 published (`<tag> was published by Stowage <s>, whose boot takes no input
+  reset-db --new-baseline gives: it is reached only by a release that requires none`), and the
+  boot that crosses on a VM whose OS, the one it goes back to, an earlier Stowage built (`the OS
+  the VM goes back to was built with Stowage <s>, whose reset-db --new-baseline gives no input:
+  upgrade it first to a release of its own schema baseline built with Stowage 0.45.0 or later,
+  then cross from there`). Inputs
   for a release published by a Stowage before 0.43.0, other than the one the host daemon was
   built with, are refused (409, `<tag> was published by Stowage <s>, whose boot takes no input an
   upgrade gives: nothing is staged`, fix: upgrade without them, then give them by a re-run of
@@ -590,9 +601,14 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   address — IPv4, else IPv6 (a network without IPv4) — on the first network by name that gives
   it one and is not `internal: true` (the host
   has no route into an internal network); a service on internal networks alone is not ready.
-- `secrets rotate` is the Docker shape's three passes, run by the daemon as a job (`rotate`)
-  once the health gate judged the boot (its restarts could fail the gate's deadline); `<short>-stow`
-  follows it. `secrets set` is the Docker shape's too: `<short>-stow` reads the value as Docker's
+- `secrets rotate` is the Docker shape's, its three passes and its one pass alike, run by the
+  daemon as a job (`rotate`) once the health gate judged the boot (its restarts could fail the
+  gate's deadline), on the operator's socket alone; `<short>-stow` refuses a pass the secret does
+  not take and asks the one pass's confirmation (or takes `--yes`) before it asks the daemon,
+  which refuses (400) a key that is no secret of the release and a pass the secret does not take,
+  and (409) an install not made yet, one running another release than the OS's, a boot the health
+  gate has not judged and a running job — those after the confirmation; each
+  refusal names `sudo <short>-stow`; `<short>-stow` follows it. `secrets set` is the Docker shape's too: `<short>-stow` reads the value as Docker's
   does and sends it to the daemon (`POST /v1/secrets/set`, the operator's socket alone), which
   refuses (400) a key that is not settable and a value Docker's refuses, then records it in a job
   (`secret`) once the health gate judged the boot, followed the same way. `secrets export` is
@@ -745,12 +761,24 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   not be yanked, start another baseline than the install's — both told, read from the two
   installers (`… cannot be told (the daemon's log says why): --new-baseline never wipes on a
   guess`; the same baseline: `… --new-baseline only crosses a baseline; `sudo <short>-stow upgrade`
-  moves it`) — and pass `upgrade`'s checks given no input (as `upgrade`, only for a release the
-  host daemon's Stowage published; another's are its boot's). The question names that release and
+  moves it`) — and pass `upgrade`'s checks (as `upgrade`, only for a release the
+  host daemon's Stowage published; another's are its boot's), given the inputs it gives (below). The question names that release and
   the plan (`write <tag>'s OS and reboot into it; that boot stops <name>, deletes the volumes
   data.reset names, forgets what its provision hook returned, then installs <v>, at schema
   baseline <n> (from <m>), with the same values`, naming the volumes of both releases it deletes
-  and those it keeps, and ending with why in parentheses when the values are left to the boot). A release the install went back from is refused (`remove
+  and those it keeps, and ending with why in parentheses when the values are left to the boot). `--set`, `--set-file` and
+  `--answers` give the inputs the release adds, as `upgrade`'s (refused without `--new-baseline`:
+  a reset-db resets the release with the values the install records): `<short>-stow` asks the
+  plan with them (`POST /v1/reset-db/plan`, the operator's socket alone, as no URL carries an
+  input; `GET /v1/reset-db` asks one without — the app's plan carries no token, as only the
+  operator confirms, and leaves the operator's plan as it was), which judges them as the boot that crosses takes
+  them, and sends them again with the confirmation — another set, or none, is another plan
+  (`… showed another plan: look again`) — and the job stages them for that boot as `upgrade`
+  stages its own (root-only beside the install, never logged), which takes them and removes the
+  file. Inputs without `new_baseline` are refused (400), and inputs for a release published by a
+  Stowage before 0.45.0, other than the one the host daemon was built with, are refused (409,
+  `<tag> was published by Stowage <s>, whose crossing's boot takes no input a reset-db gives:
+  nothing is staged`, fix: cross without the inputs, with a release that requires none it adds). A release the install went back from is refused (`remove
   <dir>/.stowage-failed to cross to it again`). The POST takes the check of the GET that showed the plan when the
   target's installer and the install's `.env` are unchanged, rather than fetching the installer
   again (the check of that GET alone: its token). The job, as `upgrade`'s, records the release

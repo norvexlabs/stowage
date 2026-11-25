@@ -300,15 +300,11 @@ type Installer struct {
 	crossing *crossing
 	// givenNothing: the run takes no flag, input or answer of its own — the VM's upgrade, which its
 	// daemon checks (upgradeCheck) and its boot runs (Upgrade), and the VM's crossing (reset-db
-	// --new-baseline) — so a refusal's fix names none (flagFix), but an input's on vmUpgrade.
+	// --new-baseline) — so a refusal's fix names none (flagFix), but an input's on vmGives.
 	givenNothing bool
-	// vmUpgrade: the run is the VM's upgrade, whose `upgrade` gives the inputs the release adds to
-	// the boot into it (--set, --set-file, --answers): a refusal of one names that command, with
-	// vmUpgradeArgs (upgradeArgs: the release it reaches); unless vmNoInputs says why that upgrade
-	// can give none (the release's boot, or the OS the VM goes back to, built before
-	// stagedInputsSince), which the refusal says instead.
-	vmUpgrade                 bool
-	vmUpgradeArgs, vmNoInputs string
+	// vmGives, on the VM's upgrade and crossing, is the command that gives the inputs the release
+	// adds to the boot into it (--set, --set-file, --answers), which a refusal of one names.
+	vmGives *vmGiving
 	// seeding: the run is vm seed's, whose refusal of a secret input on its command line says a
 	// seed carries none (seedRefusal), where vm create's names its own way, and whose --tls byo
 	// awaits its certificate over SSH (awaitOverSSH).
@@ -3270,17 +3266,16 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 		}
 	}
 	if len(missing) > 0 {
-		if in.givenNothing {
-			// On the VM the boot takes what the upgrade staged, and nothing else; a crossing takes
-			// nothing.
-			switch up := in.vmUpgradeWith("--set KEY=VALUE"); {
-			case up != "":
+		if g := in.vmGives; in.givenNothing && g != nil {
+			// On the VM the boot takes what the upgrade or the crossing staged, and nothing else.
+			if up := in.vmGivesWith("--set KEY=VALUE"); up != "" {
 				fix := up + " (or --set-file KEY=PATH, --answers FILE) gives each to the boot into the release"
-				return nil, refuse(fix, "missing required input(s) the release adds, which the upgrade did not give: %s: %s", strings.Join(missing, "; "), fix)
-			case in.vmUpgrade:
-				return nil, refuse("", "missing required input(s) the release adds, which the upgrade did not give: %s: %s", strings.Join(missing, "; "), in.vmNoInputs)
+				return nil, refuse(fix, "missing required input(s) the release adds, which %s did not give: %s: %s", g.run, strings.Join(missing, "; "), fix)
 			}
-			return nil, refuse("", "missing required input(s) the release adds, which reset-db --new-baseline cannot give on the VM: %s", strings.Join(missing, "; "))
+			return nil, refuse("", "missing required input(s) the release adds, which %s did not give: %s: %s", g.run, strings.Join(missing, "; "), g.none)
+		}
+		if in.givenNothing {
+			return nil, refuse("", "missing required input(s) the release adds, which this run is given none of: %s", strings.Join(missing, "; "))
 		}
 		return nil, refuse("give each with --set KEY=VALUE, --set-file KEY=PATH or --answers", "missing required input(s), set by --set KEY=VALUE, the environment or --answers: %s", strings.Join(missing, "; "))
 	}

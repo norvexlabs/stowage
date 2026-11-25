@@ -43,7 +43,10 @@ type Spec struct {
 	Signing   *Provider          `yaml:"signing"`
 	// Audit is the gate a signing release passes before a channel points at it: its SBOMs scanned,
 	// a finding the policy refuses stopping the ship. The publisher's alone (RuntimeView drops it).
-	Audit  *Audit           `yaml:"audit"`
+	Audit *Audit `yaml:"audit"`
+	// Lint is what `lint` takes from the project beyond its checks: the warnings it weighed and
+	// accepted. The publisher's alone (RuntimeView drops it).
+	Lint   *Lint            `yaml:"lint"`
 	Images map[string]Image `yaml:"images"`
 	Stack  Stack            `yaml:"stack"`
 	// Services are what the project asks for its compose services beyond their compose file, by
@@ -150,6 +153,12 @@ type Audit struct {
 	FailOn      string `yaml:"fail_on" json:"fail_on"`
 	FixableOnly *bool  `yaml:"fixable_only" json:"fixable_only,omitempty"`
 	Allow       string `yaml:"allow" json:"allow,omitempty"`
+}
+
+// Lint holds Accept, a file of the project's (lint.ParseAcceptances) accepting lint warnings for a
+// while, each with its reason.
+type Lint struct {
+	Accept string `yaml:"accept" json:"accept,omitempty"`
 }
 
 // Fixable reports whether only fixable findings count (the default).
@@ -606,6 +615,9 @@ type Secret struct {
 	// Rotation lets `secrets rotate` replace the value in three passes, through KEY_NEXT and
 	// KEY_PREVIOUS.
 	Rotation bool `yaml:"rotation"`
+	// Replace lets `secrets rotate` replace the value in one pass, nothing of the old one kept: the
+	// publisher's word that nothing the data keeps is made with it (a session key, a token).
+	Replace bool `yaml:"replace"`
 	// Settable lets `secrets set` record a value the operator chooses in place of the generated one.
 	Settable bool `yaml:"settable"`
 	// AsFile delivers the value as a file a service mounts (${STOWAGE_SECRET_FILE_<KEY>}), never
@@ -706,6 +718,12 @@ func (s *Spec) AsFile(key string) bool {
 		return i.Secret && i.AsFile
 	}
 	return slices.ContainsFunc(s.Secrets, func(sec Secret) bool { return sec.Key == key && sec.AsFile })
+}
+
+// Replaces reports whether key is a secret with replace: true, which `secrets rotate` replaces in
+// one pass.
+func (s *Spec) Replaces(key string) bool {
+	return slices.ContainsFunc(s.Secrets, func(sec Secret) bool { return sec.Key == key && sec.Replace })
 }
 
 // AsFileKeys are the keys delivered as files, in the spec's order: its secrets', then its inputs'.
@@ -1444,13 +1462,14 @@ func (s *Spec) Signs() bool { return s.Signing != nil && s.Signing.Name != "none
 
 // RuntimeView is the part of the spec that reaches an install: the spec without the fields only
 // the publisher reads (version and changelog providers, channels, push credentials, the signing
-// key, the audit gate, the delete provider, the kairos shape's disks policy, the kubernetes shape's
+// key, the audit gate, the lint acceptances, the delete provider, the kairos shape's disks policy, the kubernetes shape's
 // answers to lint). Artifacts embed this view, so their inputs digests hash it and nothing else: fixing push
 // credentials or a channel template must not change what a release contains.
 func (s *Spec) RuntimeView() Spec {
 	v := *s
 	v.Version = VersionSpec{}
 	v.Audit = nil
+	v.Lint = nil
 	v.Changelog = Provider{}
 	v.Channels = nil
 	v.Registry.Push = Provider{}

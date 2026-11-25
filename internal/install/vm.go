@@ -624,6 +624,14 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 		o.logf("the install runs %s %s (revision %s); this OS carries %s (revision %d), which reset-db --new-baseline asked: wiping the data and installing it", name, cur, rev, m.ProjectVersion, m.Revision)
 		// What the old release wipes is read under the upgrade's lock (upgradeRefusals).
 		in.crossing = &crossing{version: cur, revision: rev}
+		// What the reset-db gave for this release's boot is given to it, as Docker's crossing takes
+		// --set; a refusal names the reset-db of the OS the VM goes back to that crosses again.
+		var channel string
+		if o.Set, channel, err = in.stagedInputs(); err != nil {
+			return err
+		}
+		in.vmGives = bootGives(kept, verbNewBaseline, verbNewBaseline, crossedInputsSince, upgradeArgs(channel, m.ProjectVersion, needsUnordered(m, cur)),
+			"upgrade it first to a release of its own schema baseline built with Stowage "+crossedInputsSince+" or later, then cross from there")
 		if err := in.Upgrade(ctx); err != nil {
 			return err
 		}
@@ -660,18 +668,26 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 		return err
 	}
 	// A refusal names, in its reason (printed alone here), the upgrade the OS the VM goes back to
-	// runs that reaches this release again, on the channel it was asked on; that OS's `upgrade`
-	// gives no input when an earlier Stowage built it.
-	in.vmUpgrade = true
-	in.vmUpgradeArgs = upgradeArgs(channel, m.ProjectVersion, needsUnordered(m, cur))
+	// runs that reaches this release again, on the channel it was asked on.
+	in.vmGives = bootGives(kept, "the upgrade", "upgrade", stagedInputsSince, upgradeArgs(channel, m.ProjectVersion, needsUnordered(m, cur)),
+		"upgrade it first to a release built with Stowage "+stagedInputsSince+" or later that requires none")
+	return in.Upgrade(ctx)
+}
+
+// bootGives is the command (verb with args, which run names in a reason) of the OS the VM goes
+// back to — kept's, the release the install runs — that gives the boot into this release the
+// inputs it adds: none when Stowage since did not build that OS yet (its verb gives no input),
+// way then saying how to go on.
+func bootGives(kept *keptRelease, run, verb, since, args, way string) *vmGiving {
+	g := &vmGiving{run: run, cmd: verb + args, since: since}
 	built := ""
-	if kept.Manifest != nil {
+	if kept != nil && kept.Manifest != nil {
 		built = kept.Manifest.StowageVersion
 	}
-	if !stagedInputsBy(built, StowageVersion) {
-		in.vmNoInputs = fmt.Sprintf("the OS the VM goes back to was built with Stowage %s, whose upgrade gives no input: upgrade it first to a release built with Stowage %s or later that requires none", cmp.Or(built, "of no recorded version"), stagedInputsSince)
+	if !stagedInputsBy(built, StowageVersion, since) {
+		g.none = fmt.Sprintf("the OS the VM goes back to was built with Stowage %s, whose %s gives no input: %s", cmp.Or(built, "of no recorded version"), verb, way)
 	}
-	return in.Upgrade(ctx)
+	return g
 }
 
 // finishStopped finishes an upgrade or a rollback a reboot stopped, which PrevDir recording the

@@ -17,7 +17,8 @@
 # it → its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned
 # (the spec declares it in hooks.provision.returns) and no other is minted → re-runs turn the api route's forward auth on and off, narrow the ingest route's allowlist,
 # set an advanced input and give it back to its default → `secrets rotate` takes the internal
-# secret through its three passes, each value accepted while it must be → `secrets set` records a
+# secret through its three passes, each value accepted while it must be → `secrets rotate` replaces
+# the session secret (replace: true) in one pass, once --yes confirms it (the database's password refused) → `secrets set` records a
 # chosen login password, its hash made again → ship .2 (a migration) → upgrade --version → the data kept → rollback is allowed (the
 # previous api reads the newer schema, by its label) → ship .3 (a migration that is a rollback
 # barrier) → upgrade → rollback is refused, naming the barrier and the snapshot.
@@ -319,6 +320,23 @@ rotate --finish
 [[ -z $(secret INTERNAL_SERVICE_SECRET_PREVIOUS) ]] || fail "--finish kept the previous value"
 expect_code 401 --max-time 10 -X POST -H "Authorization: Bearer $old" "http://127.0.0.1:$API_PORT/api/v1/events"
 event "http://127.0.0.1:$INGEST_PORT/events"
+atlas_running "$V1" 1
+
+step "secrets rotate SESSION_SECRET (replace: true): one pass, confirmed by --yes; refused without, and for the database's password"
+old=$(secret SESSION_SECRET)
+"${CTL[@]}" secrets rotate SESSION_SECRET --dir "$D" </dev/null >"$WORK/replace.log" 2>&1 && fail "a replace ran unconfirmed"
+grep -q 'there is no terminal to answer: give --yes' "$WORK/replace.log" || { cat "$WORK/replace.log"; fail "the unconfirmed replace does not name --yes"; }
+[[ $(secret SESSION_SECRET) == "$old" ]] || fail "the unconfirmed replace changed the value"
+"${CTL[@]}" secrets rotate POSTGRES_PASSWORD --dir "$D" >"$WORK/replace.log" 2>&1 && fail "the database's password was replaced"
+grep -q "POSTGRES_PASSWORD has neither rotation: true nor replace: true" "$WORK/replace.log" || { cat "$WORK/replace.log"; fail "the refusal does not say why"; }
+"${CTL[@]}" secrets rotate SESSION_SECRET --yes --dir "$D" >"$WORK/replace.log" 2>&1 || { cat "$WORK/replace.log"; fail "secrets rotate SESSION_SECRET --yes"; }
+new=$(secret SESSION_SECRET)
+[[ ${#new} == 64 && $new != "$old" ]] || fail "the replace did not record a new value"
+# The api, which reads it, was recreated with it (compared, never printed).
+api=$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api)
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$api" | grep -qxF "SESSION_SECRET=$new" ||
+	fail "the api does not run with the new SESSION_SECRET"
+! grep -q -- "$new" "$WORK/replace.log" || fail "the replace printed the value"
 atlas_running "$V1" 1
 
 step "secrets set OPS_PASSWORD: a chosen value from standard input, the login's hash made again"

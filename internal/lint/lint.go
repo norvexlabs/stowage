@@ -56,7 +56,10 @@ func (f Finding) String() string { return fmt.Sprintf("%s: %s: %s", f.Severity, 
 // Result is a lint run's findings plus what it resolved on the way.
 type Result struct {
 	Findings []Finding `json:"findings"`
-	Version  string    `json:"version,omitempty"`
+	// Accepted are the warnings the project's acceptances in force accepted (lint.accept): out of
+	// Findings, counted nowhere.
+	Accepted []Accepted `json:"accepted,omitempty"`
+	Version  string     `json:"version,omitempty"`
 }
 
 // Errors counts the error findings.
@@ -76,6 +79,7 @@ type linter struct {
 	s        *spec.Spec
 	now      time.Time
 	findings []Finding
+	accepted []Accepted
 	compose  *Compose
 	scheme   version.Scheme
 	version  string
@@ -142,10 +146,11 @@ func Run(root, specPath string, now time.Time) (*Result, error) {
 	l.shapes()
 	l.hookReturns()
 	l.lockFile(filepath.Join(filepath.Dir(specPath), lock.FileName))
+	l.accept()
 	sort.SliceStable(l.findings, func(i, j int) bool {
 		return l.findings[i].Severity == Error && l.findings[j].Severity != Error
 	})
-	return &Result{Findings: l.findings, Version: l.version}, nil
+	return &Result{Findings: l.findings, Accepted: l.accepted, Version: l.version}, nil
 }
 
 func (l *linter) exists(where, rel string, dir bool) bool {
@@ -1647,12 +1652,22 @@ func (l *linter) secretsAndInputs() {
 			claim(w+".rotation", s.Key+"_PREVIOUS", "a rotated secret's previous value")
 			claim(w+".rotation", s.Key+"_ACCEPTED", "a rotated secret's other accepted value")
 			l.rotated(w, s.Key)
+			l.keptByData(w+".rotation", s.Key, "rotated")
 			if s.Settable {
 				l.errf(w+".settable", "%s rotates: `secrets rotate` changes it, in passes every service follows; keep one of rotation and settable", s.Key)
 			}
+			if s.Replace {
+				l.errf(w+".replace", "%s rotates: `secrets rotate` changes it in three passes; keep one of rotation and replace", s.Key)
+			}
+		}
+		if s.Replace && !s.Rotation { // with rotation, its own refusal says so once
+			l.keptByData(w+".replace", s.Key, "replaced")
+			if s.Settable {
+				l.errf(w+".replace", "%s is settable: its value is the operator's, and a generated one would replace the login they set; keep one of replace and settable", s.Key)
+			}
 		}
 		if s.Settable {
-			l.settable(w, s.Key)
+			l.keptByData(w+".settable", s.Key, "settable")
 		}
 		if s.AsFile && s.Rotation {
 			l.errf(w+".as_file", "%s rotates: its passes give the services %s_NEXT and %s_PREVIOUS to read beside it, as variables; keep one of rotation and as_file", s.Key, s.Key, s.Key)
@@ -1802,15 +1817,25 @@ func (l *linter) rotated(where, key string) {
 	}
 }
 
-// settable refuses a settable secret the database's service reads in its environment: the
+// keptByData refuses a secret whose value `secrets` changes (what: rotated, settable, replaced)
+// when the database's service reads it (ServiceReads: its environment, or
+// interpolated anywhere in its definition, a file secret's path among it, or an env_file): the
 // database keeps the value it was first made with, so a new one in .env breaks its readers.
-func (l *linter) settable(where, key string) {
+func (l *linter) keptByData(where, key, what string) {
 	if l.compose == nil || !l.s.HasDatabase() {
 		return
 	}
 	db := l.s.DB().Service
-	if envReads(l.compose.Services[db].Environment, key) {
-		l.errf(where+".settable", "%s is read by the database's service %s, which keeps the value it was first made with: a secret the data is made with is never settable", key, db)
+	// A compose file ServiceReads cannot read (another check reports why) is judged by the
+	// database's environment alone, so the rule never goes quiet.
+	reads := envReads(l.compose.Services[db].Environment, key)
+	if raw, err := os.ReadFile(spec.Path(l.root, l.s.Stack.Compose)); err == nil {
+		if r, err := ServiceReads(raw, db, key); err == nil {
+			reads = r
+		}
+	}
+	if reads {
+		l.errf(where, "%s is read by the database's service %s, which keeps the value it was first made with: a secret the data is made with is never %s", key, db, what)
 	}
 }
 

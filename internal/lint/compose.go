@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"path"
@@ -80,7 +81,8 @@ type Service struct {
 	MemLimit       any `yaml:"mem_limit"`
 	MemReservation any `yaml:"mem_reservation"`
 	Scale          any `yaml:"scale"`
-	// Environment is the service's own `environment:`, a map or a list of KEY=VALUE.
+	// Environment is the service's `environment:`, a map or a list of KEY=VALUE; after inherit,
+	// its own over its `extends` base's, as compose merges them (mergeEnv: one map).
 	Environment any `yaml:"environment"`
 	Deploy      struct {
 		Replicas any `yaml:"replicas"`
@@ -242,6 +244,7 @@ func (c *Compose) inherit() map[string]error {
 		svc.Links = joinList(svc.Links, b.Links)
 		svc.ExtLinks = joinList(svc.ExtLinks, b.ExtLinks)
 		svc.CapAdd = joinList(svc.CapAdd, b.CapAdd)
+		svc.Environment = mergeEnv(svc.Environment, b.Environment)
 		// The memory a share's maximum is checked against: each setting the service leaves unset.
 		for _, f := range []struct{ own, base *any }{
 			{&svc.MemLimit, &b.MemLimit}, {&svc.MemReservation, &b.MemReservation}, {&svc.Scale, &b.Scale},
@@ -577,6 +580,129 @@ func ServiceDevices(raw []byte) (map[string][]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// ServiceReads reports whether the compose service reads key: in its environment (envReads: by
+// name, or interpolated in a value, its `extends` base's included), or interpolated anywhere else
+// in its definition or its bases' (its command, a volume's source, what an alias or a merge key
+// brings), or in a top-level `secrets:` or `configs:` entry one of them names — ${KEY}, or, for a
+// secret delivered as a file, the variable holding its path, ${STOWAGE_SECRET_FILE_KEY} — and
+// reads every key through an `env_file`, whose content no lint sees.
+func ServiceReads(raw []byte, service, key string) (bool, error) {
+	c, err := parseCompose(raw, "compose.yaml")
+	if err != nil {
+		return false, err
+	}
+	if errs := c.inherit(); len(errs) > 0 {
+		name := sortedKeys(errs)[0]
+		return false, fmt.Errorf("compose.yaml: services.%s.extends: %w", name, errs[name])
+	}
+	svc, ok := c.Services[service]
+	if !ok {
+		return false, nil
+	}
+	if envReads(svc.Environment, key) {
+		return true, nil
+	}
+	// The file as compose reads it, its aliases and merge keys resolved.
+	var doc map[string]any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return false, fmt.Errorf("compose.yaml: %w", err)
+	}
+	names := []string{key, spec.SecretFileVar(key)}
+	var mentions func(v any) bool
+	mentions = func(v any) bool {
+		switch v := v.(type) {
+		case string:
+			refs, _ := Interpolations(v) // parseCompose read every scalar already
+			return slices.ContainsFunc(refs, func(r VarRef) bool { return slices.Contains(names, r.Name) })
+		case map[string]any:
+			for k, x := range v {
+				if mentions(k) || mentions(x) {
+					return true
+				}
+			}
+		case map[any]any: // a mapping whose keys are not all strings
+			for k, x := range v {
+				if mentions(k) || mentions(x) {
+					return true
+				}
+			}
+		case []any:
+			return slices.ContainsFunc(v, mentions)
+		}
+		return false
+	}
+	services, _ := doc["services"].(map[string]any)
+	// The service, then each base it extends (inherit refused a loop and an unknown one), with the
+	// top-level secrets and configs each one names (their `file:` and the rest).
+	for name := service; name != ""; {
+		svc, ok := services[name].(map[string]any)
+		if !ok {
+			break
+		}
+		// An env_file gives the service whatever the file holds: the install's .env, every key.
+		if svc["env_file"] != nil || mentions(svc) {
+			return true, nil
+		}
+		for _, kind := range []string{"secrets", "configs"} {
+			top, _ := doc[kind].(map[string]any)
+			refs, _ := svc[kind].([]any)
+			for _, r := range refs {
+				src, _ := r.(string)
+				if m, ok := r.(map[string]any); ok {
+					src, _ = m["source"].(string)
+				}
+				// `environment: NAME` takes the value of the variable NAME, uninterpolated.
+				entry, _ := top[src].(map[string]any)
+				if from, _ := entry["environment"].(string); mentions(top[src]) || slices.Contains(names, from) {
+					return true, nil
+				}
+			}
+		}
+		switch e := c.Services[name].Extends.(type) {
+		case string:
+			name = e
+		case map[string]any:
+			name, _ = e["service"].(string)
+		default:
+			name = ""
+		}
+	}
+	return false, nil
+}
+
+// mergeEnv is a service's environment over its base's, as compose merges them: one mapping, each
+// variable the service sets its own, the others its base's (a list entry KEY=VALUE as KEY: VALUE,
+// a bare KEY as KEY: null). Either alone is returned as it is.
+func mergeEnv(own, base any) any {
+	if base == nil {
+		return own
+	}
+	if own == nil {
+		return base
+	}
+	out := map[string]any{}
+	for _, e := range []any{base, own} {
+		switch e := e.(type) {
+		case map[string]any:
+			maps.Copy(out, e)
+		case []any:
+			for _, x := range e {
+				entry, isText := x.(string)
+				if !isText {
+					continue // compose refuses a list entry that is no KEY or KEY=VALUE
+				}
+				k, v, ok := strings.Cut(entry, "=")
+				if ok {
+					out[k] = v
+				} else {
+					out[k] = nil
+				}
+			}
+		}
+	}
+	return out
 }
 
 func parseCompose(raw []byte, path string) (*Compose, error) {

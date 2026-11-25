@@ -97,9 +97,10 @@ func (in *Installer) dropStagedInputs() {
 	}
 }
 
-// upgradeInputs are the inputs the VM's `upgrade` gives the boot into the release: --answers's,
-// then --set's and --set-file's over them, as Docker's upgrade orders them; nil when none. An
-// answers file's tls section is refused, as the upgrade keeps what the install records.
+// upgradeInputs are the inputs the VM's `upgrade` (or `reset-db --new-baseline`) gives the boot
+// into the release: --answers's, then --set's and --set-file's over them, as Docker's upgrade
+// orders them; nil when none. An answers file's tls section is refused, as the upgrade keeps what
+// the install records.
 func upgradeInputs(sets, setFiles []string, answers string) (map[string]string, error) {
 	set, err := parseSets(sets)
 	if err != nil {
@@ -126,7 +127,7 @@ func upgradeInputs(sets, setFiles []string, answers string) (map[string]string, 
 		return nil, err
 	}
 	if n := len(raw); n > maxSecretsFile {
-		return nil, refuse("give the upgrade the inputs the release requires, and the rest by a re-run of `install` once it runs", "the inputs given are %d bytes, over the %d an upgrade carries", n, maxSecretsFile)
+		return nil, refuse("give the inputs the release requires, and the rest by a re-run of `install` once it runs", "the inputs given are %d bytes, over the %d an upgrade or a reset-db carries", n, maxSecretsFile)
 	}
 	return out, nil
 }
@@ -141,22 +142,26 @@ func inputsNotTaken(first bool) string {
 	return "the install runs it already, and a re-run of `install` changes a recorded input"
 }
 
-// stagedInputsSince is the first Stowage whose boot takes the inputs an upgrade staged for it.
-const stagedInputsSince = "0.43.0"
+// stagedInputsSince is the first Stowage whose boot takes the inputs an upgrade staged for it, and
+// crossedInputsSince the first whose crossing's boot takes those a reset-db --new-baseline staged.
+const (
+	stagedInputsSince  = "0.43.0"
+	crossedInputsSince = "0.45.0"
+)
 
 // takesStaged reports whether the boot into release m takes the inputs an upgrade stages.
 func (h *Hostd) takesStaged(m *release.Manifest) bool {
-	return stagedInputsBy(m.StowageVersion, h.Stowage)
+	return stagedInputsBy(m.StowageVersion, h.Stowage, stagedInputsSince)
 }
 
-// stagedInputsBy reports whether what Stowage v built — a release's boot, an OS's `upgrade` — takes
-// the inputs an upgrade stages: v is own (the Stowage running this), or stagedInputsSince or a later
-// one.
-func stagedInputsBy(v, own string) bool {
+// stagedInputsBy reports whether what Stowage v built — a release's boot, an OS's `upgrade` or
+// `reset-db` — takes the inputs a command stages, which Stowage since first did: v is own (the
+// Stowage running this), or since or a later one.
+func stagedInputsBy(v, own, since string) bool {
 	if sameStowage(v, own) {
 		return true
 	}
-	c, err := version.SemVer{}.Compare(v, stagedInputsSince)
+	c, err := version.SemVer{}.Compare(v, since)
 	return err == nil && c >= 0
 }
 

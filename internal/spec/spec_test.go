@@ -66,12 +66,13 @@ registry:
   pull: { provider: none }
   push: { provider: token, user: p, token_env: T }
 signing: { provider: cosign-key, key: env://SECRET, public_keys: [a.pub] }
+lint: { accept: lint-accept.yaml }
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
 	v := s.RuntimeView()
-	if !v.Version.Source.IsZero() || !v.Changelog.IsZero() || v.Channels != nil || !v.Registry.Push.IsZero() {
+	if !v.Version.Source.IsZero() || !v.Changelog.IsZero() || v.Channels != nil || !v.Registry.Push.IsZero() || v.Lint != nil {
 		t.Errorf("publisher fields kept: %+v", v)
 	}
 	if v.Registry.Prefix != "r.example/x" || v.Registry.Pull.Name != "none" {
@@ -84,7 +85,7 @@ signing: { provider: cosign-key, key: env://SECRET, public_keys: [a.pub] }
 		t.Errorf("public keys = %v", v.Signing.Config["public_keys"])
 	}
 	// The original is untouched.
-	if s.Signing.Config["key"] != "env://SECRET" || s.Channels == nil {
+	if s.Signing.Config["key"] != "env://SECRET" || s.Channels == nil || s.Lint == nil || s.Lint.Accept != "lint-accept.yaml" {
 		t.Error("RuntimeView mutated the spec")
 	}
 }

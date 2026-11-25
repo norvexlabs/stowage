@@ -436,12 +436,16 @@ func TestResetSendsUnordered(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")
 	var got ResetRequest
+	var planned ResetPlanRequest
 	var unordered, version string
 	asked := 0
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/reset-db", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /v1/reset-db/plan", func(w http.ResponseWriter, r *http.Request) {
 		asked++
-		unordered, version = r.URL.Query().Get("unordered"), r.URL.Query().Get("version")
+		var req ResetPlanRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		planned = req
+		unordered, version = fmt.Sprint(req.Unordered), req.Version
 		reply(w, 200, ResetPlan{Target: Version{"2.0.0", 1}, Plan: "cross", Token: "t"})
 	})
 	mux.HandleFunc("POST /v1/reset-db", func(w http.ResponseWriter, r *http.Request) {
@@ -462,6 +466,17 @@ func TestResetSendsUnordered(t *testing.T) {
 	}
 	if unordered != "true" || version != "2.0.0" || got.Version != "2.0.0" || !got.Unordered || !got.NewBaseline {
 		t.Errorf("asked unordered=%q version=%q, sent %+v", unordered, version, got)
+	}
+	// The inputs a crossing gives are its alone, sent with the plan and the POST alike.
+	asked = 0
+	if out, err := ctl(e, sock, "reset-db", "--yes", "--set", "SMTP_HOST=mail"); err == nil || !strings.Contains(err.Error(), "give the inputs the release --new-baseline installs adds") || asked != 0 {
+		t.Fatalf("inputs without a crossing: %v, asked %d\n%s", err, asked, out)
+	}
+	if out, err := ctl(e, sock, "reset-db", "--yes", "--new-baseline", "--set", "SMTP_HOST=mail"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if want := map[string]string{"SMTP_HOST": "mail"}; !maps.Equal(planned.Inputs, want) || !maps.Equal(got.Inputs, want) {
+		t.Errorf("planned with %v, sent %v", planned.Inputs, got.Inputs)
 	}
 }
 
@@ -1246,7 +1261,7 @@ func TestSecretsRotateOverTheSocket(t *testing.T) {
 	}
 	// Refused before a job: a key without rotation, a pass of none.
 	h := daemon(e, &fakeHost{}).Handler()
-	for _, req := range []SecretRotateRequest{{Key: "POSTGRES_PASSWORD", Pass: RotateStage}, {Key: "SESSION_SECRET", Pass: "twice"}} {
+	for _, req := range []SecretRotateRequest{{Key: "POSTGRES_PASSWORD", Pass: RotateStage}, {Key: "POSTGRES_PASSWORD", Pass: RotateReplace}, {Key: "SESSION_SECRET", Pass: RotateReplace}, {Key: "SESSION_SECRET", Pass: "twice"}} {
 		var e400 errOf
 		if code := call(t, h, "POST", "/v1/secrets/rotate", req, &e400); code != 400 {
 			t.Errorf("%+v: %d %s", req, code, e400.Error)
@@ -1283,13 +1298,85 @@ func TestSecretsRotateOverTheSocket(t *testing.T) {
 		t.Fatalf("finish: %v\n%s", err, out)
 	}
 	for args, want := range map[string]string{
-		"POSTGRES_PASSWORD":                 "POSTGRES_PASSWORD is no secret with rotation: true (rotated: SESSION_SECRET)",
+		"POSTGRES_PASSWORD":                 "POSTGRES_PASSWORD has neither rotation: true nor replace: true",
+		"POSTGRES_PASSWORD --yes":           "unknown flag: --yes", // no secret takes the one pass here
+		"POSTGRES_PASSWORD --stage":         "POSTGRES_PASSWORD has neither rotation: true nor replace: true",
 		"SESSION_SECRET --stage --finish":   "--stage and --finish are two passes",
 		"SESSION_SECRET --finish --stage=x": "invalid argument",
 	} {
 		if out, err := ctl(e, sock, append([]string{"secrets", "rotate"}, strings.Fields(args)...)...); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: %v\n%s", args, err, out)
 		}
+	}
+}
+
+// On the VM a secret with replace: true is replaced through the daemon once --yes confirms it, and
+// `secrets`'s help names the verbs the release has alone.
+func TestSecretReplacedOverTheSocket(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	e.r, e.self = bundledInstaller(t, "1.0.0", 1, replacing)
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	sock := served(t, daemon(e, &fakeHost{}))
+	get := func(k string) string {
+		env, err := ReadEnvFile(filepath.Join(e.dir, ".env"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		v, _ := env.Get(k)
+		return v
+	}
+	old := get("SESSION_SECRET")
+	if out, err := ctl(e, sock, "secrets", "rotate", "SESSION_SECRET"); err == nil || !strings.Contains(err.Error(), "there is no terminal to answer: give --yes") || get("SESSION_SECRET") != old {
+		t.Fatalf("unconfirmed: %v\n%s", err, out)
+	}
+	// No secret has rotation: true: the passes' flag is not offered, and the daemon's refusal of a
+	// pass names the VM's command as its operator types it.
+	if out, err := ctl(e, sock, "secrets", "rotate", "SESSION_SECRET", "--stage"); err == nil || !strings.Contains(err.Error(), "unknown flag: --stage") {
+		t.Errorf("--stage: %v\n%s", err, out)
+	}
+	var e400 errOf
+	if code := call(t, daemon(e, &fakeHost{}).Handler(), "POST", "/v1/secrets/rotate", SecretRotateRequest{Key: "SESSION_SECRET", Pass: RotateStage}, &e400); code != 400 ||
+		!strings.Contains(e400.Error, "SESSION_SECRET has replace: true: `sudo notes-stow secrets rotate SESSION_SECRET` replaces it in one pass") {
+		t.Errorf("a pass over the daemon: %d %s", code, e400.Error)
+	}
+	out, err := ctl(e, sock, "secrets", "rotate", "SESSION_SECRET", "--yes")
+	if err != nil || !strings.Contains(out, "recorded a new SESSION_SECRET") || get("SESSION_SECRET") == old || len(get("SESSION_SECRET")) != 64 {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	out, err = ctl(e, sock, "secrets", "--help")
+	if err != nil || !strings.Contains(out, "The install's secrets: rotate one or export them all for a disaster recovery") {
+		t.Errorf("help: %v\n%s", err, out)
+	}
+	// Nothing to rotate: no secret with rotation: true nor replace: true.
+	e.r, e.self = bundledInstaller(t, "1.0.0", 1, nil)
+	if out, err := ctl(e, sock, "secrets", "--help"); err != nil || strings.Contains(out, "rotate") {
+		t.Errorf("nothing to rotate: %v\n%s", err, out)
+	}
+	// A secret with neither is refused before the question, naming those with one.
+	e.r, e.self = bundledInstaller(t, "1.0.0", 1, func(s *spec.Spec) {
+		s.Secrets = append(s.Secrets, spec.Secret{Key: "OTHER_TOKEN", Gen: "hex32", Replace: true})
+	})
+	if out, err := ctl(e, sock, "secrets", "rotate", "SESSION_SECRET"); err == nil ||
+		err.Error() != "SESSION_SECRET has neither rotation: true nor replace: true: its release lets `secrets rotate` change it in no way (rotated or replaced: OTHER_TOKEN)" {
+		t.Errorf("neither: %v\n%s", err, out)
+	}
+}
+
+// confirmReplace asks once on a terminal: "no" aborts, "yes" goes on; --yes asks nothing.
+func TestConfirmReplaceAsksOnce(t *testing.T) {
+	t.Parallel()
+	for answer, want := range map[string]error{"no": ErrAborted, "yes": nil} {
+		p := &fakePrompter{answers: map[string]string{"confirm": answer}}
+		err := confirmReplace(context.Background(), func(bool) Prompter { return p }, false, false, "SESSION_SECRET")
+		if !errors.Is(err, want) || err != nil && want == nil || len(p.forms) != 1 || !strings.Contains(p.forms[0].Questions[0].Title, "Replace SESSION_SECRET now?") {
+			t.Errorf("%s: %v, %d forms", answer, err, len(p.forms))
+		}
+	}
+	if err := confirmReplace(context.Background(), func(bool) Prompter { t.Fatal("asked with --yes"); return nil }, true, false, "K"); err != nil {
+		t.Error(err)
 	}
 }
 

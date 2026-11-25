@@ -206,7 +206,14 @@ func lintCmd(o *options) *cobra.Command {
 				for _, f := range res.Findings {
 					fmt.Fprintln(o.out, f)
 				}
-				fmt.Fprintf(o.out, "%d error(s), %d warning(s)\n", res.Errors(), len(res.Findings)-res.Errors())
+				for _, a := range res.Accepted {
+					fmt.Fprintln(o.out, a)
+				}
+				fmt.Fprintf(o.out, "%d error(s), %d warning(s)", res.Errors(), len(res.Findings)-res.Errors())
+				if n := len(res.Accepted); n > 0 {
+					fmt.Fprintf(o.out, ", %d accepted", n)
+				}
+				fmt.Fprintln(o.out)
 			}
 			if res.Errors() > 0 {
 				return ExitError{Code: 1}

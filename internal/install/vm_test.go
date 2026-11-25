@@ -452,9 +452,9 @@ func TestTheBootsRefusalOnAnOldOSNamesNoFlag(t *testing.T) {
 	}
 }
 
-// A crossing (reset-db --new-baseline) takes no input on the VM: its refusal of one the release
-// adds names no fix, where the VM's upgrade names itself.
-func TestTheVMsMissingInputFixIsTheUpgradesAlone(t *testing.T) {
+// The refusal of an input the release adds names the VM's command that gives it: the upgrade, or the
+// crossing (reset-db --new-baseline) with its arguments; one that gives none says why instead.
+func TestTheVMsMissingInputFixNamesTheCommandThatGivesIt(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")
 	if err := e.install(vm); err != nil {
@@ -467,14 +467,20 @@ func TestTheVMsMissingInputFixIsTheUpgradesAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for vmUpgrade, c := range map[bool]struct{ why, fix string }{
-		true:  {"which the upgrade did not give: SMTP_HOST (Mail host): " + vmGivesAdded(""), vmGivesAdded("")},
-		false: {"missing required input(s) the release adds, which reset-db --new-baseline cannot give on the VM: SMTP_HOST (Mail host)", ""},
+	const crossFix = "`sudo notes-stow reset-db --new-baseline --version 2.0.0 --set KEY=VALUE` (or --set-file KEY=PATH, --answers FILE) gives each to the boot into the release"
+	for name, c := range map[string]struct {
+		gives    *vmGiving
+		why, fix string
+	}{
+		"upgrade":  {&vmGiving{run: "the upgrade", cmd: "upgrade"}, "which the upgrade did not give: SMTP_HOST (Mail host): " + vmGivesAdded(""), vmGivesAdded("")},
+		"crossing": {&vmGiving{run: verbNewBaseline, cmd: verbNewBaseline + " --version 2.0.0"}, "which reset-db --new-baseline did not give: SMTP_HOST (Mail host): " + crossFix, crossFix},
+		"none":     {&vmGiving{run: verbNewBaseline, cmd: verbNewBaseline, none: "the OS was built before"}, "which reset-db --new-baseline did not give: SMTP_HOST (Mail host): the OS was built before", ""},
+		"nothing":  {nil, "missing required input(s) the release adds, which this run is given none of: SMTP_HOST (Mail host)", ""},
 	} {
-		in := &Installer{R: r2, O: e.installer(vm).O, vmUpgrade: vmUpgrade}
+		in := &Installer{R: r2, O: e.installer(vm).O, vmGives: c.gives}
 		err := in.upgradeCheck(context.Background(), env, nil)
 		if r, ok := Refusal(err); !ok || r.Fix != c.fix || !strings.HasSuffix(err.Error(), c.why) {
-			t.Errorf("vmUpgrade %v: %v (fix %q)", vmUpgrade, err, r.Fix)
+			t.Errorf("%s: %v (fix %q)", name, err, r.Fix)
 		}
 	}
 }
@@ -1904,6 +1910,61 @@ func TestACrossingThatFailsIsTriedAgainByTheNextBoot(t *testing.T) {
 	}
 	if _, err := os.Stat(newBaselineFile(e.dir)); !os.IsNotExist(err) {
 		t.Errorf("the mark outlived the crossing: %v", err)
+	}
+}
+
+// The crossing's boot takes the inputs its reset-db staged for the release it installs, then
+// removes them; without them its refusal names the reset-db that gives them, on the channel it was
+// asked on — or, where the OS the VM goes back to was built before 0.45.0, why it gives none.
+func TestTheCrossingsBootTakesTheInputsStagedForIt(t *testing.T) {
+	t.Parallel()
+	cross := func(t *testing.T, stage, built string) (*env, error) {
+		e := vmEnv(t, "1.0.0")
+		if err := e.install(vm); err != nil {
+			t.Fatal(err)
+		}
+		_, keptExe := bundledBy(t, "1.0.0", 1, nil, built)
+		if err := testutil.WriteExecutable(filepath.Join(e.dir, "notes-stow"), []byte(read(t, keptExe))); err != nil {
+			t.Fatal(err)
+		}
+		e.docker.answer = volumes(get(e.readEnv(), "COMPOSE_PROJECT_NAME"), func(string) ([]byte, bool, error) { return nil, false, nil })
+		e.r, e.self = bundledInstaller(t, "2.0.0", 1, func(s *spec.Spec) {
+			atBaseline(2)(s)
+			s.Inputs = append(s.Inputs, spec.Input{Key: "SMTP_HOST", Prompt: "Mail host", Required: true})
+		})
+		if err := os.WriteFile(newBaselineFile(e.dir), []byte("2.0.0 1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if stage != "" {
+			if err := os.WriteFile(stagedInputsFile(e.dir), []byte(stage), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return e, e.installer(vm).Boot(context.Background())
+	}
+	e, err := cross(t, `{"release":"2.0.0 1","inputs":{"SMTP_HOST":"mail.example.org"}}`, crossedInputsSince)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if env := e.readEnv(); get(env, "STOWAGE_PROJECT_VERSION") != "2.0.0" || get(env, "SMTP_HOST") != "mail.example.org" {
+		t.Errorf("the install runs %s, SMTP_HOST %q", get(env, "STOWAGE_PROJECT_VERSION"), get(env, "SMTP_HOST"))
+	}
+	for _, f := range []string{stagedInputsFile(e.dir), newBaselineFile(e.dir)} {
+		if _, err := os.Stat(f); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s is left: %v", f, err)
+		}
+	}
+	for built, want := range map[string]string{
+		crossedInputsSince: "which reset-db --new-baseline did not give: SMTP_HOST (Mail host): `sudo notes-stow reset-db --new-baseline --channel edge --version 2.0.0 --set KEY=VALUE`",
+		"0.44.0":           "which reset-db --new-baseline did not give: SMTP_HOST (Mail host): the OS the VM goes back to was built with Stowage 0.44.0, whose reset-db --new-baseline gives no input: upgrade it first to a release of its own schema baseline built with Stowage 0.45.0 or later, then cross from there",
+	} {
+		e, err := cross(t, `{"release":"2.0.0 1","channel":"edge"}`, built)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("built by %s: %v", built, err)
+		}
+		if v := get(e.readEnv(), "STOWAGE_PROJECT_VERSION"); v != "1.0.0" {
+			t.Errorf("built by %s: runs %s", built, v)
+		}
 	}
 }
 
