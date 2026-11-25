@@ -720,12 +720,6 @@ func (s *Spec) AsFile(key string) bool {
 	return slices.ContainsFunc(s.Secrets, func(sec Secret) bool { return sec.Key == key && sec.AsFile })
 }
 
-// Replaces reports whether key is a secret with replace: true, which `secrets rotate` replaces in
-// one pass.
-func (s *Spec) Replaces(key string) bool {
-	return slices.ContainsFunc(s.Secrets, func(sec Secret) bool { return sec.Key == key && sec.Replace })
-}
-
 // AsFileKeys are the keys delivered as files, in the spec's order: its secrets', then its inputs'.
 func (s *Spec) AsFileKeys() []string {
 	var keys []string

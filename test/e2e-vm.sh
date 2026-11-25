@@ -45,8 +45,8 @@ vm_env
 # those, the steps they need (NEEDS, the state they leave) and the ones every run needs (the
 # project, its ship and its mirror, the VM, its install, and its destroy unless E2E_KEEP_VM keeps
 # it); a step checks what an earlier one left only when that one ran (ran <id>). Unset, every step.
-STEPS=(docker-k8s kit-vm vm install firewall listen tune retune l4 app-socket mirror-login disk seed audit front kits reset-db backups restore allow upgrade nic rollback fallback barrier network recovery destroy)
-declare -A NEEDS=([kit-vm]=docker-k8s [kits]=docker-k8s [restore]=backups [upgrade]="retune backups allow" [nic]=upgrade [rollback]=upgrade [fallback]=rollback [barrier]=fallback)
+STEPS=(docker-k8s kit-vm vm install firewall listen tune retune l4 app-socket mirror-login disk seed audit front kits reset-db backups restore allow upgrade nic rollback fallback barrier cross network recovery destroy)
+declare -A NEEDS=([kit-vm]=docker-k8s [kits]=docker-k8s [restore]=backups [upgrade]="retune backups allow" [nic]=upgrade [rollback]=upgrade [fallback]=rollback [barrier]=fallback [cross]=barrier)
 declare -A WANT=() RAN=()
 # want <id>: the step is asked for, with the steps it needs.
 want() {
@@ -952,6 +952,59 @@ step_barrier() {
 		{ cat "$WORK/assess.txt"; fail "the kept boot is not marked: the next boot would fall back"; }
 }
 
+step_cross() {
+	step "ship 1.0.4 at schema baseline 2, adding a required input: upgrade refuses it, naming reset-db --new-baseline; that refuses without the input, naming --set; given it, the VM reboots into 1.0.4, whose boot wipes the data and records the input"
+	# The schema compat becomes sql at baseline 2 (the earlier releases', command's, is 1): the last
+	# release this suite ships, as the steps after it ship none.
+	python3 - "$P/stowage.yaml" <<'PY'
+import re, sys
+path = sys.argv[1]
+s = open(path).read()
+s, k = re.subn(r"  schema_compat:\n(    .*\n)+", "  schema_compat:\n    provider: sql\n    current: \"SELECT 1\"\n    baseline: 2\n", s, count=1)
+assert k == 1, "schema_compat"
+open(path, "w").write(s)
+PY
+	sed -i 's/^  - { key: ADMIN_EMAIL, prompt: "Administrator email", required: true }$/&\n  - { key: CROSS_TOKEN, prompt: "Cross token", secret: true, required: true }/' "$P/stowage.yaml"
+	grep -q '^  - { key: CROSS_TOKEN, ' "$P/stowage.yaml" || fail "no CROSS_TOKEN input in the project"
+	release 1.0.4
+	local code=0
+	on_vm sudo notes-stow upgrade --dry-run >"$WORK/cross-up.txt" 2>&1 || code=$?
+	[[ $code == 3 ]] && grep -q 'notes 1.0.4 starts schema baseline 2, and the install runs notes 1.0.3, at baseline 1' "$WORK/cross-up.txt" && grep -q 'sudo notes-stow reset-db --new-baseline' "$WORK/cross-up.txt" ||
+		{ cat "$WORK/cross-up.txt"; fail "an upgrade across the baseline is not refused (exit $code), naming reset-db --new-baseline"; }
+	# Refused before anything is written: the input 1.0.4 adds, its fix naming --set.
+	local boot api rc
+	boot=$(boot_id)
+	code=0
+	on_vm sudo notes-stow reset-db --new-baseline --yes >"$WORK/cross-refused.txt" 2>&1 || code=$?
+	[[ $code == 3 ]] && grep -q 'missing required input(s) the release adds, which reset-db --new-baseline did not give: CROSS_TOKEN' "$WORK/cross-refused.txt" &&
+		grep -q 'sudo notes-stow reset-db --new-baseline .*--set KEY=VALUE' "$WORK/cross-refused.txt" ||
+		{ cat "$WORK/cross-refused.txt"; fail "a crossing without the input 1.0.4 adds is not refused (exit $code), naming --set"; }
+	[[ $(boot_id) == "$boot" ]] && ! on_vm sudo test -e /usr/local/notes.new-baseline -o -e /usr/local/notes.os-upgrade-inputs || fail "the refused crossing marked or staged something"
+	api=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
+	[[ $api =~ ^[0-9a-f]+$ ]] || fail "not one api container before the crossing: '$api'"
+	on_vm sudo docker exec "$api" touch /data/uploads/marker || fail "no marker written in the uploads volume"
+	local cross=cross-$RANDOM$RANDOM
+	rc=0; on_vm sudo notes-stow reset-db --new-baseline --yes --set "CROSS_TOKEN=$cross" >"$WORK/cross.txt" 2>&1 || rc=$?
+	[[ $rc == 0 || $rc == 255 ]] || { cat "$WORK/cross.txt"; fail "reset-db --new-baseline exited $rc"; }
+	! grep -qF -- "$cross" "$WORK/cross.txt" || fail "the crossing printed the input it gives"
+	back_on 1.0.4 active "after the crossing" "$boot"
+	healthy_postgres "after the crossing"
+	on_vm sudo journalctl -b -u notes.service --no-pager >"$WORK/cross-boot.txt" 2>&1 || true
+	grep -q 'which reset-db --new-baseline asked: wiping the data and installing it' "$WORK/cross-boot.txt" || { tail -40 "$WORK/cross-boot.txt"; fail "the boot did not log the crossing"; }
+	api=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
+	[[ $api =~ ^[0-9a-f]+$ ]] || fail "not one api container after the crossing: '$api'"
+	# What the container answers, not an exit status: an exec that could not run proves nothing.
+	local marker
+	marker=$(on_vm sudo docker exec "$api" sh -c "'test -e /data/uploads/marker && echo present || echo absent'") || fail "the api container did not answer whether the marker is there"
+	[[ $marker == absent ]] || fail "the crossing did not wipe the uploads volume (the marker is $marker)"
+	# The recorded input alone, never the .env's other secrets, read into this host.
+	local recorded
+	recorded=$(on_vm sudo sed -n "\"s/^CROSS_TOKEN='\\{0,1\\}\\([^']*\\)'\\{0,1\\}\\\$/\\1/p\"" /usr/local/notes/.env) || fail "reading CROSS_TOKEN from the VM's .env"
+	[[ $recorded == "$cross" ]] || fail "the install does not record the input the crossing gave"
+	! on_vm sudo test -e /usr/local/notes.os-upgrade-inputs -o -e /usr/local/notes.new-baseline || fail "the boot left the staged input or the crossing's mark"
+	[[ $(on_vm systemctl is-active notes-health.service) == active ]] || fail "the health gate did not pass 1.0.4"
+}
+
 step_network() {
 	step "network: the lease kept as a static address, a static IPv6 address beside it, confirmed; a change not confirmed comes undone, at its window's end and at a reboot"
 	# net_field <field>: the field of `notes-stow network`, as the last call printed it.
@@ -959,7 +1012,7 @@ step_network() {
 	net_field() { sed -n "s/^$1 *//p" "$WORK/net.txt"; }
 	net "on DHCP"
 	vm_lease
-	# edge's override, kept through 1.0.0 (which names no edge), rendered again by 1.0.3's boot: the
+	# edge's override, kept through 1.0.0 (which names no edge), rendered again by the boot of the last release shipped (1.0.3, or 1.0.4 once cross ran): the
 	# VM runs a release naming edge once nic ran, unless a rollback took it back to 1.0.0 since.
 	if ran nic && { ran barrier || ! ran rollback; }; then
 		grep -q "^role       edge: .*192\.0\.2\.11/24; set by \`notes-stow network set --role edge\`: 192\.0\.2\.11/24$" "$WORK/net.txt" ||

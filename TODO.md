@@ -13,15 +13,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run. 
 Must above Blocked (user, 2026-11-15): the clouds under Blocked ship in it as preview, Google
 Cloud alone proven.
 
-- **`describe --json` names each secret's `secrets rotate` way** (`rotate`: `passes` for
-  `rotation: true`, `replace` for `replace: true`, `none`): the provider's `secret_rotations`
-  refuses at plan only from it (its TODO, Should 3). An additive field of the machine interface.
-- **e2e-vm crosses a schema baseline for real**: no suite crosses one on the VM; the crossing and
-  0.45.0's inputs for it are proven by unit tests alone. Ship a release at a new baseline adding a
-  required input, `reset-db --new-baseline --set` over SSH, the boot that crosses (data wiped, the
-  input recorded, the staged file gone), and the refusal without `--set` naming that command; run
-  with the next slice that runs e2e-vm.
-
 ### Supply chain — stopgaps back to canonical
 
 1. **Check every stopgap at each release, and drop each one the upstream has caught up with**:

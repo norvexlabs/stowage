@@ -25,7 +25,7 @@ func (in *Installer) K8sExportSecrets(ctx context.Context, recipients []string) 
 	in.kube = true
 	// The keys first: a refusal reads nothing from the cluster.
 	if _, err := parseRecipients(recipients, maxRecipients); err != nil {
-		return nil, err
+		return nil, refusal("", err)
 	}
 	rec, err := in.k8sRecordedHere(ctx, "export")
 	if err != nil {

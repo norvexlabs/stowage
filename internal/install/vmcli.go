@@ -718,11 +718,11 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	reset.Flags().StringArrayVar(&setFiles, "set-file", nil, "with --new-baseline, a file input the release adds, KEY=PATH (repeatable): given to the boot that crosses")
 	reset.Flags().StringVar(&answers, "answers", "", "with --new-baseline, a YAML file of the inputs the release adds, KEY: value: given to the boot that crosses")
 	var rotate func(cmd *cobra.Command, key, pass string, confirm func() error) error
-	passes, replaces := rotations(r.Spec)
+	passes, replaces := rotations(r.Spec, onVM)
 	if passes || replaces != nil {
 		rotate = func(cmd *cobra.Command, key, pass string, confirm func() error) error {
 			// What the spec refuses comes before the question; the daemon's, after.
-			if _, err := (&Installer{R: r, O: o}).rotation(key, pass); err != nil {
+			if _, err := (&Installer{R: r, O: o}).rotation(onVM, key, pass); err != nil {
 				return err
 			}
 			if err := confirm(); err != nil {
@@ -745,7 +745,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			return c.follow(cmd.Context(), stderr, started)
 		}
 	}
-	secrets := secretsCommand(name, stdout, func(*cobra.Command) {}, rotate, passes, replaces, set, in.checkSetValue, terminal, func(cmd *cobra.Command, recipients []string) ([]byte, error) {
+	secrets := secretsCommand(name, func(args string) string { return in.secretsCmd(onVM, args) }, stdout, func(*cobra.Command) {}, rotate, passes, replaces, set, in.checkSetValue, terminal, func(cmd *cobra.Command, recipients []string) ([]byte, error) {
 		var out SecretsExport
 		err := c.do(cmd.Context(), http.MethodPost, "/v1/secrets/export", SecretsExportRequest{Recipients: recipients}, &out)
 		_, _ = io.WriteString(stderr, out.Log)

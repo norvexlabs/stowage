@@ -418,7 +418,7 @@ func (in *Installer) k8sCtl(verb string) string {
 
 // k8sTarget is the flags naming the release, as an operator gives them again.
 func k8sTarget(k K8sOptions) string {
-	s := " --namespace " + k.Namespace + " --release " + k.Release
+	s := " --namespace " + shellQuote(k.Namespace) + " --release " + shellQuote(k.Release)
 	if k.Context != "" {
 		s += " --kube-context " + shellQuote(k.Context)
 	}

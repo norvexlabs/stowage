@@ -326,7 +326,7 @@ func TestBackupConfigIsValidatedKeptAndMasked(t *testing.T) {
 		req.Recipients = slices.Clone(ok.Recipients)
 		c.edit(&req)
 		var e errOf
-		if code := call(t, h, "POST", "/v1/backup/config", req, &e); code != 400 || !strings.Contains(e.Error, c.want) {
+		if code := call(t, h, "POST", "/v1/backup/config", req, &e); code != 400 || !e.Refused || !strings.Contains(e.Error, c.want) {
 			t.Errorf("%s: %d %s", name, code, e.Error)
 		}
 	}
@@ -376,10 +376,21 @@ func TestBackupScheduleReachesTheTimer(t *testing.T) {
 	if ran := fmt.Sprint(host.calls()); !strings.Contains(ran, "[systemctl daemon-reload] [systemctl restart notes-backup.timer]") {
 		t.Errorf("the timer was not started: %s", ran)
 	}
-	host.calendarErr = errors.New("Failed to parse calendar specification")
+	host.calendarErr = exitCodeErr{1, "Failed to parse calendar specification"}
 	var e errOf
-	if code := call(t, d.Handler(), "POST", "/v1/backup/config", BackupConfigRequest{Schedule: ptr("someday")}, &e); code != 400 || !strings.Contains(e.Error, "not a systemd calendar event") {
-		t.Errorf("a schedule systemd refuses: %d %s", code, e.Error)
+	if code := call(t, d.Handler(), "POST", "/v1/backup/config", BackupConfigRequest{Schedule: ptr("someday")}, &e); code != 400 || !e.Refused || !strings.Contains(e.Error, "not a systemd calendar event") {
+		t.Errorf("a schedule systemd refuses: %d %+v", code, e)
+	}
+	// systemd-analyze cut by a signal, or that did not run, judged nothing: a failure.
+	host.calendarErr = exitCodeErr{-1, "signal: killed"}
+	e = errOf{}
+	if code := call(t, d.Handler(), "POST", "/v1/backup/config", BackupConfigRequest{Schedule: ptr("someday")}, &e); code != 500 || e.Refused {
+		t.Errorf("a check a signal cut: %d %+v", code, e)
+	}
+	host.calendarErr = errors.New("exec: systemd-analyze: not found")
+	e = errOf{}
+	if code := call(t, d.Handler(), "POST", "/v1/backup/config", BackupConfigRequest{Schedule: ptr("someday")}, &e); code != 500 || e.Refused || !strings.Contains(e.Error, "could not check it") {
+		t.Errorf("a check that did not run: %d %+v", code, e)
 	}
 	host.calendarErr = nil
 	configure(t, d, BackupConfigRequest{Schedule: ptr("Sun *-*-* 04:30:00 UTC")})
@@ -877,7 +888,7 @@ func TestAStoredScheduleRefusedStartsTheTimerOnTheDefault(t *testing.T) {
 	if err := os.WriteFile(BackupFile(d.O.Dir), bytes.Replace(raw, []byte("Mon *-*-* 01:00:00 UTC"), []byte("someday"), 1), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	d.Host.(*fakeHost).calendarErr = errors.New("Failed to parse calendar specification")
+	d.Host.(*fakeHost).calendarErr = exitCodeErr{1, "Failed to parse calendar specification"}
 	d.backupResume()
 	if _, err := os.Stat(filepath.Join(d.Systemd, "notes-backup.timer.d", "schedule.conf")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the refused schedule reached the timer: %v", err)
@@ -1681,6 +1692,28 @@ func TestAnRcloneDestinationOnTheRunnersOwnDiskIsRefused(t *testing.T) {
 		var e errOf
 		if code := call(t, h, "POST", "/v1/backup/config", req, &e); code != 200 {
 			t.Errorf("%q: %d %s", conf, code, e.Error)
+		}
+	}
+}
+
+// A stored schedule the check could not judge (systemd-analyze cut by a signal, or failing for
+// another reason than the schedule) is kept: the timer is not moved to the default on a guess.
+func TestAStoredScheduleUncheckedIsKept(t *testing.T) {
+	t.Parallel()
+	for _, cut := range []error{exitCodeErr{-1, "signal: killed"}, exitCodeErr{1, "systemd-analyze: unrecognized option '--iterations'"}} {
+		_, d, _, key := backupVM(t)
+		req := validConfig(key)
+		req.Schedule = ptr("Mon *-*-* 01:00:00 UTC")
+		configure(t, d, req)
+		// The resume alone writes the timer's schedule: what the config wrote is gone first.
+		if err := os.RemoveAll(filepath.Join(d.Systemd, "notes-backup.timer.d")); err != nil {
+			t.Fatal(err)
+		}
+		d.Host.(*fakeHost).calendarErr = cut
+		d.backupResume()
+		raw, err := os.ReadFile(filepath.Join(d.Systemd, "notes-backup.timer.d", "schedule.conf"))
+		if err != nil || !strings.Contains(string(raw), "Mon *-*-* 01:00:00 UTC") {
+			t.Errorf("%v: the stored schedule did not reach the timer: %v %s", cut, err, raw)
 		}
 	}
 }

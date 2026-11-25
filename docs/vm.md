@@ -1232,7 +1232,8 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   with `systemd-analyze calendar`, without `%` or `\`; default `*-*-* 03:00:00 UTC`) and `profile`
   (one of the release's, default its `default_profile`). A change gives the flags given and keeps
   the rest; the first needs a destination, the rclone config and a recipient; `--remove` drops the
-  settings. `<name>-backup.timer` (`RandomizedDelaySec` 15 min, `Persistent`: a run missed while
+  settings. A value it cannot take, or a schedule `systemd-analyze` rejects, is refused (exit 3),
+  nothing saved; a `systemd-analyze` that cannot run fails it (exit 1). `<name>-backup.timer` (`RandomizedDelaySec` 15 min, `Persistent`: a run missed while
   the VM was off runs once the timer starts again) is never enabled: the daemon starts it once
   settings exist, at each change and as it starts, on their schedule — one other than the default
   is the runtime drop-in `/run/systemd/system/<name>-backup.timer.d/schedule.conf`, then
@@ -1240,7 +1241,8 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   host without that unit, nothing); no boot runs it on a schedule not the operator's. Settings this release cannot read still start it,
   so its runs fail and say why; on the default schedule when the file does not decode, or when
   its schedule is one the unit cannot hold or `systemd-analyze` refuses (the daemon's log says so;
-  `backup config` still shows the stored one). As the
+  `backup config` still shows the stored one); a `systemd-analyze` that cannot judge it (it did
+  not run, a signal cut it, it failed otherwise) keeps the stored one, logged as unchecked. As the
   timer is `Persistent`, a restart whose schedule had a time pass since the last scheduled run (a
   new schedule, settings set again) runs a backup at once. The timer starts `<name>-backup.service`, which
   runs `<short>-stow backup run --if-configured` (nothing, saying why, without settings, before the
@@ -1502,13 +1504,13 @@ showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rol
   —; 202, a `backup-verify` job, the target the destination: done, its
   `result` is the message; failed, its `error` the destination's reason), `POST
   secrets/export` (`{"recipients"}`: `{"file"}`, the armored file), `POST secrets/rotate`
-  (`{"key", "pass": "stage|swap|finish"}`, 202, a job), `POST restore` (`{"object", "identity",
+  (`{"key", "pass": "stage|swap|finish|replace"}`, 202, a job), `POST restore` (`{"object", "identity",
   "confirm": {"version", "revision"}, "unrecorded"}`, 202, a job; `unrecorded` is `--unrecorded`). Every 202 that starts a job answers
   `{"job", "target", "started", "events"}`: the job's kind and target, its `started` (its
   identity, as `GET job` and the journal's `job` give it) and the journal's last `seq` once its
   `job.started` was written, which its `job.ended` (and its reboot's entries) come after — `null`
   when the start could not be journaled, with `{"events_error": "the job's start could not be
-  journaled: …"}` beside it (absent otherwise): a client then takes no cursor from it. An error is `{"error": "…"}` with a 4xx or 5xx status, and a refusal (a rule said no, nothing changed) `{"error": "…", "refused": true, "fix": "…"}`, the fix advice for a person that holds on the VM, absent when none does, which the verbs exit 3 on (an answer without `refused` is a failure, fix or not); a body with an unknown field is refused.
+  journaled: …"}` beside it (absent otherwise): a client then takes no cursor from it. An error is `{"error": "…"}` with a 4xx or 5xx status, and a refusal (a rule said no, nothing changed) `{"error": "…", "refused": true, "fix": "…"}`, the fix advice for a person that holds on the VM, absent when none does, which the verbs exit 3 on (an answer without `refused` is a failure, fix or not); a body with an unknown field is refused. `kit`, `reset-db`, `restore` and `secrets export|rotate|set|show` are refused (409) while the install runs another release than the OS carries (`the install runs <name> <v> (revision <r>), not this OS's <name'> <v'> (revision <r'>): <verb> runs on the release the OS carries`), with no fix: `status` names the two releases, which an upgrade or a rollback brings to one. A body the daemon cannot take as given — a network change or its revert window, a backup config, an export's keys — is refused, 400 with `refused`.
 - A disaster recovery: `secrets export --recipient age1…` while the VM lives (the file kept off
   it), backups to a destination off it; on a new VM, `vm create --secrets FILE` (the file
   decrypted) installs with those secrets over SSH, after `systemctl start <name>.service` (a

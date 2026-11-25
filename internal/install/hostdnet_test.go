@@ -645,6 +645,11 @@ func TestAChangeNotConfirmedComesUndone(t *testing.T) {
 	h := netDaemon(t, link)
 	api := h.Handler()
 	var a NetAnswer
+	// A window too short is refused, nothing changed: exit 3.
+	var e errOf
+	if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}, RevertSecs: intp(minRevertSecs - 1)}, &e); code != http.StatusBadRequest || !e.Refused || !strings.Contains(e.Error, "revert_secs") {
+		t.Errorf("a window too short: %d %+v", code, e)
+	}
 	if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}, RevertSecs: intp(minRevertSecs)}, fresh(&a)); code != http.StatusOK || a.Pending == nil {
 		t.Fatalf("%d %+v", code, a)
 	}

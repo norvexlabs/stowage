@@ -48,51 +48,74 @@ func acceptedVars(secrets []spec.Secret, get func(string) string, set func(k, v 
 	}
 }
 
-// rotated returns the secret key names, which must have rotation: true.
-func (in *Installer) rotated(key string) (spec.Secret, error) {
-	var names []string
-	for _, s := range in.R.Spec.Secrets {
-		if s.Rotation {
-			if s.Key == key {
-				return s, nil
-			}
-			names = append(names, s.Key)
-		}
+// The ways `secrets rotate` changes a secret, as `describe --json` names them: RotatePasses its three
+// passes (rotation: true), RotateReplace its one pass (replace: true), RotateNone none.
+const (
+	RotatePasses = "passes"
+	RotateNone   = "none"
+)
+
+// rotateWay is how `secrets rotate` changes sec on shape (onDocker, onK8s, onVM), from the spec
+// alone: RotatePasses for rotation: true, RotateReplace for replace: true but on Kubernetes (`k8s
+// secrets rotate` takes the three passes alone), RotateNone otherwise. Every reader of the way
+// asks it (describe, the verbs, the daemon), so they agree; lint holds rotation: true and
+// replace: true off one secret.
+func rotateWay(sec spec.Secret, shape string) string {
+	switch {
+	case sec.Rotation:
+		return RotatePasses
+	case sec.Replace && shape != onK8s:
+		return RotateReplace
 	}
-	return spec.Secret{}, fmt.Errorf("%s is no secret with rotation: true (rotated: %s)", key, cmp.Or(strings.Join(names, ", "), "none"))
+	return RotateNone
 }
 
-// rotation is the spec's secret key for pass, on Docker and the VM: a secret with rotation: true
-// takes its three passes, one with replace: true RotateReplace alone, and any other none (lint
-// holds replace off a secret the database reads, and off a settable one).
-func (in *Installer) rotation(key, pass string) (spec.Secret, error) {
+// settableOn is whether `secrets set` records a value the operator chooses for sec on shape:
+// Kubernetes has no `secrets set`.
+func settableOn(sec spec.Secret, shape string) bool { return sec.Settable && shape != onK8s }
+
+// secretsCmd is the `secrets` verb args as its operator types it on shape: Docker's naming the
+// install's directory, the VM's run as root (over the daemon), Kubernetes's under `k8s`.
+func (in *Installer) secretsCmd(shape, args string) string {
+	switch shape {
+	case onK8s:
+		return in.k8sCtl("secrets " + args) // the release it acts on named
+	case onVM:
+		return in.vmCtl() + " secrets " + args
+	}
+	return shellQuote(in.ctl()) + " secrets " + args + " --dir " + shellQuote(in.O.Dir)
+}
+
+// rotation is the spec's secret key for pass on shape: one whose way (rotateWay) is RotatePasses
+// takes its three passes, RotateReplace that pass alone, RotateNone none. Each no is a refusal:
+// nothing changed.
+func (in *Installer) rotation(shape, key, pass string) (spec.Secret, error) {
 	i := slices.IndexFunc(in.R.Spec.Secrets, func(s spec.Secret) bool { return s.Key == key })
 	if i < 0 {
 		var names []string
 		for _, s := range in.R.Spec.Secrets {
 			names = append(names, s.Key)
 		}
-		return spec.Secret{}, fmt.Errorf("%s is no secret of %s (secrets: %s)", key, in.R.Spec.Name, cmp.Or(strings.Join(names, ", "), "none"))
+		return spec.Secret{}, refuse("", "%s is no secret of %s (secrets: %s)", key, in.R.Spec.Name, cmp.Or(strings.Join(names, ", "), "none"))
 	}
-	// The command as its operator types it: the VM's, run as root, over the daemon.
-	sec, ctl := in.R.Spec.Secrets[i], in.fixOn(in.R.Ctl(), in.vmCtl())+" secrets rotate "+key
-	switch {
-	case sec.Rotation && pass == RotateReplace:
-		return spec.Secret{}, fmt.Errorf("%s has rotation: true: it is replaced in three passes, `%s --stage` first", key, ctl)
-	case sec.Rotation:
+	sec, stage, one := in.R.Spec.Secrets[i], in.secretsCmd(shape, "rotate "+key+" --stage"), in.secretsCmd(shape, "rotate "+key)
+	switch way := rotateWay(sec, shape); {
+	case way == RotatePasses && pass == RotateReplace:
+		return spec.Secret{}, refuse(stage, "%s has rotation: true: it is replaced in three passes, `%s` first", key, stage)
+	case way == RotateReplace && pass != RotateReplace:
+		return spec.Secret{}, refuse(one, "%s has replace: true: `%s` replaces it in one pass, without --stage or --finish", key, one)
+	case way != RotateNone:
 		return sec, nil
-	case sec.Replace && pass != RotateReplace:
-		return spec.Secret{}, fmt.Errorf("%s has replace: true: `%s` replaces it in one pass, without --stage or --finish", key, ctl)
 	case sec.Replace:
-		return sec, nil
+		return spec.Secret{}, refuse("", "%s has replace: true, which `secrets rotate` replaces in one pass on Docker and the VM: `k8s secrets rotate` takes a secret with rotation: true alone", key)
 	}
 	var ways []string
 	for _, s := range in.R.Spec.Secrets {
-		if s.Rotation || s.Replace {
+		if rotateWay(s, shape) != RotateNone {
 			ways = append(ways, s.Key)
 		}
 	}
-	return spec.Secret{}, fmt.Errorf("%s has neither rotation: true nor replace: true: its release lets `secrets rotate` change it in no way (rotated or replaced: %s)", key, cmp.Or(strings.Join(ways, ", "), "none"))
+	return spec.Secret{}, refuse("", "%s has neither rotation: true nor replace: true: its release lets `secrets rotate` change it in no way (rotated or replaced: %s)", key, cmp.Or(strings.Join(ways, ", "), "none"))
 }
 
 // rotationVars records, for each rotated secret, an empty next and previous value where none is.
@@ -111,8 +134,8 @@ func rotationVars(secrets []spec.Secret, has func(string) bool, set func(k, v st
 
 // rotatePass applies one pass of sec's rotation to the values get reads and set writes, its
 // AcceptedVar with them, and says what it did. A pass out of order is refused.
-func (in *Installer) rotatePass(sec spec.Secret, pass string, get func(string) string, set func(k, v string)) (string, error) {
-	what, err := in.rotateValues(sec, pass, get, set)
+func (in *Installer) rotatePass(shape string, sec spec.Secret, pass string, get func(string) string, set func(k, v string)) (string, error) {
+	what, err := in.rotateValues(shape, sec, pass, get, set)
 	if err == nil {
 		acceptedVars([]spec.Secret{sec}, get, set)
 	}
@@ -120,40 +143,42 @@ func (in *Installer) rotatePass(sec spec.Secret, pass string, get func(string) s
 }
 
 // rotateValues is rotatePass on KEY, KEY_NEXT and KEY_PREVIOUS.
-func (in *Installer) rotateValues(sec spec.Secret, pass string, get func(string) string, set func(k, v string)) (string, error) {
+func (in *Installer) rotateValues(shape string, sec spec.Secret, pass string, get func(string) string, set func(k, v string)) (string, error) {
 	k, next, prev := sec.Key, NextVar(sec.Key), PreviousVar(sec.Key)
-	ctl := in.R.Ctl() + " secrets rotate " + k
+	// The next pass's command, as its operator types it: a pass out of order is refused (nothing
+	// recorded yet), fixed by the pass that comes first.
+	run := func(flag string) string { return in.secretsCmd(shape, strings.TrimSpace("rotate "+k+" "+flag)) }
 	// A pass whose state is already there (a run that recorded it, then failed to restart) is run
 	// again: the stack is brought up with it.
 	switch pass {
 	case RotateStage:
 		switch {
 		case get(next) != "":
-			return fmt.Sprintf("a new %s is staged already: bringing it up again; `%s` then puts it in use", k, ctl), nil
+			return fmt.Sprintf("a new %s is staged already: bringing it up again; `%s` then puts it in use", k, run("")), nil
 		case get(prev) != "":
-			return "", fmt.Errorf("the last rotation of %s is not finished: `%s --finish` ends it", k, ctl)
+			return "", refuse(run("--finish"), "the last rotation of %s is not finished: `%s` ends it", k, run("--finish"))
 		}
 		v, err := generate(in.O.rand(), sec.Gen)
 		if err != nil {
 			return "", fmt.Errorf("secret %s: %w", k, err)
 		}
 		set(next, v)
-		return fmt.Sprintf("staged a new %s as %s; once every service runs with it, `%s` puts it in use", k, next, ctl), nil
+		return fmt.Sprintf("staged a new %s as %s; once every service runs with it, `%s` puts it in use", k, next, run("")), nil
 	case RotateSwap:
 		switch {
 		case get(next) == "" && get(prev) != "":
-			return fmt.Sprintf("%s is in use already, the old one kept as %s: bringing it up again; `%s --finish` then drops it", k, prev, ctl), nil
+			return fmt.Sprintf("%s is in use already, the old one kept as %s: bringing it up again; `%s` then drops it", k, prev, run("--finish")), nil
 		case get(next) == "":
-			return "", fmt.Errorf("no new %s is staged: `%s --stage` first", k, ctl)
+			return "", refuse(run("--stage"), "no new %s is staged: `%s` first", k, run("--stage"))
 		}
 		set(prev, get(k))
 		set(k, get(next))
 		set(next, "")
-		return fmt.Sprintf("%s is the new value, the old one kept as %s; once nothing uses it, `%s --finish` drops it", k, prev, ctl), nil
+		return fmt.Sprintf("%s is the new value, the old one kept as %s; once nothing uses it, `%s` drops it", k, prev, run("--finish")), nil
 	case RotateFinish:
 		switch {
 		case get(next) != "":
-			return "", fmt.Errorf("a new %s is staged, not in use: `%s` puts it in use first", k, ctl)
+			return "", refuse(run(""), "a new %s is staged, not in use: `%s` puts it in use first", k, run(""))
 		case get(prev) == "":
 			return fmt.Sprintf("%s keeps no previous value: bringing the stack up again", k), nil
 		}
@@ -173,7 +198,7 @@ func (in *Installer) rotateValues(sec spec.Secret, pass string, get func(string)
 // RotateSecret runs one pass of a secret's rotation (rotation) on the Docker install in O.Dir, then
 // brings the stack up again with it.
 func (in *Installer) RotateSecret(ctx context.Context, key, pass string) error {
-	sec, err := in.rotation(key, pass)
+	sec, err := in.rotation(in.fixOn(onDocker, onVM), key, pass)
 	if err != nil {
 		return err
 	}
@@ -193,7 +218,7 @@ func (in *Installer) RotateSecret(ctx context.Context, key, pass string) error {
 		return err
 	}
 	get := func(k string) string { v, _ := env.Get(k); return v }
-	what, err := in.rotatePass(sec, pass, get, env.Set)
+	what, err := in.rotatePass(in.fixOn(onDocker, onVM), sec, pass, get, env.Set)
 	if err != nil {
 		return err
 	}
@@ -216,10 +241,7 @@ func (in *Installer) RotateSecret(ctx context.Context, key, pass string) error {
 // one rollout after the other.
 func (in *Installer) K8sRotateSecret(ctx context.Context, key, pass string) error {
 	k := in.O.K8s
-	if in.R.Spec.Replaces(key) {
-		return fmt.Errorf("%s has replace: true, which `secrets rotate` replaces in one pass on Docker and the VM: `k8s secrets rotate` takes a secret with rotation: true alone", key)
-	}
-	sec, err := in.rotated(key)
+	sec, err := in.rotation(onK8s, key, pass)
 	if err != nil {
 		return err
 	}
@@ -244,7 +266,7 @@ func (in *Installer) K8sRotateSecret(ctx context.Context, key, pass string) erro
 	if rec == nil {
 		return fmt.Errorf("release %s in %s has no Secret %s", k.Release, k.Namespace, k.envSecret())
 	}
-	what, err := in.rotatePass(sec, pass, func(k string) string { return rec[k] }, func(k, v string) { rec[k] = v })
+	what, err := in.rotatePass(onK8s, sec, pass, func(k string) string { return rec[k] }, func(k, v string) { rec[k] = v })
 	if err != nil {
 		return err
 	}

@@ -453,5 +453,91 @@
       ],
       "check": true
     }
+  ],
+  "secrets": [
+    {
+      "key": "ENCRYPTION_KEY",
+      "rotate": {
+        "docker": "none",
+        "kairos": "none",
+        "kubernetes": "none"
+      },
+      "settable": {
+        "docker": false,
+        "kairos": false,
+        "kubernetes": false
+      },
+      "as_file": true
+    },
+    {
+      "key": "SESSION_SECRET",
+      "rotate": {
+        "docker": "replace",
+        "kairos": "replace",
+        "kubernetes": "none"
+      },
+      "settable": {
+        "docker": false,
+        "kairos": false,
+        "kubernetes": false
+      },
+      "as_file": false
+    },
+    {
+      "key": "INTERNAL_SERVICE_SECRET",
+      "rotate": {
+        "docker": "passes",
+        "kairos": "passes",
+        "kubernetes": "passes"
+      },
+      "settable": {
+        "docker": false,
+        "kairos": false,
+        "kubernetes": false
+      },
+      "as_file": false
+    },
+    {
+      "key": "POSTGRES_PASSWORD",
+      "rotate": {
+        "docker": "none",
+        "kairos": "none",
+        "kubernetes": "none"
+      },
+      "settable": {
+        "docker": false,
+        "kairos": false,
+        "kubernetes": false
+      },
+      "as_file": false
+    },
+    {
+      "key": "APP_DB_PASSWORD",
+      "rotate": {
+        "docker": "none",
+        "kairos": "none",
+        "kubernetes": "none"
+      },
+      "settable": {
+        "docker": false,
+        "kairos": false,
+        "kubernetes": false
+      },
+      "as_file": false
+    },
+    {
+      "key": "OPS_PASSWORD",
+      "rotate": {
+        "docker": "none",
+        "kairos": "none",
+        "kubernetes": "none"
+      },
+      "settable": {
+        "docker": true,
+        "kairos": true,
+        "kubernetes": false
+      },
+      "as_file": false
+    }
   ]
 }

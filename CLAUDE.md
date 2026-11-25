@@ -164,7 +164,7 @@ a self-review against the code it describes is enough. Every other commit clears
    over SSH (`vmssh*.go`, `vmkit*.go`, `vmhostkey*.go`), `internal/install/tofu` and `vmtofu*.go`
    (a path not in the tree keeps its rule, as a `GATE_BASE` diff names it), `seed*.go`,
    the boot (`vm.go`), the host daemon, the backup runner, the OS bundle's files (its recipe's lists, `internal/kairos/kairos.go`, included), e2e-vm's OpenTofu root (`test/vm-truenas/`) or `test/vm.sh` runs `STOWAGE_VM_ENV=<file> make
-   e2e-vm` too (a real VM on TrueNAS, an upgrade of it through a TLS mirror, `reset-db`, `rollback`, a failed health gate's fallback, a backup, a second NIC attached by the suite's OpenTofu root and `network attach` and the network overrides' revert, handoff kits with a Docker install and a kind cluster beside it, a kit taken by `vm kit take` on a second VM the root made, ~105 min; the file is the user's, its path given at run time,
+   e2e-vm` too (a real VM on TrueNAS, an upgrade of it through a TLS mirror, `reset-db`, a schema baseline crossed by `reset-db --new-baseline --set`, `rollback`, a failed health gate's fallback, a backup, a second NIC attached by the suite's OpenTofu root and `network attach` and the network overrides' revert, handoff kits with a Docker install and a kind cluster beside it, a kit taken by `vm kit take` on a second VM the root made, ~105 min; the file is the user's, its path given at run time,
    never written in the tree); it runs beside the parallel suites (`e2e-kairos` among them: disk
    builds wait for one another on auroraboot's one container name) in one chain with `e2e-full-vm`, one TrueNAS VM
    at a time. A change to `examples/full`'s kairos

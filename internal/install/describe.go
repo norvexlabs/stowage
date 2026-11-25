@@ -79,6 +79,19 @@ type Description struct {
 	L4Routes []DescribedL4Route `json:"l4_routes"`
 	// Handoffs are the kits this release issues (`kit create`), in the spec's order ([] when none).
 	Handoffs []DescribedHandoff `json:"handoffs"`
+	// Secrets are the secrets the release generates, in the spec's order ([] when none): never a value.
+	Secrets []DescribedSecret `json:"secrets"`
+}
+
+// DescribedSecret is a secret the release generates: for each shape the release declares, how
+// `secrets rotate` changes it there (rotateWay: RotatePasses, RotateReplace or RotateNone) and
+// whether `secrets set` takes a chosen value there (settableOn); and whether a service reads it
+// from a file.
+type DescribedSecret struct {
+	Key      string            `json:"key"`
+	Rotate   map[string]string `json:"rotate"`
+	Settable map[string]bool   `json:"settable"`
+	AsFile   bool              `json:"as_file"`
 }
 
 // DescribedRoute is a front route: its name, and the host port it binds in loopback mode when
@@ -156,6 +169,14 @@ func Describe(r *Release) Description {
 		Routes:         []DescribedRoute{},
 		L4Routes:       []DescribedL4Route{},
 		Handoffs:       []DescribedHandoff{},
+		Secrets:        []DescribedSecret{},
+	}
+	for _, sec := range r.Spec.Secrets {
+		ds := DescribedSecret{Key: sec.Key, Rotate: map[string]string{}, Settable: map[string]bool{}, AsFile: sec.AsFile}
+		for _, shape := range d.Shapes {
+			ds.Rotate[shape], ds.Settable[shape] = rotateWay(sec, shape), settableOn(sec, shape)
+		}
+		d.Secrets = append(d.Secrets, ds)
 	}
 	for _, h := range r.Spec.Handoffs {
 		dh := DescribedHandoff{Name: h.Name, For: h.For, Instance: h.Instance, Ask: []DescribedHandoffAsk{},
@@ -310,6 +331,23 @@ func (d Description) print(w io.Writer) error {
 			check = ", checked"
 		}
 		fmt.Fprintf(&b, "handoff   %s (for %s, gives %s%s)\n", h.Name, h.For, strings.Join(h.Gives, ","), check)
+	}
+	for _, sec := range d.Secrets {
+		var ways, settable []string
+		for _, shape := range d.Shapes {
+			ways = append(ways, shape+"="+sec.Rotate[shape])
+			if sec.Settable[shape] {
+				settable = append(settable, shape)
+			}
+		}
+		tags := []string{"rotate " + strings.Join(ways, " ")}
+		if len(settable) > 0 {
+			tags = append(tags, "settable "+strings.Join(settable, ","))
+		}
+		if sec.AsFile {
+			tags = append(tags, "as file")
+		}
+		fmt.Fprintf(&b, "secret    %s (%s)\n", sec.Key, strings.Join(tags, ", "))
 	}
 	fmt.Fprintf(&b, "registry  %s\n", d.Registry)
 	if d.StowageVersion != "" {

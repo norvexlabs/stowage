@@ -3,6 +3,30 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.46.0]
+
+### Added
+
+- `describe --json` lists the release's secrets, `secrets`: for each shape the release declares,
+  how `secrets rotate` changes each one there (`passes`, `replace` or `none`: Kubernetes takes
+  the three passes alone) and whether `secrets set` takes a chosen value there (never on
+  Kubernetes); and whether a service reads it from a file — never a value. `describe` prints a
+  `secret` line for each.
+
+### Fixed
+
+- The `secrets` verbs refused with exit 1, as failures: `secrets rotate` of a key or a pass the
+  release does not take, a pass out of order, its one pass unconfirmed (no terminal, or `--no-input`, without
+  `--yes`), `--stage` with `--finish`; `secrets set` of a key that is not settable or a value it
+  cannot record; `secrets show` to no terminal; `secrets export` without `--recipient` or with a
+  key that is not an age public key. Each is a refusal, exit 3, nothing changed. The command
+  `secrets rotate` names in its hints is the one to run there: with `--dir` on Docker, `sudo` on
+  the VM, under `k8s` on Kubernetes.
+- On the VM, a refusal the host daemon answered with its own status reached the verb as a
+  failure, exit 1: a request it cannot take (a body that is no request, a network change or its
+  revert window, a backup config or a schedule systemd rejects, an export's keys), a verb run while the install runs another release than the OS
+  carries. Each exits 3, with its fix where one holds.
+
 ## [0.45.0] - 2026-11-25
 
 ### Added

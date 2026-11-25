@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
 // The verbs that need the release refuse a namespace without it, as `k8s status` does
@@ -71,8 +74,13 @@ func TestASecretRotatesInThreePassesOnDocker(t *testing.T) {
 	refused := func(pass, want string) {
 		t.Helper()
 		before := e.file(".env")
-		if err := rotate(pass); err == nil || !strings.Contains(err.Error(), want) {
+		err := rotate(pass)
+		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("%s: %v", pass, err)
+		}
+		// A pass out of order, a key or a way it does not take: a refusal, fixed by the command to run.
+		if r, ok := Refusal(err); !ok || !strings.Contains(r.Fix, " secrets rotate SESSION_SECRET") || !strings.HasSuffix(r.Fix, " --dir "+e.dir) {
+			t.Fatalf("%s: %v is no refusal fixed by the install's command: %+v", pass, err, r)
 		}
 		if e.file(".env") != before {
 			t.Fatalf("a refused %s changed .env", pass)
@@ -92,7 +100,9 @@ func TestASecretRotatesInThreePassesOnDocker(t *testing.T) {
 		err.Error() != "POSTGRES_PASSWORD has neither rotation: true nor replace: true: its release lets `secrets rotate` change it in no way (rotated or replaced: SESSION_SECRET)" {
 		t.Fatalf("a secret with neither: %v", err)
 	}
-	refused(RotateReplace, "SESSION_SECRET has rotation: true: it is replaced in three passes, `notes-stow secrets rotate SESSION_SECRET --stage` first")
+	// The fix, as the operator types it: the install's own installer, its directory named.
+	ctl := filepath.Join(e.dir, "notes-stow")
+	refused(RotateReplace, "SESSION_SECRET has rotation: true: it is replaced in three passes, `"+ctl+" secrets rotate SESSION_SECRET --stage --dir "+e.dir+"` first")
 	if err := rotate(RotateStage); err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +163,7 @@ func TestASecretWithoutRotationIsReplacedOnDocker(t *testing.T) {
 	}
 	for _, pass := range []string{RotateStage, RotateSwap, RotateFinish} {
 		if err := e.installer(nil).RotateSecret(context.Background(), "SESSION_SECRET", pass); err == nil ||
-			err.Error() != "SESSION_SECRET has replace: true: `notes-stow secrets rotate SESSION_SECRET` replaces it in one pass, without --stage or --finish" {
+			err.Error() != "SESSION_SECRET has replace: true: `"+filepath.Join(e.dir, "notes-stow")+" secrets rotate SESSION_SECRET --dir "+e.dir+"` replaces it in one pass, without --stage or --finish" {
 			t.Errorf("%s: %v", pass, err)
 		}
 	}
@@ -231,13 +241,20 @@ func TestDockersReplaceRefusesBeforeItAsks(t *testing.T) {
 		t.Fatal(err)
 	}
 	for args, want := range map[string]string{
-		"SESSION_SECRET --yes":   "--yes, --no-input and --accessible confirm the one pass of a secret with replace: true, which SESSION_SECRET is not: leave them out",
-		"SESION_SECRET --yes":    "SESION_SECRET is no secret of notes (secrets: SESSION_SECRET, POSTGRES_PASSWORD, OTHER_TOKEN)",
-		"OTHER_TOKEN --no-input": "secrets rotate OTHER_TOKEN replaces it at once, and --no-input asks nothing: give --yes",
+		"SESSION_SECRET --yes":            "--yes, --no-input and --accessible confirm the one pass of a secret with replace: true, which SESSION_SECRET is not: leave them out",
+		"SESION_SECRET --yes":             "SESION_SECRET is no secret of notes (secrets: SESSION_SECRET, POSTGRES_PASSWORD, OTHER_TOKEN)",
+		"OTHER_TOKEN --no-input":          "secrets rotate OTHER_TOKEN replaces it at once, and --no-input asks nothing: give --yes",
+		"SESSION_SECRET --stage --finish": "--stage and --finish are two passes: give one",
 	} {
-		if err := run(append([]string{"secrets", "rotate"}, strings.Fields(args)...)...); err == nil || err.Error() != want {
+		// Each a refusal: exit 3, nothing changed.
+		if err := run(append([]string{"secrets", "rotate"}, strings.Fields(args)...)...); err == nil || err.Error() != want || !isRefused(err) {
 			t.Errorf("%s: %v", args, err)
 		}
+	}
+	// The fix of an unconfirmed one pass runs as given: the install's installer, its directory named.
+	err := run("secrets", "rotate", "OTHER_TOKEN", "--no-input")
+	if r, _ := Refusal(err); r.Fix != filepath.Join(e.dir, "notes-stow")+" secrets rotate OTHER_TOKEN --yes --dir "+e.dir {
+		t.Errorf("--no-input's fix: %q", r.Fix)
 	}
 }
 
@@ -303,7 +320,7 @@ func TestASecretRotatesInThreePassesOnKubernetes(t *testing.T) {
 		t.Fatalf("rollouts:\n%q\nwant\n%q", restarted, want)
 	}
 	e.stored(got, ours)
-	if err := e.installer(nil).K8sRotateSecret(context.Background(), "SESSION_SECRET", RotateFinish); err == nil || !strings.Contains(err.Error(), "is staged, not in use") {
+	if err := e.installer(nil).K8sRotateSecret(context.Background(), "SESSION_SECRET", RotateFinish); err == nil || !strings.Contains(err.Error(), "is staged, not in use: `notes-stow k8s secrets rotate SESSION_SECRET --namespace notes --release notes` puts it in use first") || !isRefused(err) {
 		t.Fatalf("--finish while staged: %v", err)
 	}
 	e.runs("0.9.0", 1)
@@ -363,5 +380,35 @@ func TestK8sUpgradeRecordsTheAcceptedValueOfARotation(t *testing.T) {
 	}
 	if got := e.secretData("notes-stowage"); got["SESSION_SECRET_ACCEPTED"] != "staged" || got["SESSION_SECRET_NEXT"] != "staged" {
 		t.Fatalf("%v", got)
+	}
+}
+
+// The command a hint names runs as given: through a shell, Docker's directory with a space and
+// Kubernetes's namespace, release and context reach the installer as one argument each; the VM's
+// runs as root.
+func TestSecretsCmdRunsAsGiven(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "my app")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := testutil.WriteExecutable(filepath.Join(dir, "notes-stow"), []byte("#!/bin/sh\nfor a; do printf '%s\\n' \"$a\"; done\n")); err != nil {
+		t.Fatal(err)
+	}
+	r := &Release{Spec: &spec.Spec{Name: "notes"}}
+	in := &Installer{R: r, O: Options{Dir: dir, K8s: K8sOptions{Namespace: "my ns", Release: "notes prod", Context: "a ctx"}}}
+	for shape, want := range map[string][]string{
+		onDocker: {"secrets", "rotate", "K", "--yes", "--dir", dir},
+		onK8s:    {"k8s", "secrets", "rotate", "K", "--yes", "--namespace", "my ns", "--release", "notes prod", "--kube-context", "a ctx"},
+	} {
+		cmd := exec.Command("sh", "-c", in.secretsCmd(shape, "rotate K --yes"))
+		cmd.Env = []string{"PATH=" + dir + ":/usr/bin:/bin"}
+		out, err := cmd.Output()
+		if got := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n"); err != nil || !slices.Equal(got, want) {
+			t.Errorf("%s: %q run by a shell gave %q (%v), want %q", shape, in.secretsCmd(shape, "rotate K --yes"), got, err, want)
+		}
+	}
+	if got := in.secretsCmd(onVM, "rotate K --yes"); got != "sudo notes-stow secrets rotate K --yes" {
+		t.Errorf("the VM's: %s", got)
 	}
 }

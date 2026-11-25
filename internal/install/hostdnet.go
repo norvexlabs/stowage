@@ -1565,12 +1565,12 @@ func (h *Hostd) setNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	next, err := f.valid(req.NetConfig)
 	if err != nil {
-		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		replyErr(w, refuseRequest(err))
 		return
 	}
 	secs, err := revertSecs(req.RevertSecs)
 	if err != nil {
-		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		replyErr(w, refuseRequest(err))
 		return
 	}
 	h.netMu.Lock()
@@ -1879,7 +1879,7 @@ func (h *Hostd) resetNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	secs, err := revertSecs(req.RevertSecs)
 	if err != nil {
-		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		replyErr(w, refuseRequest(err))
 		return
 	}
 	h.netMu.Lock()

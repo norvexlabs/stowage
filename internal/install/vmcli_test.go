@@ -1261,10 +1261,15 @@ func TestSecretsRotateOverTheSocket(t *testing.T) {
 	}
 	// Refused before a job: a key without rotation, a pass of none.
 	h := daemon(e, &fakeHost{}).Handler()
-	for _, req := range []SecretRotateRequest{{Key: "POSTGRES_PASSWORD", Pass: RotateStage}, {Key: "POSTGRES_PASSWORD", Pass: RotateReplace}, {Key: "SESSION_SECRET", Pass: RotateReplace}, {Key: "SESSION_SECRET", Pass: "twice"}} {
+	// Each is a refusal (the client exits 3), the rotation's fix carried where it has one.
+	for _, c := range []struct {
+		req SecretRotateRequest
+		fix string
+	}{{SecretRotateRequest{Key: "POSTGRES_PASSWORD", Pass: RotateStage}, ""}, {SecretRotateRequest{Key: "POSTGRES_PASSWORD", Pass: RotateReplace}, ""},
+		{SecretRotateRequest{Key: "SESSION_SECRET", Pass: RotateReplace}, "sudo notes-stow secrets rotate SESSION_SECRET --stage"}, {SecretRotateRequest{Key: "SESSION_SECRET", Pass: "twice"}, ""}} {
 		var e400 errOf
-		if code := call(t, h, "POST", "/v1/secrets/rotate", req, &e400); code != 400 {
-			t.Errorf("%+v: %d %s", req, code, e400.Error)
+		if code := call(t, h, "POST", "/v1/secrets/rotate", c.req, &e400); code != 400 || !e400.Refused || e400.Fix != c.fix {
+			t.Errorf("%+v: %d %+v, want a refusal fixed by %q", c.req, code, e400, c.fix)
 		}
 	}
 	// Not while the health gate judges the boot.
@@ -1331,6 +1336,8 @@ func TestSecretReplacedOverTheSocket(t *testing.T) {
 	old := get("SESSION_SECRET")
 	if out, err := ctl(e, sock, "secrets", "rotate", "SESSION_SECRET"); err == nil || !strings.Contains(err.Error(), "there is no terminal to answer: give --yes") || get("SESSION_SECRET") != old {
 		t.Fatalf("unconfirmed: %v\n%s", err, out)
+	} else if r, refused := Refusal(err); !refused || r.Fix != "sudo notes-stow secrets rotate SESSION_SECRET --yes" {
+		t.Errorf("unconfirmed: %v is no refusal (exit 1, not 3) fixed by the VM's command: %+v", err, r)
 	}
 	// No secret has rotation: true: the passes' flag is not offered, and the daemon's refusal of a
 	// pass names the VM's command as its operator types it.
@@ -1370,12 +1377,12 @@ func TestConfirmReplaceAsksOnce(t *testing.T) {
 	t.Parallel()
 	for answer, want := range map[string]error{"no": ErrAborted, "yes": nil} {
 		p := &fakePrompter{answers: map[string]string{"confirm": answer}}
-		err := confirmReplace(context.Background(), func(bool) Prompter { return p }, false, false, "SESSION_SECRET")
+		err := confirmReplace(context.Background(), func(bool) Prompter { return p }, false, false, "notes-stow secrets rotate SESSION_SECRET --yes", "SESSION_SECRET")
 		if !errors.Is(err, want) || err != nil && want == nil || len(p.forms) != 1 || !strings.Contains(p.forms[0].Questions[0].Title, "Replace SESSION_SECRET now?") {
 			t.Errorf("%s: %v, %d forms", answer, err, len(p.forms))
 		}
 	}
-	if err := confirmReplace(context.Background(), func(bool) Prompter { t.Fatal("asked with --yes"); return nil }, true, false, "K"); err != nil {
+	if err := confirmReplace(context.Background(), func(bool) Prompter { t.Fatal("asked with --yes"); return nil }, true, false, "notes-stow secrets rotate K --yes", "K"); err != nil {
 		t.Error(err)
 	}
 }

@@ -747,8 +747,9 @@ func TestTheDaemonRefusesAResetOfAnotherReleaseAtOnce(t *testing.T) {
 	for _, method := range []string{"GET", "POST"} {
 		var refused errOf
 		if code := call(t, d.Handler(), method, "/v1/reset-db", ResetRequest{Confirm: &Version{"1.0.0", 1}}, &refused); code != 409 ||
-			!strings.Contains(refused.Error, "the install runs notes 1.0.0 (revision 1), not this OS's notes 1.0.0 (revision 2)") {
-			t.Fatalf("%s: %d %s", method, code, refused.Error)
+			!strings.Contains(refused.Error, "the install runs notes 1.0.0 (revision 1), not this OS's notes 1.0.0 (revision 2)") ||
+			!refused.Refused || refused.Fix != "" {
+			t.Fatalf("%s: %d %+v", method, code, refused)
 		}
 	}
 	if n := len(e.docker.ran("compose")) + resetVolumeCalls(e); n != 0 {

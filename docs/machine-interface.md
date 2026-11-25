@@ -200,9 +200,24 @@ share; each shape's own fields and verbs are on its page:
     or `KIT_TLS_*` for the target's front), `check` whether `kit check` can prove a kit taken; `[]`
     when none. A program issuing a kit reads it to build the request, and to tell the keys a kit
     gives from the ones it gives itself.
+  - `secrets`: the secrets the release generates (`secrets` in its spec), in the spec's order,
+    each `{key, rotate, settable, as_file}` — never a value. `rotate` and `settable` hold one key
+    per shape the release declares (`shapes`'s names): `rotate` is how `secrets rotate KEY` changes
+    the secret there — `passes` (`rotation: true`: `--stage`, the swap, `--finish`), `replace`
+    (`replace: true`: one pass, `--yes` to confirm without a terminal; Docker and `kairos` alone,
+    as `k8s secrets rotate` takes the three passes alone) or `none` (refused, exit 3); `settable`
+    whether `secrets set` records a value the operator chooses there (`settable: true`; never on
+    `kubernetes`, which has no `secrets set`). `as_file` is whether a service reads it from a
+    file. `[]` when none. A program rotating a secret reads it to pick the passes on its shape, or
+    to refuse a key before it runs one:
+    ```json
+    { "key": "SESSION_SECRET", "rotate": { "docker": "replace", "kubernetes": "none" },
+      "settable": { "docker": false, "kubernetes": false }, "as_file": false }
+    ```
   Without `--json`, a `route` line per route (`route     NAME (loopback port N)`), an `l4 route`
   line per L4 route (`l4 route  NAME (PROTOCOL/PORT)`), a `handoff` line per handoff
-  (`handoff   NAME (for PROJECT, gives KEY,…[, checked])`), `registry  PREFIX` and `stowage   VERSION`
+  (`handoff   NAME (for PROJECT, gives KEY,…[, checked])`), a `secret` line per secret
+  (`secret    KEY (rotate SHAPE=WAY …[, settable SHAPE,…][, as file])`), `registry  PREFIX` and `stowage   VERSION`
   (the Stowage that built the installer; left out when its manifest records none) come before
   `first install only: …`.
 
@@ -332,7 +347,14 @@ share; each shape's own fields and verbs are on its page:
   half restored; a directory with another project's `compose.yaml`, or that became an install
   meanwhile; a re-run given `--secrets`, or a first-install-only setting (`--address`,
   `--registry`, `--registry-ca`); `--secrets` with `--given` or `--kit`; a re-run by the
-  installer of another release than the one installed; a required input missing, or a value its
+  installer of another release than the one installed; `secrets rotate` of a key the release does not
+  rotate on the shape (`describe`'s `rotate` `none`), a pass that key does not take, or a pass out
+  of order (the fix names the pass to run first), and its one
+  pass with no terminal to confirm it and without `--yes`, or with `--no-input` and without
+  `--yes`, `--stage` with `--finish`, and `--yes`, `--no-input` or `--accessible` on a key with no
+  one pass; `secrets set` of a key without `settable: true`, or a value it cannot record (empty,
+  over 4096 bytes, a quote or a line break), or with no terminal to ask it on and nothing piped;
+  `secrets show` to no terminal; `secrets export` without `--recipient`, or with one that is not an age public key; a required input missing, or a value its
   input refuses; ports in use, a front port that is an L4 route's, an L4 route bound to an
   address the host does not have, an existing `tls/`, and `--ports`/`--address` or
   `--http-port`/`--https-port` in the wrong TLS mode; an operator's "no" at a prompt (`aborted`);

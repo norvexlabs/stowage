@@ -572,7 +572,7 @@ func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := validBackup(c, pg); err != nil {
-		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		replyErr(w, refuseRequest(err))
 		return
 	}
 	if err := h.checkSchedule(r.Context(), c.Schedule); err != nil {
@@ -696,7 +696,13 @@ func (h *Hostd) checkSchedule(ctx context.Context, s string) error {
 		return nil // no timer takes it: kept, unchecked
 	}
 	if _, err := h.Host.Run(ctx, Cmd{Args: []string{"systemd-analyze", "calendar", "--iterations", "1", "--", s}}); err != nil {
-		return fail(http.StatusBadRequest, "schedule %q is not a systemd calendar event (e.g. %q): %v", s, defaultBackupSchedule, err)
+		// systemd judged it (it exited saying it cannot parse it): refused; the check that did not
+		// run, that a signal cut (ExitCode -1) or that failed otherwise (an option an older
+		// systemd-analyze lacks), a failure.
+		if ec := (interface{ ExitCode() int })(nil); errors.As(err, &ec) && ec.ExitCode() > 0 && strings.Contains(err.Error(), "Failed to parse calendar specification") {
+			return refuseAs(http.StatusBadRequest, "", "schedule %q is not a systemd calendar event (e.g. %q): %v", s, defaultBackupSchedule, err)
+		}
+		return fail(http.StatusInternalServerError, "schedule %q: systemd-analyze could not check it: %v", s, err)
 	}
 	return nil
 }
@@ -764,13 +770,19 @@ func (h *Hostd) backupResume() {
 		c = &BackupConfig{Schedule: defaultBackupSchedule}
 	}
 	if c != nil && c.Schedule != defaultBackupSchedule {
-		err := validSchedule(c.Schedule)
+		// A schedule judged wrong falls back to the default; one the check could not judge (it
+		// did not run, a signal cut it) is kept, as its config was checked when it was saved.
+		err, judged := validSchedule(c.Schedule), true
 		if err == nil {
 			err = h.checkSchedule(h.ctx, c.Schedule)
+			_, judged = Refusal(err)
 		}
-		if err != nil {
+		switch {
+		case err != nil && judged:
 			h.O.logf("backup schedule: %v: the timer runs on the default, %s", err, defaultBackupSchedule)
 			c = &BackupConfig{Schedule: defaultBackupSchedule}
+		case err != nil:
+			h.O.logf("backup schedule: %v: the timer keeps it, unchecked", err)
 		}
 	}
 	if c != nil {
@@ -1641,7 +1653,7 @@ func (h *Hostd) proposedBackup(req BackupConfigRequest, app bool) (*Installer, *
 	}
 	c := mergeBackup(cur, req, pg)
 	if _, err := validBackup(c, pg); err != nil {
-		return nil, nil, fail(http.StatusBadRequest, "%v", err)
+		return nil, nil, refuseRequest(err)
 	}
 	return in, &c, nil
 }

@@ -108,6 +108,70 @@ func TestEveryHandoffFieldIsDecidedInDescribe(t *testing.T) {
 	}
 }
 
+// describeSecretFields maps each field of spec.Secret to the JSON key describe gives it, or "" for
+// one it leaves out on purpose (how a value is generated is the release's own).
+var describeSecretFields = map[string]string{"Key": "key", "Gen": "", "Rotation": "rotate", "Replace": "rotate",
+	"Settable": "settable", "AsFile": "as_file"}
+
+func TestEverySecretFieldIsDecidedInDescribe(t *testing.T) {
+	t.Parallel()
+	var keys []string
+	for f := range reflect.TypeFor[DescribedSecret]().Fields() {
+		keys = append(keys, f.Tag.Get("json"))
+	}
+	for f := range reflect.TypeFor[spec.Secret]().Fields() {
+		key, ok := describeSecretFields[f.Name]
+		switch {
+		case !ok:
+			t.Errorf("spec.Secret.%s: describe neither carries it nor leaves it out on purpose: map it in describeSecretFields", f.Name)
+		case key != "" && !slices.Contains(keys, key):
+			t.Errorf("spec.Secret.%s maps to %q, which DescribedSecret has not", f.Name, key)
+		}
+	}
+	for _, key := range keys {
+		if !slices.Contains(slices.Collect(maps.Values(describeSecretFields)), key) {
+			t.Errorf("DescribedSecret prints %q, which no field of spec.Secret maps to", key)
+		}
+	}
+	// Each way on each shape: Kubernetes takes the three passes alone, and has no `secrets set`.
+	secrets := []spec.Secret{{Key: "P", Gen: "hex32", Rotation: true}, {Key: "R", Gen: "hex32", Replace: true},
+		{Key: "S", Gen: "pass18", Settable: true, AsFile: true}}
+	every := spec.Shapes{Docker: &spec.DockerShape{}, Kubernetes: &spec.K8sShape{}, Kairos: &spec.KairosShape{}}
+	got := Describe(&Release{Spec: &spec.Spec{Secrets: secrets, Shapes: every}, Manifest: &release.Manifest{}}).Secrets
+	no := map[string]bool{onDocker: false, onK8s: false, onVM: false}
+	want := []DescribedSecret{
+		{Key: "P", Rotate: map[string]string{onDocker: RotatePasses, onK8s: RotatePasses, onVM: RotatePasses}, Settable: no},
+		{Key: "R", Rotate: map[string]string{onDocker: RotateReplace, onK8s: RotateNone, onVM: RotateReplace}, Settable: no},
+		{Key: "S", Rotate: map[string]string{onDocker: RotateNone, onK8s: RotateNone, onVM: RotateNone},
+			Settable: map[string]bool{onDocker: true, onK8s: false, onVM: true}, AsFile: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Describe's secrets = %+v, want %+v", got, want)
+	}
+	// What describe says is what the verbs do: a way rotation takes on each shape, the others refused.
+	in := &Installer{R: &Release{Spec: &spec.Spec{Name: "notes", Secrets: secrets, Shapes: every}}}
+	for _, ds := range got {
+		for shape, way := range ds.Rotate {
+			for _, pass := range []string{RotateStage, RotateSwap, RotateFinish, RotateReplace} {
+				_, err := in.rotation(shape, ds.Key, pass)
+				if takes := way == RotateReplace && pass == RotateReplace || way == RotatePasses && pass != RotateReplace; takes != (err == nil) {
+					t.Errorf("%s on %s, pass %s: describe says %s, rotation says %v", ds.Key, shape, pass, way, err)
+				}
+				if _, refused := Refusal(err); err != nil && !refused {
+					t.Errorf("%s on %s, pass %s: %v is no refusal (exit 1, not 3)", ds.Key, shape, pass, err)
+				}
+			}
+		}
+	}
+	if _, err := in.rotation(onDocker, "NOPE", RotateReplace); err == nil {
+		t.Error("an unknown key: rotation took it")
+	} else if _, refused := Refusal(err); !refused {
+		t.Errorf("an unknown key: %v is no refusal", err)
+	}
+	if got := Describe(&Release{Spec: &spec.Spec{}, Manifest: &release.Manifest{}}).Secrets; got == nil {
+		t.Error("Describe's secrets without any: nil, want [] (a reader's list)")
+	}
+}
+
 // examples/full, which uses every input key, described as its installer would.
 func TestDescribeFull(t *testing.T) {
 	t.Parallel()

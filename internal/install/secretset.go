@@ -3,7 +3,6 @@ package install
 import (
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -27,30 +26,33 @@ func (in *Installer) settable(key string) (spec.Secret, error) {
 			names = append(names, s.Key)
 		}
 	}
-	return spec.Secret{}, fmt.Errorf("%s is no secret with settable: true (settable: %s)", key, cmp.Or(strings.Join(names, ", "), "none"))
+	return spec.Secret{}, refuse("", "%s is no secret with settable: true (settable: %s)", key, cmp.Or(strings.Join(names, ", "), "none"))
 }
 
 // checkSetSecret refuses a value `secrets set` cannot record.
 func checkSetSecret(v string) error {
 	switch {
 	case v == "":
-		return errors.New("the value is empty: give one on standard input")
+		return refuse("", "the value is empty: give one on standard input")
 	case len(v) > maxSetSecret:
-		return fmt.Errorf("the value is over %d bytes", maxSetSecret)
+		return refuse("", "the value is over %d bytes", maxSetSecret)
 	}
-	return spec.CheckEnvValue(v)
+	if err := spec.CheckEnvValue(v); err != nil {
+		return refusal("", err)
+	}
+	return nil
 }
 
 // checkSetValue refuses a value the settable secret key cannot take: checkSetSecret's, and, for
 // the password of a front route's login, one bcrypt cannot take (the route would refuse everyone).
 func (in *Installer) checkSetValue(key, v string) error {
 	if err := checkSetSecret(v); err != nil {
-		return fmt.Errorf("%s: %w", key, err)
+		return refusal("", fmt.Errorf("%s: %w", key, err))
 	}
 	for _, r := range in.R.Spec.Front.Routes {
 		if r.BasicAuth != nil && r.BasicAuth.Secret == key {
 			if err := checkLoginPassword(v); err != nil {
-				return fmt.Errorf("%s, route %s's login password, %w", key, r.Name, err)
+				return refusal("", fmt.Errorf("%s, route %s's login password, %w", key, r.Name, err))
 			}
 		}
 	}

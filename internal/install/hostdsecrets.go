@@ -62,7 +62,7 @@ func (h *Hostd) exportSecrets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := parseRecipients(req.Recipients, maxRecipients); err != nil {
-		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		replyErr(w, refuseRequest(err))
 		return
 	}
 	// The secrets are the ones the install's release names: those of another release (after a
@@ -89,7 +89,7 @@ func (h *Hostd) exportSecrets(w http.ResponseWriter, r *http.Request) {
 func (h *Hostd) osRelease(env *EnvFile, verb string) error {
 	m := h.R.Manifest
 	if name, v, rev := runs(env); name != m.Name || !isAt(m.ProjectVersion, m.Revision, v, rev) {
-		return fail(http.StatusConflict, "the install runs %s %s (revision %s), not this OS's %s %s: %s runs on the release the OS carries", name, v, rev, m.Name, Version{m.ProjectVersion, m.Revision}, verb)
+		return refuseAs(http.StatusConflict, "", "the install runs %s %s (revision %s), not this OS's %s %s: %s runs on the release the OS carries", name, v, rev, m.Name, Version{m.ProjectVersion, m.Revision}, verb)
 	}
 	return nil
 }
@@ -107,7 +107,7 @@ func (h *Hostd) rotateSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !slices.Contains([]string{RotateStage, RotateSwap, RotateFinish, RotateReplace}, req.Pass) {
-		replyErr(w, fail(http.StatusBadRequest, "pass %q: %s, %s, %s or %s", req.Pass, RotateStage, RotateSwap, RotateFinish, RotateReplace))
+		replyErr(w, refusal("", fail(http.StatusBadRequest, "pass %q: %s, %s, %s or %s", req.Pass, RotateStage, RotateSwap, RotateFinish, RotateReplace)))
 		return
 	}
 	in, _ := h.run()
@@ -122,8 +122,8 @@ func (h *Hostd) rotateSecret(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	if _, err := in.rotation(req.Key, req.Pass); err != nil {
-		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+	if _, err := in.rotation(onVM, req.Key, req.Pass); err != nil {
+		replyErr(w, failAs(http.StatusBadRequest, err))
 		return
 	}
 	// Not while the health gate judges the boot: the restarts could fail its deadline.
@@ -170,11 +170,11 @@ func (h *Hostd) setSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := in.settable(req.Key); err != nil {
-		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		replyErr(w, failAs(http.StatusBadRequest, err))
 		return
 	}
 	if err := in.checkSetValue(req.Key, req.Value); err != nil {
-		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		replyErr(w, failAs(http.StatusBadRequest, err))
 		return
 	}
 	// Not while the health gate judges the boot: the restarts could fail its deadline.
@@ -224,12 +224,12 @@ func (h *Hostd) showSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := in.settable(req.Key); err != nil {
-		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		replyErr(w, failAs(http.StatusBadRequest, err))
 		return
 	}
 	v, err := recordedSecret(env.Get, req.Key, "the install")
 	if err != nil {
-		replyErr(w, fail(http.StatusNotFound, "%v", err))
+		replyErr(w, failAs(http.StatusNotFound, err))
 		return
 	}
 	reply(w, http.StatusOK, SecretShown{Value: v})

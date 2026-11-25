@@ -903,6 +903,15 @@ func failAs(code int, err error) error {
 	return he
 }
 
+// refuseRequest is err, a request's value the daemon cannot take (its body as given), refused
+// 400: nothing changed, and the same request is refused again.
+func refuseRequest(err error) error {
+	if _, ok := Refusal(err); ok {
+		return failAs(http.StatusBadRequest, err)
+	}
+	return refusal("", fail(http.StatusBadRequest, "%v", err))
+}
+
 // refuseAs is a refusal answered with code, its fix fix and its message format's.
 func refuseAs(code int, fix, format string, a ...any) error {
 	return refusal(fix, fail(code, format, a...))
@@ -918,8 +927,17 @@ func decodeBodyUpTo(w http.ResponseWriter, r *http.Request, v any, limit int64) 
 	dec.DisallowUnknownFields()
 	var over *http.MaxBytesError
 	if err := dec.Decode(v); errors.As(err, &over) {
-		return fail(http.StatusRequestEntityTooLarge, "the request body is over the %d bytes it may be", limit)
+		return refuseAs(http.StatusRequestEntityTooLarge, "", "the request body is over the %d bytes it may be", limit)
 	} else if err != nil && !errors.Is(err, io.EOF) {
+		// A body that is no request (its JSON, a field's type, an unknown field) is refused; one
+		// whose read was cut short is a failure, which the same request may not meet again.
+		var syntax *json.SyntaxError
+		var typ *json.UnmarshalTypeError
+		// encoding/json gives an unknown field no type: its message is matched, which
+		// TestDecodeBodyRefusesWhatIsNoRequest holds to the toolchain's wording.
+		if errors.As(err, &syntax) || errors.As(err, &typ) || strings.HasPrefix(err.Error(), "json: unknown field ") {
+			return refuseAs(http.StatusBadRequest, "", "the request body: %v", err)
+		}
 		return fail(http.StatusBadRequest, "the request body: %v", err)
 	}
 	return nil
@@ -1495,7 +1513,7 @@ type ResetPlan struct {
 // a release other than the OS's, whose installer the job runs.
 func (h *Hostd) resetCheck(ctx context.Context, in *Installer) (ResetPlan, error) {
 	if err := in.hasDatabase("reset-db has nothing to reset"); err != nil {
-		return ResetPlan{}, fail(http.StatusConflict, "%v", err)
+		return ResetPlan{}, failAs(http.StatusConflict, err)
 	}
 	env, err := h.installed(in)
 	if err != nil {
@@ -1652,7 +1670,7 @@ func (h *Hostd) resetPlan(ctx context.Context, in *Installer, req ResetPlanReque
 		wipe, keep, _, _, err = t.wipeSet(in)
 	}
 	if err != nil {
-		return ResetPlan{}, nil, "", fail(http.StatusConflict, "%v", err)
+		return ResetPlan{}, nil, "", failAs(http.StatusConflict, err)
 	}
 	if len(wipe) == 0 {
 		return ResetPlan{}, nil, "", fail(http.StatusConflict, "neither %s %s nor %s %s names a volume in data.reset: --new-baseline has nothing to wipe", m.Name, h.R.Manifest.ProjectVersion, m.Name, m.ProjectVersion)

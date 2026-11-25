@@ -149,7 +149,7 @@ func TestSecretsExportRefusals(t *testing.T) {
 		{[]string{"a\nb"}, "one age public key"},
 		{strings.Fields(strings.Repeat("x ", 17)), "recipients: 1 to 16"},
 	} {
-		if _, err := e.installer(nil).ExportSecrets(c.list); err == nil || !strings.Contains(err.Error(), c.want) {
+		if _, err := e.installer(nil).ExportSecrets(c.list); err == nil || !strings.Contains(err.Error(), c.want) || !isRefused(err) {
 			t.Errorf("%q: %v", c.list, err)
 		}
 	}
@@ -183,7 +183,7 @@ func TestTheSecretsVerbsWriteAFileOfTheOperatorsOwn(t *testing.T) {
 	if _, err := run("secrets", "export", "--recipient", key.Recipient().String(), "-o", out); err == nil || !errors.Is(err, os.ErrExist) {
 		t.Errorf("over a file: %v", err)
 	}
-	if _, err := run("secrets", "export"); err == nil || !strings.Contains(err.Error(), "--recipient is required") {
+	if _, err := run("secrets", "export"); err == nil || !strings.Contains(err.Error(), "--recipient is required") || !isRefused(err) {
 		t.Errorf("no recipient: %v", err)
 	}
 }

@@ -216,12 +216,15 @@ func TestDescribeTextRoutes(t *testing.T) {
 	d := Description{Name: "notes", Registry: "ghcr.io/acme/notes",
 		Routes:   []DescribedRoute{{Name: "app", LoopbackPort: 8080}, {Name: "bare"}},
 		L4Routes: []DescribedL4Route{{Name: "db", Protocol: "tcp", Port: 5432}},
-		Handoffs: []DescribedHandoff{{Name: "client", For: "atlas", Gives: []string{"A", "B"}, Check: true}, {Name: "bare", For: "x", Gives: []string{"C"}}}}
+		Handoffs: []DescribedHandoff{{Name: "client", For: "atlas", Gives: []string{"A", "B"}, Check: true}, {Name: "bare", For: "x", Gives: []string{"C"}}},
+		Shapes:   []string{onDocker, onK8s},
+		Secrets: []DescribedSecret{{Key: "S", Rotate: map[string]string{onDocker: RotateReplace, onK8s: RotateNone}, Settable: map[string]bool{onDocker: true}, AsFile: true},
+			{Key: "N", Rotate: map[string]string{onDocker: RotateNone, onK8s: RotateNone}}}}
 	var b bytes.Buffer
 	if err := d.print(&b); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"\nroute     app (loopback port 8080)\n", "\nroute     bare\n", "\nl4 route  db (tcp/5432)\n", "\nhandoff   client (for atlas, gives A,B, checked)\n", "\nhandoff   bare (for x, gives C)\n", "\nregistry  ghcr.io/acme/notes\nfirst install only: "} {
+	for _, want := range []string{"\nroute     app (loopback port 8080)\n", "\nroute     bare\n", "\nl4 route  db (tcp/5432)\n", "\nhandoff   client (for atlas, gives A,B, checked)\n", "\nhandoff   bare (for x, gives C)\n", "\nsecret    S (rotate docker=replace kubernetes=none, settable docker, as file)\n", "\nsecret    N (rotate docker=none kubernetes=none)\nregistry  ghcr.io/acme/notes\nfirst install only: "} {
 		if !strings.Contains(b.String(), want) {
 			t.Errorf("no %q in:\n%s", want, b.String())
 		}

@@ -50,8 +50,12 @@ func TestASettableSecretIsSetOnDocker(t *testing.T) {
 		{"SESSION_SECRET", strings.Repeat("a", maxSetSecret+1), "over 4096 bytes"},
 		{"SESSION_SECRET", "it's", "single quote"},
 	} {
-		if err := set(c.key, c.v); err == nil || !strings.Contains(err.Error(), c.want) {
+		err := set(c.key, c.v)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s=%.10q: %v", c.key, c.v, err)
+		}
+		if _, refused := Refusal(err); !refused {
+			t.Errorf("%s=%.10q: %v is no refusal (exit 1, not 3)", c.key, c.v, err)
 		}
 		if e.file(".env") != before || ups() != 0 {
 			t.Fatalf("a refused set changed .env or started the stack")
@@ -114,10 +118,10 @@ func TestSecretsSetOnTheDockerCLI(t *testing.T) {
 	if c, _, err := command().Find([]string{"secrets", "set"}); err != nil || c.Name() != "set" {
 		t.Fatalf("no secrets set: %v", err)
 	}
-	if err := run("", "secrets", "set", "SESSION_SECRET"); err == nil || !strings.Contains(err.Error(), "SESSION_SECRET: the value is empty") {
+	if err := run("", "secrets", "set", "SESSION_SECRET"); err == nil || !strings.Contains(err.Error(), "SESSION_SECRET: the value is empty") || !isRefused(err) {
 		t.Errorf("no value: %v", err)
 	}
-	if err := run("v\n", "secrets", "set", "POSTGRES_PASSWORD"); err == nil || !strings.Contains(err.Error(), "settable: SESSION_SECRET") {
+	if err := run("v\n", "secrets", "set", "POSTGRES_PASSWORD"); err == nil || !strings.Contains(err.Error(), "settable: SESSION_SECRET") || !isRefused(err) {
 		t.Errorf("not settable: %v", err)
 	}
 }
@@ -268,5 +272,18 @@ func TestALoginPasswordSetIsOneBcryptTakes(t *testing.T) {
 	want := "SESSION_SECRET, route " + e.r.Spec.Front.Routes[0].Name + "'s login password, is 73 bytes, over the 72 bcrypt takes"
 	if err := in.checkSetValue("SESSION_SECRET", strings.Repeat("a", maxLoginPassword+1)); err == nil || err.Error() != want {
 		t.Errorf("past it: %v", err)
+	}
+}
+
+// A value `secrets set` cannot record, read from standard input, is refused (exit 3) before the
+// key is judged.
+func TestReadSetSecretRefuses(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{"", "\n", "it's"} {
+		if _, err := readSetSecret(strings.NewReader(in)); err == nil {
+			t.Errorf("%q: read", in)
+		} else if _, refused := Refusal(err); !refused {
+			t.Errorf("%q: %v is no refusal (exit 1, not 3)", in, err)
+		}
 	}
 }

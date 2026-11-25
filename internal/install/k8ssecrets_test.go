@@ -101,7 +101,7 @@ func TestK8sSecretsExportRefusals(t *testing.T) {
 	rcpt := []string{key.Recipient().String()}
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
 	// A key refused before the cluster is read.
-	if _, err := e.installer(nil).K8sExportSecrets(context.Background(), []string{"age1nope"}); err == nil || !strings.Contains(err.Error(), `recipient "age1nope" is not an age public key`) || len(e.f.calls) > 0 {
+	if _, err := e.installer(nil).K8sExportSecrets(context.Background(), []string{"age1nope"}); err == nil || !strings.Contains(err.Error(), `recipient "age1nope" is not an age public key`) || !isRefused(err) || len(e.f.calls) > 0 {
 		t.Errorf("a bad key: %v %q", err, e.f.calls)
 	}
 	if _, err := e.installer(nil).K8sExportSecrets(context.Background(), rcpt); err == nil || !strings.Contains(err.Error(), "no release notes in notes") {

@@ -104,7 +104,7 @@ func parseRecipients(list []string, max int) ([]age.Recipient, error) {
 func encryptSecrets(f *SecretsFile, ctl string, recipients []string) ([]byte, error) {
 	recips, err := parseRecipients(recipients, maxRecipients)
 	if err != nil {
-		return nil, err
+		return nil, refusal("", err) // the keys given: nothing changed
 	}
 	raw, err := yaml.Marshal(f)
 	if err != nil {

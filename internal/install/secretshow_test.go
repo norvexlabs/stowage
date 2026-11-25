@@ -51,7 +51,7 @@ func TestSecretsShowOnTheDockerCLI(t *testing.T) {
 		t.Errorf("another release: %v", err)
 	}
 	onTerminal(t, false)
-	if out, err := run("secrets", "show", "SESSION_SECRET"); err == nil || !strings.Contains(err.Error(), "standard output is no terminal") || strings.Contains(out, want) {
+	if out, err := run("secrets", "show", "SESSION_SECRET"); err == nil || !strings.Contains(err.Error(), "standard output is no terminal") || !isRefused(err) || strings.Contains(out, want) {
 		t.Errorf("off a terminal: %q %v", out, err)
 	}
 }

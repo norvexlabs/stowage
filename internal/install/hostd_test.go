@@ -247,6 +247,15 @@ func asApp(t *testing.T, e *env) http.Handler {
 
 // errOf is an error answer's message.
 // errOf is the daemon's error answer: its message, and a refusal's fix.
+// exitCodeErr is a command's exit with code, as exec's ExitError reports it.
+type exitCodeErr struct {
+	code int
+	msg  string
+}
+
+func (e exitCodeErr) Error() string { return e.msg }
+func (e exitCodeErr) ExitCode() int { return e.code }
+
 type errOf struct {
 	Error, Fix string
 	Refused    bool
@@ -870,8 +879,9 @@ func TestPowerTakesABoundedDrainAndHappensOnce(t *testing.T) {
 	if fmt.Sprint(host.calls()) != "[[systemctl reboot]]" {
 		t.Errorf("ran %v", host.calls())
 	}
-	if code := call(t, hh, "POST", "/v1/reboot", map[string]any{"drain": 1}, nil); code != 400 {
-		t.Errorf("an unknown field: %d", code)
+	var unknown errOf
+	if code := call(t, hh, "POST", "/v1/reboot", map[string]any{"drain": 1}, &unknown); code != 400 || !unknown.Refused {
+		t.Errorf("an unknown field: %d %+v, want a refusal", code, unknown)
 	}
 }
 
@@ -1260,5 +1270,37 @@ func TestAnUpgradeBeforeTheFirstInstall(t *testing.T) {
 	h.Docker = true
 	if code := call(t, h.Handler(), "GET", "/v1/updates", nil, &e); code != 409 || !strings.Contains(e.Error, "not installed yet") {
 		t.Errorf("Docker: %d %s", code, e.Error)
+	}
+}
+
+// A handler giving an error its code keeps a refusal one: its fix and absent reach the client,
+// which exits 3; any other error stays a failure.
+func TestFailAsKeepsARefusal(t *testing.T) {
+	t.Parallel()
+	r := absent("install first", "no install")
+	got, ok := Refusal(failAs(http.StatusBadRequest, fmt.Errorf("wrapped: %w", r)))
+	if !ok || got.Fix != "install first" || !got.Absent || got.Reason != "wrapped: no install" {
+		t.Errorf("a refusal: %+v %v", got, ok)
+	}
+	var he httpError
+	if err := failAs(http.StatusConflict, r); !errors.As(err, &he) || he.code != http.StatusConflict {
+		t.Errorf("the code: %v", err)
+	}
+	if _, ok := Refusal(failAs(http.StatusBadRequest, errors.New("broken"))); ok {
+		t.Error("a failure became a refusal")
+	}
+}
+
+// A body that is no request is refused, the same request refused again; one cut short is a
+// failure.
+func TestDecodeBodyRefusesWhatIsNoRequest(t *testing.T) {
+	t.Parallel()
+	var v struct{ Key string }
+	for body, refused := range map[string]bool{`{"key": 1}`: true, `{"nope": 1}`: true, `{"key"`: false, `{"key":`: false, `nope`: true} {
+		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		err := decodeBodyUpTo(httptest.NewRecorder(), r, &v, 1024)
+		if _, ok := Refusal(err); err == nil || ok != refused {
+			t.Errorf("%s: %v, refused %v, want %v", body, err, ok, refused)
+		}
 	}
 }

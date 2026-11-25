@@ -471,7 +471,7 @@ func TestTheDaemonExportsTheSecretsEncrypted(t *testing.T) {
 		t.Errorf("%+v", f)
 	}
 	var e400 errOf
-	if code := call(t, d.Handler(), "POST", "/v1/secrets/export", SecretsExportRequest{}, &e400); code != 400 || !strings.Contains(e400.Error, "recipients: 1 to 16") {
+	if code := call(t, d.Handler(), "POST", "/v1/secrets/export", SecretsExportRequest{}, &e400); code != 400 || !e400.Refused || !strings.Contains(e400.Error, "recipients: 1 to 16") {
 		t.Errorf("no recipient: %d %s", code, e400.Error)
 	}
 	// An OS of another release reads another spec: its list of secrets is not the install's.
@@ -1234,7 +1234,7 @@ func TestTheDaemonRefusesAResetOfAnotherProject(t *testing.T) {
 	d.R = &r
 	e.docker.calls = nil
 	var refused errOf
-	if code := call(t, d.Handler(), "GET", "/v1/reset-db", nil, &refused); code != 409 ||
+	if code := call(t, d.Handler(), "GET", "/v1/reset-db", nil, &refused); code != 409 || !refused.Refused || refused.Fix != "" ||
 		!strings.Contains(refused.Error, "the install runs notes 1.0.0 (revision 1), not this OS's crm 1.0.0 (revision 1): reset-db runs on the release the OS carries") {
 		t.Fatalf("%d %s", code, refused.Error)
 	}
