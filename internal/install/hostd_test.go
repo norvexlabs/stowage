@@ -87,6 +87,9 @@ func (f *fakeHost) Run(ctx context.Context, c Cmd) ([]byte, error) {
 			}
 			return []byte("LoadState=loaded\nActiveState=active\n"), nil
 		case "notes.service":
+			if f.boot == "<error>" {
+				return nil, errors.New("Failed to connect to bus")
+			}
 			st = f.boot
 		case "notes-health.service":
 			if f.judge == "<error>" {
@@ -307,6 +310,14 @@ func TestStatusBeforeAndAfterTheInstall(t *testing.T) {
 	st = Status{}
 	if code := call(t, daemon(e, hb).Handler(), "GET", "/v1/status", nil, &st); code != 200 || !st.Installing || st.InstallFailed != "" {
 		t.Fatalf("retried by the boot: %d %+v", code, st)
+	}
+	// Queued, it is retried too; inactive with nothing queued (stopped, a dependency failed), the
+	// boot has ended (boot_settled) and the failure recorded stands.
+	for boot, failed := range map[string]string{"queued": "", "inactive": "the stack did not come up"} {
+		st = Status{}
+		if code := call(t, daemon(e, &fakeHost{boot: boot}).Handler(), "GET", "/v1/status", nil, &st); code != 200 || st.InstallFailed != failed {
+			t.Errorf("boot unit %s: %d %+v", boot, code, st)
+		}
 	}
 }
 
@@ -1064,7 +1075,7 @@ func TestTheBootMustHaveRun(t *testing.T) {
 	e := installedVM(t)
 	host := &fakeHost{}
 	hh := daemon(e, host).Handler()
-	for state, want := range map[string]int{"inactive": 409, "activating": 409, "deactivating": 409, "active": 200, "failed": 200, noBootUnit: 200} {
+	for state, want := range map[string]int{"queued": 409, "inactive": 200, "activating": 409, "deactivating": 409, "active": 200, "failed": 200, noBootUnit: 200} {
 		host.mu.Lock()
 		host.boot = state
 		host.mu.Unlock()

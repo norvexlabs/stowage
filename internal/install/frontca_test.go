@@ -231,7 +231,7 @@ func TestARestoredFrontCAIsRecordedLineByLine(t *testing.T) {
 	t.Parallel()
 	cert, key := testRoot(t, true)
 	e := frontCAEnv(t, nil)
-	plain, _ := yaml.Marshal(SecretsFile{Project: "notes", Secrets: map[string]string{}, FrontCA: &FrontCA{Cert: strings.TrimSuffix(string(cert), "\n"), Key: strings.TrimSuffix(string(key), "\n")}})
+	plain, _ := yaml.Marshal(SecretsFile{Project: "notes", Export: true, Secrets: map[string]string{}, FrontCA: &FrontCA{Cert: strings.TrimSuffix(string(cert), "\n"), Key: strings.TrimSuffix(string(key), "\n")}})
 	in := e.installer(func(o *Options) { o.Secrets = plain })
 	f, err := in.readSecrets(plain)
 	if err != nil {
@@ -253,7 +253,7 @@ func TestAFrontCALoadThatFailsIsTriedAgain(t *testing.T) {
 	t.Parallel()
 	cert, key := testRoot(t, true)
 	e := frontCAEnv(t, nil)
-	plain, err := yaml.Marshal(SecretsFile{Project: "notes", Secrets: map[string]string{}, FrontCA: &FrontCA{Cert: string(cert), Key: string(key)}})
+	plain, err := yaml.Marshal(SecretsFile{Project: "notes", Export: true, Secrets: map[string]string{}, FrontCA: &FrontCA{Cert: string(cert), Key: string(key)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestASecretsFileWithABadFrontCAIsRefused(t *testing.T) {
 	e := newEnv(t)
 	cert, _ := testRoot(t, true)
 	_, other := testRoot(t, true)
-	plain, _ := yaml.Marshal(SecretsFile{Project: "notes", Secrets: map[string]string{}, FrontCA: &FrontCA{Cert: string(cert), Key: string(other)}})
+	plain, _ := yaml.Marshal(SecretsFile{Project: "notes", Export: true, Secrets: map[string]string{}, FrontCA: &FrontCA{Cert: string(cert), Key: string(other)}})
 	if _, err := e.installer(nil).readSecrets(plain); err == nil || !strings.Contains(err.Error(), "--secrets: front_ca: the key does not go with the certificate") {
 		t.Errorf("%v", err)
 	}

@@ -851,6 +851,22 @@ func TestTheTimersRunSkipsAVMNotInstalled(t *testing.T) {
 	}
 }
 
+// While the boot brings the install up, the timer's run is refused, not skipped: its unit fails,
+// and systemd runs it again once the boot ended (Restart=on-failure), so no day's backup is lost.
+func TestTheTimersRunFailsWhileTheBootRuns(t *testing.T) {
+	t.Parallel()
+	_, d, _, key := backupVM(t)
+	configure(t, d, validConfig(key))
+	host := d.Host.(*fakeHost)
+	host.mu.Lock()
+	host.boot = "activating"
+	host.mu.Unlock()
+	var e errOf
+	if code := call(t, d.Handler(), "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &e); code != 409 || !strings.Contains(e.Error, "the boot is still bringing the install up") {
+		t.Errorf("%d %s", code, e.Error)
+	}
+}
+
 // The timer's run fails on an install it cannot read: only one not made yet is skipped.
 func TestTheTimersRunFailsOnAnUnreadableInstall(t *testing.T) {
 	t.Parallel()
@@ -1768,7 +1784,7 @@ func TestVMStatusSaysMadeAgain(t *testing.T) {
 	e := vmEnv(t, "1.0.0")
 	if err := e.install(func(o *Options) {
 		vm(o)
-		o.Secrets = []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\n")
+		o.Secrets = []byte("project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: s3cr3t\n")
 	}); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}

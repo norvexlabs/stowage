@@ -31,7 +31,7 @@ func (in *Installer) K8sExportSecrets(ctx context.Context, recipients []string) 
 	if err != nil {
 		return nil, err
 	}
-	f := &SecretsFile{Project: in.R.Spec.Name, Secrets: map[string]string{}}
+	f := newExport(in.R.Spec.Name)
 	for _, k := range sortedKeys(rec) {
 		if v := rec[k]; v != "" && in.secretKey(k) {
 			f.Secrets[k] = v

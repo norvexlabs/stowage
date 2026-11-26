@@ -302,10 +302,13 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   socket the daemon serves (this one and the app socket) is made as `.<socket>.<pid>` beside it,
   given its owner and mode, then renamed into place: it appears listening, already restricted, and
   a daemon stopping removes it unless a restarted one replaced it. Until
-  `<name>.service` ran (its state is `active` or `failed`: before, the boot is queued, or is
-  installing, upgrading or going back; a host without that unit has no boot to wait for), `upgrade`, `rollback`, `provision` and `restart`/`stop`/`start` are
-  refused; `upgrade` and `rollback` also until `<name>-health.service` judged the boot (its state
-  is `active` or `failed`). `restart`/`stop`/`start`, `reboot` and `shutdown` are refused while an install,
+  `<name>.service` ran (its state is `active` or `failed`, or `inactive` with no start queued —
+  skipped, stopped, or a dependency failed — as `status --json`'s `boot_settled` judges it: before,
+  the boot is queued, or is installing, upgrading or going back; a host without that unit has no boot to wait for), `upgrade`, `rollback`, `provision`,
+  `restart`/`stop`/`start`, `backup run`, `kit create` and `kit check`, `reset-db`, `secrets rotate`, `secrets set`,
+  `restore` and `restore --input` are refused; `upgrade`, `rollback`, `reset-db`, `secrets rotate`, `secrets set`,
+  `restore` and `restore --input` also until `<name>-health.service` judged the boot (its state
+  is `active` or `failed`, or `inactive` with no start queued, by the same rule). `restart`/`stop`/`start`, `reboot` and `shutdown` are refused while an install,
   upgrade, rollback or provision holds the install's lock — but `reboot` and `shutdown` are not
   while the boot runs, so a hung boot can be power-cycled (the next boot finishes what it
   stopped). The boot waits up to 10 minutes for an operator's run to release the lock. A verb
@@ -595,7 +598,15 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   (<error>)`, or `; putting the boot assessment back failed too, so the next boot may choose the
   passive system (<grubenv>): <error>` — read with `<short>-stow events`. It is refused for a release other than the one confirmed.
 - `health` answers whether the install is ready, as the health gate judges it (every service up,
-  the health provider's answer); not ready, it fails with the reason. Requests (`health`, `GET
+  the health provider's answer); not ready, it fails with the reason. Until the boot is over, as
+  `status --json`'s `boot_settled` judges it ([machine interface](machine-interface.md)), it is not
+  ready, with no check: while `<name>.service` runs (`the boot is still bringing the install up
+  (<name>.service is <state>)`), then until `<name>-health.service` ended (`the health gate has
+  not judged this boot yet (<name>-health.service is <state>)`), `<state>` the unit's
+  `ActiveState` (`activating`, or `inactive` with its start queued); a state systemd does not
+  answer leaves the verdict to the check. Ready thus means the verbs the boot and the gate refuse
+  meanwhile (listed under the host daemon above) are not refused for them. Each request reads the
+  two units' state; the check itself is shared, as follows. Requests (`health`, `GET
   health` on either socket) arriving while a check runs share it, and its verdict answers them
   for 5 s after it ended, unless a job started or ended or a service verb ran since it began: a
   poll starts no check (with the `command` provider, a container) per request. A check ends,
@@ -1343,7 +1354,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
     encrypted: the volumes' archives first, in the release's order, the dump (or the manifest)
     last; each 0600, owned by 0:0, timed as its name says, so the same backup always exports the
     same bytes. `tar -t` lists it, and each object extracts and decrypts with `age -d` as a
-    destination's does.
+    destination's does: each object is binary age, not armored (the secrets export is armored).
   - `restore --input FILE|- --identity FILE` restores such an archive, confirmed as `restore
     OBJECT` is (`--input -`: standard input is the archive, so an identity file and `--yes` are
     required, refused before anything is sent; `restore OBJECT` and `--input` together, or

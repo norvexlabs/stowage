@@ -49,7 +49,8 @@ over SSH from your machine takes its host key with `--known-hosts-line`.
   names, else it is refused: `--channel C: the registry P holds no release of <name> on C (this
   release is on <channel>)`), and its own: `--await-secrets` (the first install waits for a decrypted
   `secrets export`, given over SSH once the VM answers, `sudo <short>-stow install --secrets -
-  --no-input`, as `vm create --secrets` makes it; a machine made again), `--tls byo` (it waits
+  --no-input`, as `vm create --secrets` makes it; a machine made again, or a new install's
+  secrets file without `export: true`, a plain install: see `--secrets` in [installer](installer.md)), `--tls byo` (it waits
   for the certificate, its key and CA, and the secret inputs, given over SSH, `sudo <short>-stow
   install --given - --no-input`, its front serving that certificate; the release must offer
   `byo`), and `--disk-dir DIR` (an existing directory `--platform`'s disk is written into,
@@ -488,7 +489,7 @@ over SSH from your machine takes its host key with `--known-hosts-line`.
   SSH from here, unless the VM sees this machine at another address (NAT, a VPN). The
   administrator logs in with the SSH key alone: there is no password, on SSH or the console.
   `--secrets FILE` (`-` for standard input) is a decrypted `secrets export` file, a machine made
-  again: checked as `install --secrets` checks it before anything else, it is never written into
+  again (or a new install's secrets file without `export: true`, a plain install): checked as `install --secrets` checks it before anything else, it is never written into
   the cloud-config, whose settings say the first install waits for it (`await_secrets: true`); a
   secret input it holds is not named as due. The secrets go over SSH to a host key known
   beforehand: `vm create` generates a one-time ed25519 host key, which the cloud-config carries

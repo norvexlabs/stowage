@@ -1098,7 +1098,7 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	st.BootSettled = h.Docker || (bootErr == nil && unitEnded(boot, bootQueued) && h.gateDone(r.Context()))
 	if err := bootErr; err == nil {
 		switch {
-		case !unitDone(boot):
+		case !unitEnded(boot, bootQueued):
 			st.InstallFailed = ""
 		case boot == "failed" && st.Installed == nil:
 			st.InstallFailed = fmt.Sprintf("the boot's install failed before it wrote the install (`journalctl -u %s` tells why)", m.Name)
@@ -1940,17 +1940,17 @@ func (h *Hostd) rewrites(m *release.Manifest, env *EnvFile) bool {
 		isAt(this.ProjectVersion, this.Revision, v, rev)
 }
 
-// booting refuses until <name>.service ran (active, or failed): before, the boot is queued or is
-// installing, upgrading or going back. A host without the unit has no boot to wait for.
+// booting refuses while the boot runs (bootRunning): it is queued, or is installing, upgrading or
+// going back. A host without the unit has no boot to wait for.
 func (h *Hostd) booting(ctx context.Context) error {
 	if h.Docker {
 		return nil // no boot unit: the install is brought up by the installer
 	}
-	st, err := h.bootState(ctx)
+	st, running, err := h.bootRunning(ctx)
 	if err != nil {
 		return err
 	}
-	if !unitDone(st) {
+	if running {
 		return notNowErr{fail(http.StatusConflict, "the boot is still bringing the install up (%s.service is %s): wait for it", h.R.Spec.Name, st), "wait for the boot to bring the install up, then run again"}
 	}
 	return nil
@@ -1966,12 +1966,13 @@ func (h *Hostd) judged(ctx context.Context) error {
 		return err
 	}
 	unit := h.R.Spec.Name + "-health.service"
-	st, err := unitState(ctx, h.Host, unit)
+	st, queued, err := unitStatus(ctx, h.Host, unit)
 	if err != nil {
 		return err
 	}
-	// RemainAfterExit: a judged boot leaves the gate active, or failed.
-	if !unitDone(st) {
+	// RemainAfterExit: a judged boot leaves the gate active, or failed; one skipped or stopped
+	// (inactive, nothing queued) judges nothing more in this boot, as boot_settled says.
+	if !unitEnded(st, queued) {
 		return notNowErr{fail(http.StatusConflict, "the health gate has not judged this boot yet (%s is %s): wait for it, or `systemctl start %s` if it does not run", unit, st, unit), "wait for the health gate's judgement of this boot, then run again"}
 	}
 	return nil
@@ -1986,6 +1987,20 @@ func unitDone(st string) bool { return st == "active" || st == "failed" || st ==
 // or never started as a dependency of it failed.
 func unitEnded(st string, queued bool) bool { return unitDone(st) || (st == "inactive" && !queued) }
 
+// unsettled is why the boot is not over, as status's boot_settled judges it — the boot unit runs
+// (bootRunning), or the health gate after it did not end — or empty once it is, or when a unit's
+// state cannot be read.
+func (h *Hostd) unsettled(ctx context.Context) string {
+	if st, running, _ := h.bootRunning(ctx); running {
+		return fmt.Sprintf("the boot is still bringing the install up (%s.service is %s)", h.R.Spec.Name, st)
+	}
+	unit := h.R.Spec.Name + "-health.service"
+	if st, queued, err := unitStatus(ctx, h.Host, unit); err == nil && !unitEnded(st, queued) {
+		return fmt.Sprintf("the health gate has not judged this boot yet (%s is %s)", unit, st)
+	}
+	return ""
+}
+
 // gateDone reports whether the health gate's unit ran to an end in this boot.
 func (h *Hostd) gateDone(ctx context.Context) bool {
 	st, queued, err := unitStatus(ctx, h.Host, h.R.Spec.Name+"-health.service")
@@ -1994,6 +2009,14 @@ func (h *Hostd) gateDone(ctx context.Context) bool {
 
 // noBootUnit is bootState's answer on a host without <name>.service.
 const noBootUnit = "not-found"
+
+// bootRunning reports <name>.service's state, and whether the boot still runs: not ended as
+// status's boot_settled judges it (unitEnded), so health, the verbs booting refuses and
+// boot_settled agree on when a boot is over.
+func (h *Hostd) bootRunning(ctx context.Context) (string, bool, error) {
+	st, queued, err := unitStatus(ctx, h.Host, h.R.Spec.Name+".service")
+	return st, err == nil && !unitEnded(st, queued), err
+}
 
 // bootState is <name>.service's ActiveState, or noBootUnit when systemd has no such unit.
 func (h *Hostd) bootState(ctx context.Context) (string, error) {

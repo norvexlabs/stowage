@@ -44,6 +44,49 @@ func TestHealthOverTheAPI(t *testing.T) {
 	if code := call(t, h, "GET", "/v1/health", nil, &got); code != 200 || got.Ready || !strings.Contains(got.Reason, "answered 503") {
 		t.Errorf("%d %+v", code, got)
 	}
+	// While the boot brings the install up: not ready, whatever the stack answers, with no check;
+	// once the boot unit ended (failed too, as booting judges it), the check answers again.
+	host := &fakeHost{boot: "activating"}
+	bd := daemon(e, host)
+	bd.Probe = (&prober{status: 200}).client(t)
+	if code := call(t, bd.Handler(), "GET", "/v1/health", nil, &got); code != 200 || got.Ready || got.Reason != "the boot is still bringing the install up (notes.service is activating)" {
+		t.Errorf("booting: %d %+v", code, got)
+	}
+	host.boot = "queued"
+	if code := call(t, bd.Handler(), "GET", "/v1/health", nil, &got); code != 200 || got.Ready || got.Reason != "the boot is still bringing the install up (notes.service is inactive)" {
+		t.Errorf("queued: %d %+v", code, got)
+	}
+	// Ended as boot_settled judges it: active, failed, or inactive with no start queued (skipped,
+	// stopped); a state that cannot be read leaves the verdict to the check.
+	// The gate after it: not ready until it ended, as boot_settled and the verbs judged guards.
+	host.boot = "active"
+	for gate, why := range map[string]string{"activating": "(notes-health.service is activating)", "queued": "(notes-health.service is inactive)"} {
+		host.judge = gate
+		if code := call(t, bd.Handler(), "GET", "/v1/health", nil, &got); code != 200 || got.Ready || got.Reason != "the health gate has not judged this boot yet "+why {
+			t.Errorf("gate %s: %d %+v", gate, code, got)
+		}
+		if err := bd.judged(context.Background()); err == nil {
+			t.Errorf("gate %s: judged", gate)
+		}
+	}
+	for _, gate := range []string{"inactive", "<error>"} { // skipped or stopped; not read
+		host.judge = gate
+		if code := call(t, bd.Handler(), "GET", "/v1/health", nil, &got); code != 200 || !got.Ready {
+			t.Errorf("gate %s: %d %+v", gate, code, got)
+		}
+	}
+	host.judge = "inactive"
+	if err := bd.judged(context.Background()); err != nil {
+		t.Errorf("a skipped gate: %v", err)
+	}
+	host.judge = ""
+	for _, st := range []string{"active", "failed", "inactive", "<error>"} {
+		host.boot = st
+		got = Health{}
+		if code := call(t, bd.Handler(), "GET", "/v1/health", nil, &got); code != 200 || !got.Ready {
+			t.Errorf("boot unit %s: %d %+v", st, code, got)
+		}
+	}
 	// Before the install.
 	var e409 errOf
 	if code := call(t, daemon(vmEnv(t, "1.0.0"), &fakeHost{}).Handler(), "GET", "/v1/health", nil, &e409); code != 409 {
@@ -536,7 +579,7 @@ func TestRollbackRefusals(t *testing.T) {
 			_ = os.WriteFile(filepath.Join(d.Run, osWritten), nil, 0o600)
 		},
 			RollbackRequest{}, "an upgrade wrote (or began to write)"},
-		"gate queued": {func(t *testing.T, e *env, d *Hostd, h *fakeHost) { h.judge = "inactive" }, RollbackRequest{},
+		"gate queued": {func(t *testing.T, e *env, d *Hostd, h *fakeHost) { h.judge = "queued" }, RollbackRequest{},
 			"has not judged this boot yet (notes-health.service is inactive): wait for it, or `systemctl start notes-health.service`"},
 		"judging": {func(t *testing.T, e *env, d *Hostd, h *fakeHost) { h.judge = "activating" }, RollbackRequest{},
 			"the health gate has not judged this boot yet"},

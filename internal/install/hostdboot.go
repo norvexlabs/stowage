@@ -115,6 +115,16 @@ func (h *Hostd) assessment() assessment {
 }
 
 func (h *Hostd) health(w http.ResponseWriter, r *http.Request) {
+	// Not ready until the boot is over (boot_settled): what the boot refuses meanwhile (a backup,
+	// an upgrade until the gate judged it) is refused by the same rules (booting, judged), so a
+	// ready answer is one they run on. A unit whose state cannot be read leaves it to the check.
+	// Each request reads the units' state; the check alone is shared.
+	if !h.Docker {
+		if why := h.unsettled(r.Context()); why != "" {
+			reply(w, http.StatusOK, Health{Reason: why})
+			return
+		}
+	}
 	h.healthMu.Lock()
 	c := h.healthRun
 	if !h.reusable(c, time.Now()) {

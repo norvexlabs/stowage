@@ -101,6 +101,17 @@ Cloud alone proven.
 
 ## Should
 
+- **Whether `--secrets` makes an install made again, before it runs**: the provider reads a
+  `secrets_wo`'s `export: true` at plan (with `restore`), as the installer says `made_again` only
+  once the install ran. `install --secrets - --dry-run --json` answering it (and the provider
+  reading that) would end the provider's copy of the rule.
+
+- **Removing backups kept on the host**: once `backup config` moves from `keep_local` to a
+  destination, the backups already kept stay in the install's directory, listed as `local`,
+  never pruned and with no verb to remove them, so they hold the data partition (and drive its
+  disk-pressure hook) until someone deletes files by hand. A `backup remove OBJECT` (a local one;
+  refused for a destination's) on Docker and the VM, or pruning the kept ones when the mode
+  changes, with `status` naming the space they take.
 - **Encrypted data on the Kairos shape**: `COS_PERSISTENT` (the app's data, its volumes, the
   install's secrets) encrypted by Kairos's kcrypt — a spec key carried to the install's config,
   the installer ISO's install and the disks' first boot (`kcrypt.encrypt_on_boot`, to prove),

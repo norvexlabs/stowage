@@ -621,7 +621,9 @@ func TestDockerStatusJSONRestoreAndVolumes(t *testing.T) {
 	}
 	// An install made by --secrets says so, from its first write.
 	again := newEnv(t)
-	if err := again.install(func(o *Options) { o.Secrets = []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\n") }); err != nil {
+	if err := again.install(func(o *Options) {
+		o.Secrets = []byte("project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: s3cr3t\n")
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if st, out := statusOf(t, again, nil); !st.MadeAgain || !st.RestoreAwaited {

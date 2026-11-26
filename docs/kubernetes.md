@@ -347,7 +347,8 @@ the current directory. A release with no chart (published without the shape) is 
   the environment), a key that is no secret of the release on Kubernetes (a Docker-only input,
   the Cloudflare token) is left out and said, and a `front_ca` is left out and said. Refused
   before the cluster changes: a file still encrypted, one of another project, an unknown field,
-  over 1 MiB, a provision value that is no variable name or that a variable cannot hold, beside
+  over 1 MiB, a provision value that is no variable name or that a variable cannot hold, provision
+  values or a `front_ca` in a file without `export: true` (a new install's secrets, not an export), beside
   `--given` or `--kit`, or naming standard input with `--registry-login-file -`; and the Secret
   `<release>-stowage` already there (an install that stopped, or one uninstalled, kept it: a
   first install reuses it, so leave out `--secrets`, or `kubectl delete secret <release>-stowage`

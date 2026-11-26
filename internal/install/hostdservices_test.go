@@ -254,7 +254,7 @@ func TestServiceWatchLogsTheGatesRefusal(t *testing.T) {
 	}
 	st := &stackOf{}
 	e.docker.answer = st.answer
-	host := &fakeHost{judge: "inactive"}
+	host := &fakeHost{judge: "queued"}
 	h := daemon(e, host)
 	ctx := context.Background()
 	w := &serviceLooks{}

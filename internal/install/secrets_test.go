@@ -64,7 +64,7 @@ func TestSecretsExportedComeBackOnAMachineMadeAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The generated secrets, the secret input, the hook's record; nothing that is not a secret.
-	if f.Project != "notes" || f.Secrets["SESSION_SECRET"] != get(was, "SESSION_SECRET") || f.Secrets["POSTGRES_PASSWORD"] != get(was, "POSTGRES_PASSWORD") ||
+	if f.Project != "notes" || !f.Export || f.Secrets["SESSION_SECRET"] != get(was, "SESSION_SECRET") || f.Secrets["POSTGRES_PASSWORD"] != get(was, "POSTGRES_PASSWORD") ||
 		f.Secrets["SMTP_PASSWORD"] != "smtp-pw" || f.Provision["ADMIN_PASSWORD"] != "hook-pw" || len(f.Secrets) != 3 {
 		t.Fatalf("exported %+v", f)
 	}
@@ -192,7 +192,7 @@ func TestTheSecretsVerbsWriteAFileOfTheOperatorsOwn(t *testing.T) {
 func TestASecretsInstallWaitsForItsDataBeforeTheHook(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	plain := []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\nprovision:\n  ADMIN_KEY: key-of-the-old-data\n")
+	plain := []byte("project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: s3cr3t\nprovision:\n  ADMIN_KEY: key-of-the-old-data\n")
 	if err := e.install(func(o *Options) { o.Secrets = plain }); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
@@ -243,7 +243,7 @@ func TestASecretsInstallWaitsForItsDataBeforeTheHook(t *testing.T) {
 func TestASecretsInstallWithoutTheHookStillWaitsAndResetDBEndsTheWait(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	plain := []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\nprovision:\n  ADMIN_KEY: key-of-the-old-data\n")
+	plain := []byte("project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: s3cr3t\nprovision:\n  ADMIN_KEY: key-of-the-old-data\n")
 	if err := e.install(func(o *Options) { o.Secrets = plain; o.NoProvision = true }); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
@@ -270,7 +270,7 @@ func TestASecretsInstallWithoutTheHookStillWaitsAndResetDBEndsTheWait(t *testing
 func TestASecretsInstallWhoseStackFailsStillWaitsAndOneWithoutValuesToo(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	plain := []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\nprovision:\n  ADMIN_KEY: key-of-the-old-data\n")
+	plain := []byte("project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: s3cr3t\nprovision:\n  ADMIN_KEY: key-of-the-old-data\n")
 	e.docker.upErr = errors.New("a port is taken")
 	if err := e.install(func(o *Options) { o.Secrets = plain }); err == nil {
 		t.Fatal("the install succeeded with its stack failing")
@@ -283,7 +283,9 @@ func TestASecretsInstallWhoseStackFailsStillWaitsAndOneWithoutValuesToo(t *testi
 	}
 	// A file holding no provision values is a machine made again too: it awaits its data.
 	e2 := newEnv(t)
-	if err := e2.install(func(o *Options) { o.Secrets = []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\n") }); err != nil {
+	if err := e2.install(func(o *Options) {
+		o.Secrets = []byte("project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: s3cr3t\n")
+	}); err != nil {
 		t.Fatalf("%v\n%s", err, e2.log)
 	}
 	if _, err := os.Stat(filepath.Join(e2.dir, restoreAwaitedFile)); err != nil || len(e2.hookCalls()) != 0 {
@@ -303,7 +305,7 @@ func TestASecretsInstallWhoseStackFailsStillWaitsAndOneWithoutValuesToo(t *testi
 // runs no backups, the file holding no provision values: nothing a restore could load, no wait.
 func TestASecretsInstallWithoutAHook(t *testing.T) {
 	t.Parallel()
-	secretsOnly := []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\n")
+	secretsOnly := []byte("project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: s3cr3t\n")
 	e := newEnv(t)
 	e.r.Spec.Hooks.Provision = nil
 	if !providers.RunsBackups(e.r.Spec) {
@@ -337,7 +339,7 @@ func TestASecretsInstallWithoutAHook(t *testing.T) {
 		t.Fatalf("a release without backups waits: %v, %d hook runs", err, len(e2.hookCalls()))
 	}
 	// Neither a hook nor backups: provision values the file holds are left out, nothing awaited.
-	withValues := []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\nprovision:\n  ADMIN_KEY: old\n")
+	withValues := []byte("project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: s3cr3t\nprovision:\n  ADMIN_KEY: old\n")
 	e3 := newEnv(t)
 	e3.r.Spec.Backup, e3.r.Spec.Hooks.Provision = nil, nil
 	if err := e3.install(func(o *Options) { o.Secrets = withValues }); err != nil {
@@ -358,6 +360,51 @@ func TestASecretsInstallWithoutAHook(t *testing.T) {
 	// A release without a hook that runs backups says it waits, at the install.
 	if !strings.Contains(e.log.String(), "an install made again by --secrets awaits its data: `") {
 		t.Fatalf("the wait unsaid:\n%s", e.log)
+	}
+}
+
+// A secrets file without export: true is a new install's secrets a deployment seeds: the install
+// takes them and is a plain one — not made again, awaiting nothing, on a release that runs backups
+// and has a hook. Provision values in such a file are refused before anything is written.
+func TestASeededSecretsFileMakesAPlainInstall(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	if !providers.RunsBackups(e.r.Spec) || e.r.Spec.Hooks.Provision == nil {
+		t.Fatal("the test release runs no backups or has no hook")
+	}
+	if err := e.install(func(o *Options) { o.Secrets = []byte("project: notes\nsecrets:\n  SESSION_SECRET: seeded\n") }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if got := get(e.readEnv(), "SESSION_SECRET"); got != "seeded" {
+		t.Fatalf("SESSION_SECRET = %q", got)
+	}
+	for _, f := range []string{madeAgainFile, restoreAwaitedFile} {
+		if _, err := os.Stat(filepath.Join(e.dir, f)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s written for a seeded file: %v", f, err)
+		}
+	}
+	// Said, with the way on for an export written before the mark.
+	if !strings.Contains(e.log.String(), "--secrets: a new install's secrets (no export: true): a plain install, not made again") ||
+		!strings.Contains(e.log.String(), "give it no backup settings, add the line `export: true` to the file, and make the machine again from it") {
+		t.Fatalf("not said:\n%s", e.log)
+	}
+	cert, key := testRoot(t, true)
+	ca, _ := yaml.Marshal(SecretsFile{Project: "notes", Secrets: map[string]string{}, FrontCA: &FrontCA{Cert: string(cert), Key: string(key)}})
+	for name, file := range map[string][]byte{
+		"provision":              []byte("project: notes\nsecrets:\n  SESSION_SECRET: seeded\nprovision:\n  ADMIN_KEY: x\n"),
+		"front_ca":               ca,
+		"provision and front_ca": append(append([]byte{}, ca...), []byte("provision:\n  ADMIN_KEY: x\n")...),
+	} {
+		e2 := newEnv(t)
+		err := e2.install(func(o *Options) { o.Secrets = file })
+		if err == nil || !strings.Contains(err.Error(), "--secrets: "+name+": only a secrets export (export: true) gives "+name+", with its data") || !strings.Contains(err.Error(), "add the line `export: true`; for a new install's file, remove "+name) {
+			t.Fatalf("%s in a seeded file: %v", name, err)
+		}
+		for _, f := range []string{".env", madeAgainFile, restoreAwaitedFile, ProvisionEnv} {
+			if _, err := os.Stat(filepath.Join(e2.dir, f)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s: a refused file wrote %s: %v", name, f, err)
+			}
+		}
 	}
 }
 
@@ -395,7 +442,9 @@ func TestAFailedFirstWriteRemovesItsRecords(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(e.dir, InputFilesDir), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := e.install(func(o *Options) { o.Secrets = []byte("project: notes\nsecrets:\n  SESSION_SECRET: s3cr3t\n") })
+	err := e.install(func(o *Options) {
+		o.Secrets = []byte("project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: s3cr3t\n")
+	})
 	if err == nil || fileExists(filepath.Join(e.dir, envName)) {
 		t.Fatalf("the first write did not fail: %v", err)
 	}

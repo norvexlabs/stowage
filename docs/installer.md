@@ -704,12 +704,23 @@ refusal is the verb's Result.
   front's image, running or not; a front that made none yet is exported without it, said, and one
   that cannot be read — Docker down, the image gone — is a warning: the secrets are exported
   without it, and a machine made again from them issues from a new root), as
-  YAML (`project`, `secrets`, `provision`, `front_ca: {cert, key}`), encrypted to those age public
-  keys and ASCII-armored, into `-o` (default `<name>-secrets.age`, 0600, never over a file; `-`
+  YAML (`project`, `export: true`, `secrets`, `provision`, `front_ca: {cert, key}`), encrypted to those age public
+  keys and ASCII-armored (a text file, to mail or paste; a backup's objects are binary age, as a
+  large stream is; `age --decrypt` reads both), into `-o` (default `<name>-secrets.age`, 0600, never over a file; `-`
   for standard output). No private key is needed on the machine; keep the file off it.
   `age --decrypt -i KEY <name>-secrets.age > secrets.yaml` gives what `--secrets` takes back.
-- `--secrets FILE` (`-` for standard input) makes a first install with those decrypted secrets,
-  a machine made again: every generated secret the file holds is taken, not generated (one it
+- `--secrets FILE` (`-` for standard input) makes a first install with those decrypted secrets.
+  A file without `export: true` is a new install's secrets a deployment writes itself (`project`,
+  `secrets`: a generated secret's value, a secret input): they are taken, as below, and the
+  install is a plain one (no `made_again`, nothing awaited), which the run says (`--secrets: a new
+  install's secrets (no export: true): a plain install, not made again`), with the way on for an
+  export a release built with Stowage 0.48.0 or earlier wrote, which lacks the mark: the install
+  made from it is a plain one, whose backups run once configured, so give it no backup settings,
+  add the line `export: true` to the file, and make the machine again from it (`uninstall`
+  this install, or create the VM again: `--secrets` is refused on an install that exists). `provision` or
+  `front_ca` in a file without the mark is refused (they come with an export's data), naming both
+  ways on: the line for an export, removing them for a new install's file. An export (`export: true`) makes a
+  machine made again: every generated secret the file holds is taken, not generated (one it
   lacks is generated, and the run says so); its secret inputs are given (under `--set` and
   `--answers`, over the environment); what the hook returned is written to `provision.env`
   before the stack starts, so the hook's next run is given it. Those values belong to the old
@@ -727,7 +738,7 @@ refusal is the verb's Result.
   with neither a hook nor backups awaits nothing. While it awaits, no backup is taken (a timer's
   run and `backup run` are refused naming the way on, an upgrade takes none first): it would store
   an empty machine beside the old one's backups. `status --json` says `made_again` for every
-  install made by `--secrets`. The front's
+  install made by `--secrets` from an export. The front's
   local CA the file holds is recorded (`.stowage-front-ca`, 0600) for an install in the
   `internal` mode (in another, it is left out, said), and put in the front's data volume before
   the front first starts: a front container already there is removed, the root and its key
@@ -735,7 +746,7 @@ refusal is the verb's Result.
   again from the root), then the record deleted; a start that fails before keeps it, and the
   next start (a re-run) does it. So every client that trusted the old root (a browser, a
   service `publish_ca` gives it to) still trusts the new machine. Refused: a file still encrypted,
-  one of another project, an unknown field, over 1 MiB, a `front_ca` whose certificate is not a
+  one of another project, an unknown field, `provision` or `front_ca` without `export: true`, over 1 MiB, a `front_ca` whose certificate is not a
   CA's or whose key is not its own, and `--secrets` on an install that
   exists (it keeps its own). A key that is no secret of the release is left out, and said.
   Docker and the Kairos VM; on Kubernetes, `k8s secrets export` writes the same file and `k8s

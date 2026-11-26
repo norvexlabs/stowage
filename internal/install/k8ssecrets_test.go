@@ -74,7 +74,7 @@ func TestK8sSecretsExportComesBackOnDocker(t *testing.T) {
 	if err := yaml.Unmarshal(plain, &f); err != nil {
 		t.Fatal(err)
 	}
-	if f.Project != "notes" || len(f.Secrets) != 3 || f.Secrets["SESSION_SECRET"] != "k8s-session" || f.Secrets["POSTGRES_PASSWORD"] != "k8s-pg" ||
+	if f.Project != "notes" || !f.Export || len(f.Secrets) != 3 || f.Secrets["SESSION_SECRET"] != "k8s-session" || f.Secrets["POSTGRES_PASSWORD"] != "k8s-pg" ||
 		f.Secrets["SMTP_PASSWORD"] != "k8s-smtp" || len(f.Provision) != 1 || f.Provision["ADMIN_PASSWORD"] != "k8s-hook" || f.FrontCA != nil {
 		t.Fatalf("exported %+v", f)
 	}
@@ -229,15 +229,16 @@ func TestK8sInstallSecretsRefusals(t *testing.T) {
 		upgrade bool
 		want    string
 	}{
-		"another project's": {file: "project: crm\nsecrets: {}\n", want: `the file holds "crm"'s secrets, not notes's`},
-		"still encrypted":   {file: string(enc), want: "the file is still encrypted"},
-		"an unknown field":  {file: "project: notes\nsecret: {}\n", want: "field secret not found"},
-		"too big":           {file: strings.Repeat("#", maxSecretsFile+1), want: "more than"},
-		"a quote":           {file: "project: notes\nsecrets: {}\nprovision:\n  ADMIN_PASSWORD: \"a'b\"\n", want: "--secrets: provision: ADMIN_PASSWORD: a value cannot hold a single quote"},
-		"no variable name":  {file: "project: notes\nsecrets: {}\nprovision:\n  admin-password: x\n", want: "--secrets: provision: admin-password: not a variable name"},
-		"a kept Secret":     {file: "project: notes\nsecrets: {}\n", cluster: func(e *kubeEnv) { e.stored(map[string]string{"SESSION_SECRET": "kept"}, ours) }, want: "the Secret notes-stowage in notes holds release notes's secrets"},
-		"another's outputs": {file: "project: notes\nsecrets: {}\nprovision:\n  ADMIN_PASSWORD: x\n", cluster: func(e *kubeEnv) { e.f.outputs = `{"metadata":{"labels":{}},"data":{}}` }, want: "secret notes-stowage-provision in notes was not written by"},
-		"an upgrade":        {file: "project: notes\nsecrets: {}\n", upgrade: true, cluster: func(e *kubeEnv) { e.runs("1.0.0", 1); e.stored(map[string]string{"SESSION_SECRET": "s"}, ours) }, want: "--secrets is for a first install"},
+		"another project's":  {file: "project: crm\nsecrets: {}\n", want: `the file holds "crm"'s secrets, not notes's`},
+		"still encrypted":    {file: string(enc), want: "the file is still encrypted"},
+		"an unknown field":   {file: "project: notes\nsecret: {}\n", want: "field secret not found"},
+		"too big":            {file: strings.Repeat("#", maxSecretsFile+1), want: "more than"},
+		"a quote":            {file: "project: notes\nexport: true\nsecrets: {}\nprovision:\n  ADMIN_PASSWORD: \"a'b\"\n", want: "--secrets: provision: ADMIN_PASSWORD: a value cannot hold a single quote"},
+		"no variable name":   {file: "project: notes\nexport: true\nsecrets: {}\nprovision:\n  admin-password: x\n", want: "--secrets: provision: admin-password: not a variable name"},
+		"a kept Secret":      {file: "project: notes\nexport: true\nsecrets: {}\n", cluster: func(e *kubeEnv) { e.stored(map[string]string{"SESSION_SECRET": "kept"}, ours) }, want: "the Secret notes-stowage in notes holds release notes's secrets"},
+		"provision unmarked": {file: "project: notes\nsecrets: {}\nprovision:\n  ADMIN_PASSWORD: x\n", want: "--secrets: provision: only a secrets export (export: true) gives provision"},
+		"another's outputs":  {file: "project: notes\nexport: true\nsecrets: {}\nprovision:\n  ADMIN_PASSWORD: x\n", cluster: func(e *kubeEnv) { e.f.outputs = `{"metadata":{"labels":{}},"data":{}}` }, want: "secret notes-stowage-provision in notes was not written by"},
+		"an upgrade":         {file: "project: notes\nsecrets: {}\n", upgrade: true, cluster: func(e *kubeEnv) { e.runs("1.0.0", 1); e.stored(map[string]string{"SESSION_SECRET": "s"}, ours) }, want: "--secrets is for a first install"},
 	} {
 		e := newKubeEnv(t, spec.Provider{Name: "none"})
 		if c.cluster != nil {
@@ -315,7 +316,7 @@ func TestK8sInstallWithSecretsKeepsARotationUnderWay(t *testing.T) {
 func TestK8sInstallWithSecretsLeavesTheFrontCAAndReplacesTheOutputs(t *testing.T) {
 	t.Parallel()
 	cert, key := testRoot(t, true)
-	plain, err := yaml.Marshal(SecretsFile{Project: "notes", Secrets: map[string]string{}, Provision: map[string]string{"ADMIN_PASSWORD": "hook-pw"}, FrontCA: &FrontCA{Cert: string(cert), Key: string(key)}})
+	plain, err := yaml.Marshal(SecretsFile{Project: "notes", Export: true, Secrets: map[string]string{}, Provision: map[string]string{"ADMIN_PASSWORD": "hook-pw"}, FrontCA: &FrontCA{Cert: string(cert), Key: string(key)}})
 	if err != nil {
 		t.Fatal(err)
 	}

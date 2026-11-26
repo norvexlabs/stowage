@@ -21,12 +21,20 @@ import (
 // machine lost makes its install again with them (a disaster recovery). Secrets holds what the
 // install generated (a rotated secret's next and previous values included) and the secret inputs
 // it was given; Provision what the provision hook returned; FrontCA the front's local CA, for an
-// install in the internal mode whose front made one.
+// install in the internal mode whose front made one. Export marks a file `secrets export` wrote:
+// only such a file makes an install made again (made_again, its data awaited); a file without it
+// is secrets a deployment seeds into a new install, which takes no provision values.
 type SecretsFile struct {
 	Project   string            `yaml:"project"`
+	Export    bool              `yaml:"export,omitempty"`
 	Secrets   map[string]string `yaml:"secrets"`
 	Provision map[string]string `yaml:"provision,omitempty"`
 	FrontCA   *FrontCA          `yaml:"front_ca,omitempty"`
+}
+
+// newExport is the SecretsFile `secrets export` starts from, on every shape: marked an export.
+func newExport(project string) *SecretsFile {
+	return &SecretsFile{Project: project, Export: true, Secrets: map[string]string{}}
 }
 
 // maxSecretsFile bounds a secrets file read.
@@ -52,7 +60,7 @@ func (in *Installer) secretKey(k string) bool {
 // exportSecrets is the install's SecretsFile: its recorded secrets that are not empty, the
 // provision hook's record and the front's local CA.
 func (in *Installer) exportSecrets(ctx context.Context, env *EnvFile) (*SecretsFile, error) {
-	f := &SecretsFile{Project: in.R.Spec.Name, Secrets: map[string]string{}}
+	f := newExport(in.R.Spec.Name)
 	for _, k := range env.Keys() {
 		if v, _ := env.Get(k); v != "" && in.secretKey(k) {
 			f.Secrets[k] = v
@@ -169,6 +177,19 @@ func (in *Installer) readSecrets(raw []byte) (*SecretsFile, error) {
 	if f.Project != in.R.Spec.Name {
 		return nil, fmt.Errorf("--secrets: the file holds %q's secrets, not %s's", f.Project, in.R.Spec.Name)
 	}
+	if !f.Export {
+		var keys []string
+		if len(f.Provision) > 0 {
+			keys = append(keys, "provision")
+		}
+		if f.FrontCA != nil {
+			keys = append(keys, "front_ca")
+		}
+		if len(keys) > 0 {
+			named := strings.Join(keys, " and ")
+			return nil, fmt.Errorf("--secrets: %s: only a secrets export (export: true) gives %s, with its data, never a new install's secrets file: for an export a release built with Stowage 0.48.0 or earlier wrote, which lacks the mark, add the line `export: true`; for a new install's file, remove %s", named, named, named)
+		}
+	}
 	if ca := f.FrontCA; ca != nil {
 		if _, err := parseFrontCA([]byte(ca.Cert), []byte(ca.Key)); err != nil {
 			return nil, fmt.Errorf("--secrets: front_ca: %w", err)
@@ -204,14 +225,17 @@ func (in *Installer) restoredSecret(k string) string {
 }
 
 // madeAgainRecords writes the records of a first install: made_again when it is given a secrets
-// export, and restore_awaited when that install awaits its data — its release runs backups (a
+// export (Export: a seeded file makes a plain install), and restore_awaited when that install awaits its data — its release runs backups (a
 // restore loads them), or its hook is given the file's provision values: the machine made again
 // is not the old one until a backup of it is loaded (restore), or the operator says it is
 // (provision, reset-db). One an earlier attempt left (its .env never written) is removed when
 // this install makes none. Run before .env, so no install exists without its records. It says
 // which it wrote.
 func (in *Installer) madeAgainRecords() (written []string, err error) {
-	again := in.restored != nil
+	again := in.restored != nil && in.restored.Export
+	if in.restored != nil && !again {
+		in.O.logf("--secrets: a new install's secrets (no export: true): a plain install, not made again. If the file is an export a release built with Stowage 0.48.0 or earlier wrote, this machine is not made again: give it no backup settings, add the line `export: true` to the file, and make the machine again from it (`uninstall` this install on Docker, or create the VM again; `--secrets` is refused on an install that exists)")
+	}
 	var h *providers.ProvisionHook
 	if again {
 		if h, err = in.hook(); err != nil {

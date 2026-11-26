@@ -71,11 +71,12 @@ share; each shape's own fields and verbs are on its page:
   else `127.0.0.1`; `STOWAGE_LOOPBACK_ADDRESS`); `registry_ca` `sha256:<hex>` of the registry CA
   the install keeps (`registry-ca.pem`, the `--registry-ca` file as given), absent when it keeps
   none — so a program compares what it would give with what the install holds; `restore_awaited` (`true`, absent otherwise) while
-  an install given `--secrets` awaits its data (from Stowage 0.48.0 every one whose release runs
+  an install given an export by `--secrets` awaits its data (from Stowage 0.48.0 every one whose release runs
   backups, or whose hook is given the export's provision values: until `restore` loads a backup,
   or `provision` or `reset-db` ends the wait), `made_again` (`true`, absent otherwise; Docker and
   the VM, Stowage 0.48.0 or later) for an install made by `--secrets` from another install's
-  export, recorded before its `.env` and kept for good, and `volumes_split` while a restore left the
+  export (a file with `export: true`, which `secrets export` writes from Stowage 0.49.0; a file
+  without it seeds a plain install), recorded before its `.env` and kept for good, and `volumes_split` while a restore left the
   volumes half restored — not while a restore runs (it holds the install's host lock), as on the
   VM; `services` the stack's services as the VM's `ps --json` gives them
   (`service`, `state`, `health`, `image`, `exit_code`, `id`, `oom_killed`, `mem_limit_bytes`,

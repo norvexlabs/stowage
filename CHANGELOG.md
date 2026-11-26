@@ -3,6 +3,36 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.49.0]
+
+### Changed
+
+- **BREAKING**: only a `secrets export` makes an install "made again". The export now carries
+  `export: true`, and a secrets file without it (a new install's secrets that a deployment writes
+  itself) makes a plain install: no `made_again`, no data awaited, backups run. Under 0.48.0
+  every such file made an install that awaited a restore no one would run. An export written
+  by a release built with Stowage 0.48.0 or earlier lacks the mark: add the line `export: true`
+  to the decrypted file before making a machine again from it, or the install made from it is
+  a plain one, whose backups run at once. `provision` or `front_ca` in a file without the mark is
+  refused, naming both ways on; a file without it says so as it installs.
+  An installer built with Stowage before 0.49.0 refuses the field (`field export not found`):
+  remove the line to give an export to one.
+- **BREAKING**: the VM's `health` (and `GET health` on either socket) answers not ready until
+  the boot is over, as `status --json`'s `boot_settled` judges it: while the boot brings the
+  install up, then until the health gate judged it. The verbs the boot and the gate refuse meanwhile
+  (`backup run`, `upgrade`, `rollback`, `reset-db`, `restore`, the service verbs, …) are then not
+  refused for them; a unit whose state systemd does not answer is left to the check, and those
+  verbs refuse on it.
+- **BREAKING**: the boot unit and the health gate count as ended when `inactive` with no start
+  queued (skipped, stopped, or a dependency failed), as `boot_settled` already did: the verbs
+  refused until the boot or the gate ended were refused on such a unit for good before, and
+  `status` now keeps an install failure recorded before such a boot.
+
+### Documentation
+
+- Each file's encoding is stated: the secrets export is ASCII-armored age, a backup's objects
+  binary age; `age --decrypt` reads both.
+
 ## [0.48.0] - 2026-11-26
 
 ### Security
