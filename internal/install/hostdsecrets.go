@@ -612,6 +612,26 @@ func (h *Hostd) runRestore(in *Installer, input, object string, ids []age.Identi
 			largest, largestName = size, name
 		}
 	}
+	// The front's ACME account and certificates come back only into a front the install's wait
+	// holds (frontWaits), which never ran: a front that has run holds its own, newer than any
+	// backup's, and keeps them. A backup without them (taken in another TLS mode, or by a
+	// Stowage that took none) puts nothing back.
+	front := ""
+	if in.frontWaits(env) {
+		front = frontObject(object)
+		switch size, err := st.size(ctx, front); {
+		case errors.Is(err, errObjectAbsent):
+			logf("%s holds no archive of the front's certificates (%s): the front asks its CA for them", object, st.shown(front))
+			front = ""
+		case err != nil:
+			return fmt.Errorf("the archive of the front's certificates, %s: %w: nothing restored", st.shown(front), err)
+		default:
+			objects = append(objects, front)
+			if size > largest {
+				largest, largestName = size, front
+			}
+		}
+	}
 	// The recorded digest of each object, before anything stops: one without a record is refused
 	// unless unrecorded.
 	sums, err := h.checkDigests(st, objects, unrecorded, restoreTrust(pg, object, d.Roles.Migrate), logf)
@@ -680,9 +700,17 @@ func (h *Hostd) runRestore(in *Installer, input, object string, ids []age.Identi
 	// The runner is there before anything stops: a Docker install pulls it again here, never
 	// inside a step bounded after the swap.
 	var image string
-	if len(pg.Volumes) > 0 {
+	if len(pg.Volumes) > 0 || front != "" {
 		if image, err = h.runnerImage(ctx, in); err != nil {
 			return err
+		}
+	}
+	// The front's state first, before anything stops: the front is held, so its volume is written
+	// beside a stack that runs on, and a restore that fails after it leaves the front held, which
+	// the restore again writes anew. The front starts with it once the wait ends (the up below).
+	if front != "" {
+		if err := h.restoreFront(ctx, in, env, st, stage, front, sums[front], ids, image, logf); err != nil {
+			return fmt.Errorf("%w: nothing restored", err)
 		}
 	}
 	// The database alone comes up when an earlier restore left the stack down: the load runs in
@@ -860,6 +888,32 @@ func (h *Hostd) runRestore(in *Installer, input, object string, ids []age.Identi
 	return nil
 }
 
+// restoreFront puts the front's ACME account and certificates from the archive obj (its SHA-256
+// sum when not empty) in the front's data volume, for the front a wait holds: a front container
+// there (one started by hand) is removed first, as it would serve on from what it holds. A front
+// volume not there yet gets nothing: the front asks its CA.
+func (h *Hostd) restoreFront(ctx context.Context, in *Installer, env *EnvFile, st backupStore, stage, obj, sum string, ids []age.Identity, image string, logf func(string, ...any)) error {
+	vol, err := in.stackVolume(ctx, env, FrontDataVolume, false)
+	if err != nil {
+		return fmt.Errorf("the front's certificates: %w", err)
+	}
+	if vol == "" {
+		logf("the front's volume is not there: its certificates are not put back, the front asks its CA for them")
+		return nil
+	}
+	if _, err := in.Compose(ctx, env, in.O.Log, "rm", "--stop", "--force", FrontService); err != nil {
+		return fmt.Errorf("the front's certificates: %w", err)
+	}
+	logf("putting the front's ACME account and certificates back from %s", st.shown(obj))
+	if err := h.fetchVerified(ctx, st, stage, obj, sum, ids, func(plain io.Reader) error {
+		_, err := h.runnerShell(ctx, in, image, vol, false, plain, nil, frontRestoreScript)
+		return err
+	}); err != nil {
+		return fmt.Errorf("the front's certificates: %w", err)
+	}
+	return nil
+}
+
 // maxManifest bounds a backup's manifest: a project, a release and volume keys.
 const maxManifest = 64 << 10
 
@@ -920,6 +974,23 @@ const (
 		"for f in ./" + restoreStage + "/* ./" + restoreStage + "/.[!.]* ./" + restoreStage + `/..?*; do if [ -e "$f" ] || [ -L "$f" ]; then mv -- "$f" . || exit 1; fi; done && ` +
 		`chown "$(stat -c %u:%g ` + restoreStage + `)" . && chmod "$(stat -c %a ` + restoreStage + `)" . && rmdir ` + restoreStage
 	dropVolumeScript = "rm -rf /v/" + restoreReplaced
+)
+
+// The front's ACME state is the two directories of Caddy's storage (its data volume's caddy/) that
+// hold its ACME account and the certificates it was issued: acme/ and certificates/. Its locks
+// and OCSP staples are fetched again, and pki/ is the internal mode's local CA, which the secrets
+// export carries. frontArchiveScript writes the archive of those present (an archive of nothing,
+// a tar's end alone, when neither is); frontRestoreScript extracts one (stdin) into a staging
+// directory of its own, then replaces each directory the archive holds by its, given to the
+// volume root's owner (the front's user), caddy/ made as that user's when absent, so Caddy writes
+// in it as it would; whatever else the archive holds is dropped with the staging.
+const (
+	frontStage         = ".stowage-restore-front"
+	frontArchiveScript = `cd /v && set -- && for d in caddy/acme caddy/certificates; do if [ -d "$d" ]; then set -- "$@" "./$d"; fi; done && ` +
+		`if [ $# -eq 0 ]; then head -c 1024 /dev/zero; else tar -c -f - "$@"; fi`
+	frontRestoreScript = `s=/v/` + frontStage + ` && rm -rf "$s" && mkdir "$s" && tar -x -f - -C "$s" && o="$(stat -c %u:%g /v)" && ` +
+		`if [ ! -d /v/caddy ]; then mkdir /v/caddy && chown "$o" /v/caddy && chmod 700 /v/caddy; fi && ` +
+		`for d in acme certificates; do if [ -d "$s/caddy/$d" ]; then chown -hR "$o" "$s/caddy/$d" && rm -rf "/v/caddy/$d" && mv "$s/caddy/$d" /v/caddy/ || exit 1; fi; done && rm -rf "$s"`
 )
 
 // restoreObjects is the directory, in the install's, a restore downloads each object into before it
@@ -984,7 +1055,8 @@ func (h *Hostd) checkDigests(st backupStore, objects []string, unrecorded bool, 
 // --unrecorded makes the operator vouch for in it when it has no digest, migrate being the role a
 // dump loads as: a dump's statements, and the code it defines, run with that role's rights (a
 // superuser in many stacks) through the load, the hook and the migrations after it; a volume's
-// archive's files, owners and modes included, replace the volume's; a volumes-age-rclone
+// archive's files, owners and modes included, replace the volume's; the front's archive holds the
+// ACME account and certificates the front then serves with; a volumes-age-rclone
 // backup's manifest only names the release and the volumes, which the restore checks.
 func restoreTrust(pg *providers.AgeRclone, object, migrate string) func(string) string {
 	return func(o string) string {
@@ -998,6 +1070,9 @@ func restoreTrust(pg *providers.AgeRclone, object, migrate string) func(string) 
 			if o == volumeObject(object, v) {
 				return fmt.Sprintf("the archive is unpacked unchecked, its files, owners and modes included, replacing the volume %s's as they are", v)
 			}
+		}
+		if o == frontObject(object) {
+			return "the archive is unpacked unchecked into the front's volume: the ACME account and certificates it holds are the ones the front serves with"
 		}
 		return "it is read unchecked"
 	}

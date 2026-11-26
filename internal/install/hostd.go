@@ -110,6 +110,8 @@ type Hostd struct {
 	// RunNetworkd is where the secondary NICs' overrides are rendered; empty is
 	// /run/systemd/network.
 	RunNetworkd string
+	// SSHRules is SSH's rule file, which `ssh-allow set` writes; empty is SSHRules.
+	SSHRules string
 	// InstallNet is the file the cloud-config writes the install's network to; empty is
 	// InstallNetworkFile.
 	InstallNet string
@@ -161,8 +163,9 @@ type Hostd struct {
 	crossPlan *crossPlanned
 	ctx       context.Context // the daemon's: a job outlives its request
 
-	// netMu orders the network changes and their reverts; netReverts is each NIC's armed revert
-	// by role (empty: the primary): one NIC's arming or disarming never touches another's.
+	// netMu orders the network changes, SSH's sources' and their reverts; netReverts is each
+	// owner's armed revert (a NIC's by role, empty the primary's; sshOwner): one owner's arming or
+	// disarming never touches another's.
 	netMu      sync.Mutex
 	netReverts map[string]*netRevert
 	// healthMu guards healthRun, GET /v1/health's check running or last done: its verdict answers
@@ -333,6 +336,8 @@ type Status struct {
 	// `restore` loads a backup of the old install's, or `provision` ends the wait for data loaded by
 	// hand (a release without backups).
 	RestoreAwaited bool `json:"restore_awaited,omitempty"`
+	// FrontWaits: while it awaits its data in an ACME mode, the front is held (frontWaits).
+	FrontWaits bool `json:"front_waits,omitempty"`
 	// MadeAgain: the install was made by --secrets, from another install's export.
 	MadeAgain bool `json:"made_again,omitempty"`
 	// VolumesSplit: a restore left the volumes half restored; the stack stays down until a
@@ -616,6 +621,7 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 	go func() {
 		defer h.netMu.Unlock()
 		h.netResume()
+		h.sshResume()
 	}()
 	go h.backupResume()
 	wctx, stopWatch := context.WithCancel(ctx)
@@ -802,6 +808,11 @@ func (h *Hostd) routes(app bool) http.Handler {
 	both("POST /v1/network/revert", h.revertNetwork)
 	both("POST /v1/network/reset", h.resetNetwork)
 	both("POST /v1/nftables/{table}/sets/{set}", h.setElements)
+	// Who may log in is the operator's to change: the app reads it alone.
+	both("GET /v1/ssh-allow", h.sshAllow)
+	operator("POST /v1/ssh-allow", h.setSSHAllow)
+	operator("POST /v1/ssh-allow/confirm", h.confirmSSHAllow)
+	operator("POST /v1/ssh-allow/revert", h.revertSSHAllow)
 	both("GET /v1/backup/config", h.backupConfig)
 	both("POST /v1/backup/config", h.setBackupConfig) // the lock's checks are its own
 	operator("DELETE /v1/backup/config", h.removeBackupConfig)
@@ -1077,6 +1088,7 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		}
 		st.Installing, st.InstallFailed, _ = in.firstInstall()
 		st.RestoreAwaited = in.restoreAwaited()
+		st.FrontWaits = in.frontWaits(env)
 		st.MadeAgain = fileExists(in.path(madeAgainFile))
 		st.Channel, _ = env.Get(ChannelVar)
 		// A registry CA that cannot be read is left out: the status always answers, and a poll

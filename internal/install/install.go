@@ -36,6 +36,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/backup"
 	"github.com/norvexlabs/stowage/internal/chown"
+	"github.com/norvexlabs/stowage/internal/flock"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/payload"
@@ -1357,6 +1358,46 @@ func (in *Installer) awaitingData() error {
 // restoreAwaited reports whether the install waits for its data before its provision hook runs.
 func (in *Installer) restoreAwaited() bool { return fileExists(in.path(restoreAwaitedFile)) }
 
+// frontWaits reports whether the stack starts without its front: the install awaits its data
+// (restoreAwaited) and its backups hold the front's ACME account and certificates (frontACME).
+// The restore that ends the wait puts them in the front's volume before the front first starts,
+// so the front asks its ACME CA for none of those it had; a wait ended otherwise (provision,
+// reset-db) starts the front as it ends.
+func (in *Installer) frontWaits(env *EnvFile) bool {
+	return in.restoreAwaited() && in.frontACME(env)
+}
+
+// waitEnded ends the wait of an install made again on the operator's word (provision): the
+// marker goes (restoreDone), and a front the wait held starts with the stack, asking its CA for
+// its certificates — no restore brought them.
+func (in *Installer) waitEnded(ctx context.Context, env *EnvFile) error {
+	held := in.frontWaits(env)
+	in.restoreDone()
+	if !held {
+		return nil // no front held: a marker that stays is only logged (restoreDone)
+	}
+	if in.restoreAwaited() {
+		// The marker could not be removed (restoreDone logged why): the front stays held. A later
+		// provision finds no front waiting: the installer's re-run starts it, once the marker is gone.
+		return fmt.Errorf("%s could not be removed: the front, which waits for the install's data, stays stopped; remove it, then `%s` starts the stack, the front with it", in.path(restoreAwaitedFile), in.rerunHint())
+	}
+	in.O.logf("starting the front, which waited for the install's data")
+	if err := in.up(ctx, env); err != nil {
+		// The wait is over (its marker gone): a later provision does not start the front again.
+		return fmt.Errorf("the wait for the install's data ended, but starting the front, which waited for it, failed: %w (`%s` starts the stack, the front with it)", err, in.rerunHint())
+	}
+	return nil
+}
+
+// rerunHint is the run of the installer that starts the stack again: `sudo <ctl> install` on the
+// VM, the installer with --dir on Docker.
+func (in *Installer) rerunHint() string {
+	if in.O.Preloaded {
+		return in.verbHint("install")
+	}
+	return fmt.Sprintf("%s --dir %s", in.ctl(), in.O.Dir)
+}
+
 // volumesSplit refuses while a restore left the volumes not whole.
 // A mark that cannot be read counts as there.
 func (in *Installer) volumesSplit() error {
@@ -1726,6 +1767,12 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 	if err := in.writePending(append(slices.Clone(keep), names...)); err != nil {
 		return err
 	}
+	// A front the install's wait for its data holds is made with the stack's containers when its
+	// volumes are not there, readied, then left with no container (scaled to 0) until the wait ends.
+	held := in.frontWaits(env)
+	if held {
+		in.O.logf("the front waits for the install's data: the restore puts the front's certificates back before it starts, so it asks its ACME CA for none it had")
+	}
 	run := func() error {
 		// Which of the front's volumes are not there, before anything of this start makes one.
 		dataMissing, caMissing, err := in.frontVolumesMissing(ctx, env, m)
@@ -1802,7 +1849,11 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 		if in.O.Log != nil {
 			w = io.MultiWriter(in.O.Log, &out)
 		}
-		if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "up", "--detach", "--wait", "--remove-orphans", "--pull", "never"), Env: environ, Stream: w}); err != nil {
+		upArgs := append(in.composeBase(), "up", "--detach", "--wait", "--remove-orphans", "--pull", "never")
+		if held {
+			upArgs = append(upArgs, "--scale", FrontService+"=0")
+		}
+		if _, err := in.O.Docker.Run(ctx, Cmd{Args: upArgs, Env: environ, Stream: w}); err != nil {
 			return in.settle(ctx, env, out.Bytes(), err)
 		}
 		return nil
@@ -1839,6 +1890,11 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 		if e := in.l4Exposure(r, get, off, ca); e != "" {
 			in.O.logf("L4 route %s: %s/%d %s", r.Name, r.Protocol, r.Port, e)
 		}
+	}
+	if held {
+		// No front runs: none of its warnings, nor its URL.
+		fmt.Fprintln(in.O.Out, runningLine(in.R.Spec.Name, in.R.Manifest.ProjectVersion, "")+"; the front waits for the restore, which brings its certificates back: its routes are not served until then")
+		return nil
 	}
 	url := ""
 	if in.R.Spec.HasFront() {
@@ -2392,6 +2448,24 @@ func (in *Installer) heldPorts(env *EnvFile) map[peerPort]bool {
 // FirewallConf is the VM's firewall ruleset, which flushes its own table only.
 const FirewallConf = "/etc/nftables.conf"
 
+// firewallLock takes the firewall's lock, dir/.firewall.lock (dir: O.Firewall, PortRules on the VM,
+// in each of Stowage's processes that writes a file FirewallConf includes and loads it: the host
+// daemon, ssh-boot, an install's start). A load reads every file the ruleset includes as it parses,
+// and commits whole: each holds the lock from its files' writes to its load's end, so the last load
+// is of the last files, never an older view committed over a newer one. The boot's own loads
+// (nftables.service, the cloud-config's step) take no lock: the units that write after them are
+// ordered after them. The lock is not taken twice in one process.
+func firewallLock(ctx context.Context, dir string) (func(), error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("the firewall's lock: %w", err)
+	}
+	unlock, err := flock.Take(ctx, filepath.Join(dir, ".firewall.lock"), flock.Create, true, 100*time.Millisecond, nil)
+	if err != nil {
+		return nil, fmt.Errorf("the firewall's lock: %w", err)
+	}
+	return unlock, nil
+}
+
 // openPorts opens the install's host ports in the VM's firewall (O.Firewall): a TLS front's, the
 // ports the stack's bridges reach the L4 routes' services on (hn), and every L4 route's in every
 // mode, from the sources its allowlist holds, on its bind address alone when it has one; the
@@ -2511,6 +2585,28 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 		// Where earlier releases kept their L4 allowlists, and an earlier build the holds: removed.
 		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-l4.nft"), what: "L4 routes' allowlists"},
 	}
+	// The lock is taken only when a file changes: a start that changes nothing writes and loads
+	// nothing (and needs no lock directory). Under it, each file is read again.
+	stale := false
+	for i := range files {
+		f := files[i]
+		rule := f.rule
+		if rule != nil {
+			rule = append(fmt.Appendf(nil, "# %s's %s, which every start of the install writes.\n", name, f.what), rule...)
+		}
+		// As the loop below judges a change: the file's bytes against the rule's.
+		if cur, _ := os.ReadFile(f.path); !bytes.Equal(cur, rule) {
+			stale = true
+		}
+	}
+	if !stale {
+		return nil
+	}
+	unlock, err := firewallLock(ctx, in.O.Firewall)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	changed := false
 	for i := range files {
 		f := &files[i]
@@ -3028,6 +3124,10 @@ func (in *Installer) Status(ctx context.Context) error {
 		fmt.Fprintf(in.O.Out, "not finished: the first install runs, or was stopped; a re-run of the installer with --dir %s finishes it\n", dir)
 	case in.restoreAwaited():
 		fmt.Fprintf(in.O.Out, "awaiting its data: made again by --secrets: %s\n", in.awaitedHint())
+	}
+	// Whatever line the state above gives: the front is held while the install awaits its data.
+	if in.frontWaits(env) {
+		fmt.Fprintln(in.O.Out, "the front waits for the restore, which brings its certificates back (an `acme` or `dns-cloudflare` mode): its routes are not served until then")
 	}
 	for _, r := range in.R.Spec.Front.Routes {
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", r.Name, get(spec.URLVar(r.Name)))

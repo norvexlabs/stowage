@@ -930,6 +930,20 @@ func volumeObject(obj, vol string) string {
 	return base + "." + vol + ".tar.age"
 }
 
+// frontObject names the archive of the front's ACME account and certificates beside the backup
+// obj, as a volume's: its data volume's name in the volume's place. Lint keeps names starting
+// stowage- from the project's volumes, so it is never a volume's archive.
+func frontObject(obj string) string { return volumeObject(obj, FrontDataVolume) }
+
+// frontACME reports whether the install's backups take its front's ACME account and certificates
+// (frontObject): its release runs backups, and its front gets its certificates from an ACME CA
+// (acme, dns-cloudflare). In another mode they hold nothing a restore needs: the internal mode's
+// local CA travels in the secrets export.
+func (in *Installer) frontACME(env *EnvFile) bool {
+	mode, _ := env.Get("STOWAGE_TLS_MODE")
+	return in.R.Spec.HasFront() && acmeMode(mode) && providers.RunsBackups(in.R.Spec)
+}
+
 // stackVolume is the Docker volume of the stack's compose volume key: the one Compose labelled as
 // the project's, else the one named as Compose names it, when it exists and is the stack's. When
 // there is none it is "", unless create: then it is made as the compose file declares it.
@@ -1307,7 +1321,8 @@ func (h *Hostd) backupStore(in *Installer, t backupTarget, obj string) (backupSt
 	return rcloneStore{h: h, in: in, conf: conf, dest: t.c.Destination, retention: t.c.RetentionDays}, done, nil
 }
 
-// dumpUpload streams each volume's encrypted archive, then the encrypted dump (a volumes-age-rclone
+// dumpUpload streams each volume's encrypted archive, then the front's ACME account and
+// certificates' (frontACME), then the encrypted dump (a volumes-age-rclone
 // backup's manifest), to the store (the destination, checking the size each reached, or the host),
 // then prunes the profile's backups the settings no longer keep (none for a backup streamed out);
 // it returns the bytes written and the pruning's error
@@ -1354,8 +1369,9 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, st 
 	}
 	var total int64
 	sums := map[string]string{}
+	front := in.frontACME(env)
 	var image string
-	if len(pg.Volumes) > 0 {
+	if len(pg.Volumes) > 0 || front {
 		var err error
 		if image, err = h.runnerImage(ctx, in); err != nil {
 			return 0, nil, err
@@ -1377,6 +1393,34 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, st 
 			_, err := h.runnerShell(ctx, in, image, vol, true, nil, w, archiveScript)
 			if err != nil {
 				err = fmt.Errorf("the archive of the volume %s: %w", v, err)
+			}
+			return err
+		}), logf)
+		if err != nil {
+			discard()
+			return 0, nil, err
+		}
+		sent, total = append(sent, o), total+n
+		sums[st.key(o)] = sum
+	}
+	// The front's ACME account and certificates, after the volumes: a machine made again from this
+	// backup gets them back before its front first starts, and asks its CA for none of them.
+	if front {
+		vol, err := in.stackVolume(ctx, env, FrontDataVolume, false)
+		if err != nil {
+			discard()
+			return 0, nil, err
+		}
+		o := frontObject(obj)
+		logf("archiving the front's ACME account and certificates, encrypted to %d recipient(s), to %s", len(recips), st.shown(o))
+		n, sum, err := st.put(ctx, o, ageEncrypt(recips, func(w io.Writer) error {
+			if vol == "" {
+				// Never created (the front never ran): an archive of nothing.
+				return tar.NewWriter(w).Close()
+			}
+			_, err := h.runnerShell(ctx, in, image, vol, true, nil, w, frontArchiveScript)
+			if err != nil {
+				err = fmt.Errorf("the archive of the front's certificates: %w", err)
 			}
 			return err
 		}), logf)

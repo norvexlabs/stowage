@@ -1490,3 +1490,65 @@ func TestANetworkRequestWaitsForTheStartsUndo(t *testing.T) {
 		t.Errorf("the link runs %s", addr)
 	}
 }
+
+// A window whose undo the daemon's stop cut: no timer armed, the deadline past: the confirmation
+// comes too late, and undoes the change.
+func TestAConfirmationPastTheDeadlineWithNoTimerUndoes(t *testing.T) {
+	t.Parallel()
+	link := newLink(t)
+	h := netDaemon(t, link)
+	manualTimers(h)
+	if code := call(t, h.Handler(), http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}, RevertSecs: intp(minRevertSecs)}, nil); code != http.StatusOK {
+		t.Fatal(code)
+	}
+	h.netMu.Lock()
+	h.netDisarm("") // the undo the stop cut left no timer
+	f := h.netFiles()
+	st, err := f.read()
+	if err != nil {
+		h.netMu.Unlock()
+		t.Fatal(err)
+	}
+	st.Pending.Deadline = time.Now().Add(-time.Second)
+	if err := f.write(st); err != nil {
+		h.netMu.Unlock()
+		t.Fatal(err)
+	}
+	_, err = h.confirm()
+	h.netMu.Unlock()
+	if err == nil || !strings.Contains(err.Error(), "the change's window ended: the settings before it are back") {
+		t.Fatalf("%v", err)
+	}
+	if addr, _, _ := link.live(); addr != leaseAddr {
+		t.Errorf("the link runs %s", addr)
+	}
+}
+
+// No timer armed, the deadline ahead: the confirmation keeps the change — the other side of the
+// deadline rule.
+func TestAConfirmationBeforeTheDeadlineWithNoTimerKeeps(t *testing.T) {
+	t.Parallel()
+	link := newLink(t)
+	h := netDaemon(t, link)
+	manualTimers(h)
+	if code := call(t, h.Handler(), http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}, RevertSecs: intp(maxRevertSecs)}, nil); code != http.StatusOK {
+		t.Fatal(code)
+	}
+	h.netMu.Lock()
+	h.netDisarm("")
+	f := h.netFiles()
+	st, err := f.read()
+	if err == nil {
+		st.Pending.Deadline = time.Now().Add(time.Hour)
+		err = f.write(st)
+	}
+	if err != nil {
+		h.netMu.Unlock()
+		t.Fatal(err)
+	}
+	a, err := h.confirm()
+	h.netMu.Unlock()
+	if err != nil || a.Message != "confirmed" {
+		t.Fatalf("%v %+v", err, a)
+	}
+}

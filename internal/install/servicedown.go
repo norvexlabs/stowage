@@ -181,7 +181,17 @@ func (in *Installer) stackList(ctx context.Context, env *EnvFile, declared func(
 	if err != nil {
 		in.O.logf("warning: the services the stack declares could not be read (%v): a service with no container is not told", err)
 	}
+	// A front held while the install awaits its data (frontWaits) is no service down: with no
+	// container (by design), or one stopped. One running (started by hand) stays listed: the hold
+	// was bypassed, and it may ask its CA.
+	held := in.frontWaits(env)
+	if held {
+		list = slices.DeleteFunc(list, func(s Service) bool { return s.Service == FrontService && s.State != "running" })
+	}
 	for _, name := range names {
+		if held && name == FrontService {
+			continue
+		}
 		if !slices.ContainsFunc(list, func(s Service) bool { return s.Service == name }) {
 			list = append(list, Service{Service: name, State: stateMissing})
 		}

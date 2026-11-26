@@ -752,9 +752,8 @@ func (in *Installer) Provision(ctx context.Context) error {
 		if !in.restoreAwaited() { // ended under the lock meanwhile (a restore)
 			return fmt.Errorf("%s has no provision hook", in.R.Spec.Name)
 		}
-		in.restoreDone()
 		o.logf("%s has no provision hook: the data loaded by hand ends the wait --secrets began", in.R.Spec.Name)
-		return nil
+		return in.waitEnded(ctx, env)
 	}
 	env, unlock, err := in.openLocked(ctx)
 	if err != nil {
@@ -801,8 +800,7 @@ func (in *Installer) Provision(ctx context.Context) error {
 		return err
 	}
 	// Run by the operator: the data is what they chose, the wait a --secrets install began is over.
-	in.restoreDone()
-	return nil
+	return in.waitEnded(ctx, env)
 }
 
 // returned is what the hook returned before, as ProvisionEnv records it; empty when it has not run.

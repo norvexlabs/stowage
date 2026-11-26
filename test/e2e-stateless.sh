@@ -20,7 +20,9 @@
 # published into a volume, then with --tls acme against an ACME server (Pebble, its DNS stub
 # answering for the domain): the certificate issued and renewed for the L4 route alone (a site
 # answering 404, its challenge on the front's HTTP port) → 1.0.3 adds an HTTP route on that
-# domain, served over HTTPS with Pebble's certificate after the upgrade.
+# domain, served over HTTPS with Pebble's certificate after the upgrade → a backup in acme mode holds
+# the front's ACME state; the machine made again from it (--secrets) holds its front, no container,
+# until the restore brings its account and certificates back.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
@@ -317,5 +319,49 @@ for _ in $(seq 60); do [[ $(curl -sf --max-time 10 --cacert "$WORK/pebble-root.p
 [[ $(curl -sf --max-time 10 --cacert "$WORK/pebble-root.pem" --resolve "lookup.test:$HTTPS_PORT:127.0.0.1" "https://lookup.test:$HTTPS_PORT/") == secure ]] ||
 	{ stack_logs >&2; fail "the HTTP route does not serve over HTTPS with Pebble's certificate"; }
 [[ $(tls_get "$WORK/pebble-root.pem") == secure ]] || fail "the L4 route no longer serves after the HTTP route came"
+
+step "a machine made again in acme mode: the backup holds the front's ACME state; the new install's front waits, and the restore brings its account and certificates back"
+# front_files: the sha256 of each file under the front's acme/ (its ACME account) of the current
+# install, and the list of its certificates' files, read from its data volume.
+front_files() {
+	local v
+	v=$(docker volume ls -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.volume=stowage-front-data)
+	[[ -n $v ]] || return 1
+	docker run --rm -v "$v:/v:ro" "$HTPASSWD" sh -c 'cd /v/caddy && find acme -type f -name "*.key" -exec sha256sum {} + | sort && find certificates -type f | sort'
+}
+"${CTL[@]}" backup config --dir "$D" --destination dav:backups --rclone-config "$DAV_CONF" --recipient "$AGE_RECIPIENT" >/dev/null 2>&1 || fail "backup config in acme mode"
+"${CTL[@]}" backup run --dir "$D" >"$WORK/acme-run.txt" 2>&1 || { cat "$WORK/acme-run.txt"; fail "backup run in acme mode"; }
+fronts=("$WORK"/dav/backups/lookup-volumes-*-1.0.3-r1.stowage-front-data.tar.age)
+[[ -s ${fronts[-1]} ]] || { ls "$WORK/dav/backups" >&2; fail "the backup holds no archive of the front's ACME state"; }
+manifests=("$WORK"/dav/backups/lookup-volumes-*-1.0.3-r1.manifest.age)
+last=${manifests[-1]##*/}
+front_files >"$WORK/front-before.txt" && grep -q '^certificates/.*lookup\.test' "$WORK/front-before.txt" && grep -q ' acme/.*\.key$' "$WORK/front-before.txt" ||
+	{ cat "$WORK/front-before.txt" >&2; fail "the front's volume holds no ACME account key or certificate for lookup.test"; }
+"${CTL[@]}" secrets export --dir "$D" --recipient "$AGE_RECIPIENT" --output "$WORK/acme-secrets.age" >/dev/null 2>&1 || fail "secrets export in acme mode"
+"$BIN/age" -d -i "$AGE_KEY" -o "$WORK/acme-secrets.yaml" "$WORK/acme-secrets.age" || fail "the secrets export does not decrypt"
+cp "$D/lookup-stow" "$WORK/lookup-stow-again" || fail "keep the installer"
+# The old machine is gone; the new one takes its ports. Pebble leaves its network first.
+docker network disconnect "$STACK_NET" "$ZOT_NAME-pebble" >/dev/null || fail "pebble off the old stack's network"
+remove_install
+D=$WORK/stowage-e2e-install-again # removed at exit in its turn
+CTL=("${OPERATOR[@]}" "$D/lookup-stow")
+"${OPERATOR[@]}" "$WORK/lookup-stow-again" --no-input --dir "$D" --set GREETING=secure --tls acme --acme-ca https://pebble:14000/dir --acme-ca-root "$WORK/pebble-directory-root.pem" \
+	--domains lookup=lookup.test --http-port "$HTTP_PORT" --https-port "$HTTPS_PORT" --secrets "$WORK/acme-secrets.yaml" >"$WORK/acme-again.log" 2>&1 ||
+	{ cat "$WORK/acme-again.log"; fail "install --secrets in acme mode"; }
+"${CTL[@]}" status --dir "$D" --json >"$WORK/acme-again.json" 2>/dev/null || fail "status of the install made again"
+jq -e '.restore_awaited == true and .front_waits == true' "$WORK/acme-again.json" >/dev/null || { cat "$WORK/acme-again.json"; fail "the install made again in acme mode does not hold its front"; }
+[[ -z $(docker ps -aq --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=stowage-front) ]] ||
+	fail "the front of the install made again has a container before the restore: it may ask its CA"
+"${CTL[@]}" status --dir "$D" >"$WORK/acme-again-status.txt" 2>&1 || true
+grep -q 'the front waits for the restore' "$WORK/acme-again-status.txt" || { cat "$WORK/acme-again-status.txt"; fail "status does not say the front waits"; }
+"${CTL[@]}" backup config --dir "$D" --destination dav:backups --rclone-config "$DAV_CONF" --recipient "$AGE_RECIPIENT" >/dev/null 2>&1 || fail "backup config on the install made again"
+"${CTL[@]}" restore "$last" --dir "$D" --identity "$AGE_KEY" --yes --unrecorded >"$WORK/acme-restore.txt" 2>&1 || { cat "$WORK/acme-restore.txt"; fail "restore on the install made again"; }
+front_files >"$WORK/front-after.txt" || fail "the restored install's front has no volume"
+# The account key is the old one's (a renewal keeps it); every certificate file is back.
+diff <(grep ' acme/' "$WORK/front-before.txt") <(grep ' acme/' "$WORK/front-after.txt") >&2 || fail "the restore did not bring the front's ACME account back"
+while read -r f; do grep -qxF "$f" "$WORK/front-after.txt" || fail "the restore did not bring $f back"; done < <(grep '^certificates/' "$WORK/front-before.txt")
+jq -e '(.front_waits // false) == false' <("${CTL[@]}" status --dir "$D" --json 2>/dev/null) >/dev/null || fail "the front still waits after the restore"
+[[ -n $(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=stowage-front) ]] || fail "the front does not run after the restore"
+"${CTL[@]}" backup config --dir "$D" --remove >/dev/null 2>&1 || fail "backup config --remove"
 
 echo PASS

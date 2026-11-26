@@ -20,7 +20,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
           [--json]   # the run's result as one object, for a program (see "Exit status and --json on the VM")
 <short>-stow --version               # (-v) the release this OS carries and the Stowage that built it, as the Docker installer's
 <short>-stow describe [--json]        # what the release this OS carries offers, read with no install: the Docker installer's describe
-<short>-stow status [--json [--values]]   # --values: the recorded values (machine-interface.md), the operator's alone; this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `awaiting its data: made again by --secrets: …` while an install given `--secrets` awaits its data, with the way on (`backup config` with the old install's destination, then `restore OBJECT --unrecorded`; on a release without backups, the data loaded by hand, then `provision`), `"restore_awaited": true`; `"made_again": true` for an install made by `--secrets`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot (until a later boot is judged healthy), the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more, but on a link whose static `address6` has no `gateway6`), the services
+<short>-stow status [--json [--values]]   # --values: the recorded values (machine-interface.md), the operator's alone; this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `awaiting its data: made again by --secrets: …` while an install given `--secrets` awaits its data, with the way on (`backup config` with the old install's destination, then `restore OBJECT --unrecorded`; on a release without backups, the data loaded by hand, then `provision`), `"restore_awaited": true`; with it, in the `acme` or `dns-cloudflare` mode, `the front waits for the restore, which brings its certificates back …`, `"front_waits": true`; `"made_again": true` for an install made by `--secrets`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot (until a later boot is judged healthy), the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more, but on a link whose static `address6` has no `gateway6`), the services
 <short>-stow health [--json]          # ready, or fails saying why: the health gate's check, once
 <short>-stow events [--after N] [--follow|-f] [--json]   # the event journal: jobs, reboots, boots and the health gate's verdicts, the first install; --follow waits for more until interrupted, through daemon restarts
 <short>-stow ps [--json]              # the stack's services, state and health, then `down: <service> <why>` for each service down (as on Docker's `status`; the VM's `status` ends with the same); `--json`: each with `exit_code`, and when set (each absent when false, 0 or empty) `id`, `oom_killed`, `mem_limit_bytes` and `restarts` (these three from docker inspect)
@@ -48,6 +48,9 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
 <short>-stow network reset [--revert-secs N | --no-revert]   # drop the override: back to the cloud-config's network
 <short>-stow network set --role ROLE --mode dhcp|static|none [--address A/P] [--revert-secs N | --no-revert]   # a secondary NIC's override
 <short>-stow network reset --role ROLE [--revert-secs N | --no-revert]   # drop it
+<short>-stow ssh-allow [--json]        # the sources SSH accepts, what set them, a change awaiting confirmation
+<short>-stow ssh-allow set CIDR[,CIDR…]… [--revert-secs N] [--json]   # replace them; the seed's are the first boot's alone from then on
+<short>-stow ssh-allow confirm|revert [--json]   # keep the change awaiting confirmation (over a new SSH connection: `ssh -S none`), or undo it now
 sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none] [--address A/P]   # a NIC the release names, from the next boot
 <short>-stow backup config [--json] [--destination REMOTE:PATH] [--rclone-config FILE|-] [--recipient age1…]…
           [--retention-days N] [--schedule CALENDAR] [--profile P] [--remove]   # show, change or drop the backup settings
@@ -677,8 +680,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   and loaded: an object whose bytes differ is refused before a byte of it loads (`is not the
   object this install's backup uploaded`: whoever can write the destination changed it — age
   encrypts to public recipients, so it proves nothing of who wrote a backup), whatever the flags,
-  the data as it was. The manifest is checked before anything stops; the dump and the archives as
-  each loads, after the services stopped. It stops every service but the database
+  the data as it was. The manifest is checked before anything stops, and so is the front's archive
+  of an install made again (see "The front's certificates" below), put back then; the dump and
+  the volumes' archives as each loads, after the services stopped. It stops every service but the database
   (none to stop: nothing), extracts each volume's archive into a directory of its own at the
   volume's root (`.stowage-restore`, made afresh with the root's owner and mode: it and
   `.stowage-replaced` are names the stack's own data must not use, never extracted from an
@@ -1004,9 +1008,13 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
 - An addressing change (mode, `--ipv6`, an address or a gateway, IPv4 or IPv6; any change from no override) awaits
   confirmation: unless `network confirm` keeps it within `--revert-secs` (default 90, 30 to
   3600; a confirmation that comes once the window's timer fired is refused, 409, and the change
-  undone; `network confirm` with nothing awaiting confirmation fails, saying that a change not
+  undone, the refusal naming what ended it (`the change's window ended: …`, `a revert was asked:
+  …`, `the change could not be applied: …`, `the host daemon restarted inside the window: …`, or
+  `the change is being undone (<why>): …`) — while the undo at the window's end failed and is tried again, or gave up, too, the
+  confirmation trying it again; `network confirm` with nothing awaiting confirmation fails, saying that a change not
   confirmed in time is undone; either refusal ends with the settings in force, `in force: network:
-  <the primary's>; <role>: <a secondary's>`), the settings before it come back, on the interface the change
+  <the primary's>; <role>: <a secondary's>`; as is one past the deadline with no undo armed, one
+  the daemon's stop cut), the settings before it come back, on the interface the change
   was applied on (recorded with it, wherever the default route moved since) — at the window's end, when the host daemon restarts
   inside it (no network request runs before that; a record the daemon stopped before applying is
   applied then, and tried again as a revert is while it fails), and at a reboot inside it (`<name>-network.service` runs `<short>-stow network-boot`
@@ -1114,6 +1122,82 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   another NIC's revert kept); `network` shows a secondary's on its role's line (`as its
   override's record does not read: <why>`; `error` in `--json`). A record of a role the
   release no longer names is kept and not read.
+- `ssh-allow` shows the sources SSH accepts (each a CIDR; `0.0.0.0/0, ::/0` is every source),
+  what set them (`set by     ssh-allow set`, `the cloud-config (vm create --ssh-allow)`, or `the
+  image` (`0.0.0.0/0, ::/0`; with no rule file, `sources    none: <file> is absent: no rule lets SSH in`, `[]` in JSON); `"from": "set" | "cloud-config" | "image" | "unknown"` in JSON), and a change awaiting
+  confirmation (`pending    awaits confirmation for <n> s more, else back to <sources>`; `"pending":
+  {"previous", "deadline", "secs_left"}`). A rule file holding other lines than SSH's sources is
+  shown as `sources    unknown: <why>` (`"rules"` in JSON). `--json` prints the daemon's answer
+  (`message`, `sources`, `from`, `rules`, `pending`) on every verb.
+- `ssh-allow set CIDR[,CIDR…]…` (sources repeated or comma-separated, each with its prefix, as
+  `vm create --ssh-allow` takes them; masked and deduplicated, an IPv4-mapped one as its IPv4
+  network) replaces the sources SSH accepts,
+  whatever set them before: the daemon records them in `<dir>/ssh-allow.yaml` (root's, 0600),
+  writes `/etc/nftables.d/ssh.nft` (`ip saddr <cidr> tcp dport 22 accept`, `ip6 saddr` for IPv6)
+  and loads the firewall again (`nft -f /etc/nftables.conf`: Docker's rules stay). `/etc/nftables.d`
+  is not kept across boots: at every boot the cloud-config's SSH step (`vm create --ssh-allow`)
+  writes the seed's sources, or the image's rule stays, and then `<name>-ssh.service` (run only
+  while the record exists, after the cloud-config's boot stage and the firewall's load, before the
+  host daemon: `<short>-stow ssh-boot`) writes the recorded sources over them and loads the firewall again — the seed's sources
+  are the first boot's alone, on an OS built by Stowage 0.50.0 or later, whatever release made the seed. A change still awaiting
+  confirmation at that boot is undone there: to the sources recorded before it, written for this
+  boot, or, with none recorded before it, its record dropped and this boot's rule file left; a record that does not read fails the unit
+  (`systemctl --failed` names it), the seed's sources (or the image's rule) left. At every start,
+  the daemon writes the rule file from the record again when it differs (once; a failure is
+  logged, and `ssh-allow` shows the difference). Every load of the firewall Stowage's own processes make (`ssh-allow`'s,
+  `ssh-boot`'s, an install's start writing its ports) holds one lock,
+  `/run/nftables.d/.firewall.lock`, from its files' writes to its load's end, so no load commits
+  an older view of the files over a newer one; the boot's own loads (`nftables.service`, the
+  cloud-config's step) come before the units that write after them. The change comes undone unless `ssh-allow confirm` keeps it within
+  its window (`--revert-secs N`, 30 to 3600, default 90; every change of SSH's sources has one:
+  another value is refused, 400, `revert_secs <N>: every change of SSH's sources has a window, 30
+  to 3600 s`): run
+  the confirmation over a **new** SSH connection — not one shared with the session that ran `set`
+  (OpenSSH's `ControlMaster`/`ControlPersist` reuse it: `ssh -S none` opens a new one) —, which
+  proves the new sources let you in — the
+  session that ran `set` stays open either way (the firewall accepts an established connection).
+  At the window's end, at the daemon's start and at a reboot inside it, the rule file before the
+  change comes back, and the sources before it (none recorded before: the record goes, and the
+  cloud-config's step applies again at the next boot). A change that fails to load is undone at
+  once (500, `…: the sources before it are back`). `ssh-allow revert` undoes the change awaiting
+  confirmation now. `set` reads the session's `SSH_CONNECTION` (an administrator of the `admin`
+  group reaches the daemon without `sudo`, which drops it; without it the check is not made): when
+  it comes from an address none of the new sources holds, it warns `this session comes from
+  <address>, which none of the new sources holds: …` once the change is applied. The firewall's
+  lock is waited for 15 s at most by the daemon: a change that cannot take it fails, the sources
+  before it staying (500, `the firewall's lock: …: the sources before it are back`). The window counts from the change's load. A change that could not be applied,
+  whose restore is tried again (or gave up), is restored first by the next `set`; while that
+  restore fails, `set` is refused (409, exit 3: `an earlier change that could not be applied is
+  still being restored: …`, its fix: wait, or fix what fails). Nothing tells a new
+  connection from the one that ran `set`: a confirmation proves the new sources only when run over
+  a new one. While a change is being undone (its window ended, a revert was asked, or its load failed:
+  its undo under way, tried again, or given up), or awaits confirmation past its deadline with no
+  undo armed (one the daemon's stop cut, which its start does), `ssh-allow` shows `pending    <what
+  ended it>: the change is being undone (or its undo is tried again); a confirmation comes too late
+  …` (`"ended": true`, `"ended_by"`: `the change's window ended`, `a revert was asked`, `the
+  change could not be applied`, `the host daemon restarted inside the window`, or `the change is
+  being undone (<why>)` for another undo the daemon logged), and `confirm` is refused naming it (`<what ended it>: the sources
+  before it are back`), trying the undo again. An undo writes the sources recorded before the change, or, with none recorded, the rule
+  file before it (or none). A record
+  the rule file does not match (a load that failed, a boot's unit that did not run) shows what the
+  file holds, with a `warning    …` line (`"rules"`): `<file> does not hold the recorded sources (<list>): \`<short>-stow ssh-allow set
+  <list>\` writes them again`, or while a change awaits confirmation, `\`<short>-stow ssh-allow revert\` undoes the change awaiting confirmation` (`"rules"`); an empty rule file shows `sources    none: <file> holds no
+  rule: …`; one holding other lines than SSH's sources (edited by hand) `sources    unknown: …` and
+  `set by     unknown (a rule file edited by hand)` (`"from": "unknown"`); a rule file `ssh-allow set` wrote whose record is gone shows `set by     ssh-allow
+  set` with `warning    <record> is gone: the cloud-config's sources (or the image's rule) come back
+  at the next boot; …`; a change from a rule file of other lines than SSH's shows `else back to
+  the rule file before it (…)`, and one from no rule file removes the one it wrote when undone;
+  a change whose load fails leaves the firewall as it was (`nft -f` is atomic), its rule file
+  written back and the sources before it recorded at once; a change from no source shows `else back to no source`. Refused before anything changes (400, a refusal, exit 3): no source
+  (`sources: none given: SSH would accept no source, …`), a source without its prefix (`sources:
+  "<value>" is not a source with its prefix (192.0.2.0/24, 2001:db8::/32)`), a window out of range;
+  409: a change already awaiting confirmation (`ssh-allow confirm` or `revert` first), a reboot
+  scheduled; `confirm` or `revert` with nothing awaiting. The verbs ask the daemon (`GET /v1/ssh-allow`;
+  `POST /v1/ssh-allow` with `{"sources": […], "revert_secs": N}`, `POST /v1/ssh-allow/confirm`,
+  `POST /v1/ssh-allow/revert`); the app socket reads the sources but never changes them (403). To change the sources of a VM you reach
+  from an address that is about to change, set the new and the old together, confirm from the
+  new, then set the new alone: an operator already shut out reaches the VM through its platform's
+  console only.
 - The console's login screen (`/etc/issue.d`, after the host name and `IPv4: <address>`) tells
   what sets the network (`network: <the override's settings, as \`network\` prints them>; set
   with \`<short>-stow network set\``; else "the VM's cloud-config (DHCP, or its static
@@ -1176,6 +1260,57 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   its data`): the timer's run and `backup run` are refused naming the way on (the timer's unit
   fails, so the wait is seen), and an upgrade takes no backup first — a backup then would store an
   empty machine beside the old one's backups.
+- While an install made again by `--secrets` awaits its data, in the `acme` or `dns-cloudflare`
+  TLS mode, its front waits too: the stack starts without it (`docker compose up … --scale
+  stowage-front=0`: its volumes made and readied, no container), which the start says (`the front
+  waits for the install's data: the restore puts the front's certificates back before it starts,
+  so it asks its ACME CA for none it had`), so it asks its ACME CA for nothing before `restore`
+  puts the certificates of the backup back (below); the front routes are not served until then.
+  The restore that ends the wait starts it with the stack; `provision` ending the wait starts it
+  (`starting the front, which waited for the install's data`), as does `reset-db`, the front then
+  asking its CA for its certificates. A held front's start ends `<name> <version> is running; the
+  front waits for the restore, which brings its certificates back: its routes are not served until
+  then`, with no URL. When `provision` ends the wait and the front's start then fails, it fails
+  naming the way on (`the wait for the install's data ended, but starting the front, which waited
+  for it, failed: … (\`<installer re-run>\` starts the stack, the front with it)`): the wait is
+  over, so a later `provision` does not start it. A wait marker `provision` cannot remove while the
+  front is held fails it (`<marker> could not be removed: the front, which waits for the install's
+  data, stays stopped; remove it, then \`<installer re-run>\` starts the stack, the front with
+  it`); with no front held, it is only logged. While the front is held, `status`, the service
+  watch and its `service_down` events leave it out, with no container (by design) or a stopped one;
+  a front container started by hand that runs is listed (the hold bypassed).
+- The front's certificates (the `acme` and `dns-cloudflare` TLS modes): every backup, of either
+  provider, takes the front's ACME account and the certificates it was issued — the `caddy/acme/`
+  and `caddy/certificates/` directories of its data volume, `stowage-front-data` (not its locks,
+  nor its OCSP staples, fetched again, nor `caddy/pki/`, the `internal` mode's local CA, which
+  `secrets export` carries) — archived as a volume is, after the volumes and before the dump or
+  manifest, as `<the same name>.stowage-front-data.tar.age` (a front that holds neither yet, or
+  whose volume was never made, archives as empty). Its digest is recorded as every object's, and
+  retention, the archives' pruning, `backup export`, `backup run --output` and `restore --input`
+  take it as a volume's archive (a project's volume never has that name: lint keeps names
+  starting `stowage-` for Stowage). In another mode no such archive is taken, and a restore puts
+  nothing back. A `restore` into an install made again that awaits its data (its front waiting,
+  above) checks it with the backup's other objects before anything stops — its digest, or, with
+  `--unrecorded`, `the archive is unpacked unchecked into the front's volume: the ACME account and
+  certificates it holds are the ones the front serves with` — then, still before anything stops,
+  removes a front container there (one started by hand) and puts it in the front's volume: each
+  of `caddy/acme/` and `caddy/certificates/` it holds replaces the volume's, given to the volume's
+  owner (the front's user), through a staging directory of its own (`.stowage-restore-front`);
+  a failure there restores nothing, the front still waiting. Once the restore is done the front
+  starts, serving those certificates and asking its CA only for one missing or due for renewal. A
+  backup without that archive (taken in another mode, or by a Stowage before 0.50.0) restores,
+  its log saying `<object> holds no archive of the front's certificates (<where>): the front asks
+  its CA for them`; a front volume not there gets nothing (`the front's volume is not there: …`).
+  A restore into an install that does not await its data leaves its front's ACME state as it is:
+  a front that has run holds its own, newer than any backup's.
+- Rehearsing a recovery: a restore onto a throwaway machine (a VM or a Docker install made again
+  from the export and a backup) should run its install with `--acme-ca` pointing at a staging
+  ACME directory (Let's Encrypt's: `--acme-ca
+  https://acme-staging-v02.api.letsencrypt.org/directory`): its front then asks the staging CA,
+  which keeps the certificates it issues apart from the production CA's (Caddy keeps each CA's
+  under its own name), so a rehearsal never spends the production CA's allowance of 5 duplicate
+  certificates a week, which the real recovery needs; the backup's certificates put back are the
+  production CA's, which that front does not serve.
 - Backups (a `pg-age-rclone` or `volumes-age-rclone` `backup`): the daemon runs `pg_dump --format=custom --compress=9`
   (owners and privileges kept: the stack's roles exist on every install) as `database.roles.migrate` inside the database service (`docker
   compose exec`: the server's own version), encrypts the dump with age as it streams, to every
@@ -1351,8 +1486,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
     whole, `writing FILE: …`, the same), its `FILE.partial` removed: the daemon cuts its answer short, never ending it as
     whole. `backup export OBJECT` streams a backup kept there, else one streamed out still there.
   - The archive is a tar (ustar; PAX for a name over 100 bytes) of the backup's objects as stored,
-    encrypted: the volumes' archives first, in the release's order, the dump (or the manifest)
-    last; each 0600, owned by 0:0, timed as its name says, so the same backup always exports the
+    encrypted: the volumes' archives first, in the release's order, then the front's archive when
+    the backup took one (`….stowage-front-data.tar.age`, the `acme` and `dns-cloudflare` modes),
+    the dump (or the manifest) last; each 0600, owned by 0:0, timed as its name says, so the same backup always exports the
     same bytes. `tar -t` lists it, and each object extracts and decrypts with `age -d` as a
     destination's does: each object is binary age, not armored (the secrets export is armored).
   - `restore --input FILE|- --identity FILE` restores such an archive, confirmed as `restore
@@ -1632,7 +1768,7 @@ showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rol
   input chain drops by default and accepts the loopback, replies (`ct state
   established,related`), ICMP and ICMPv6 (behind extension headers too), DHCP's answers (UDP 67→68, 547→546), SSH per
   `/etc/nftables.d/ssh.nft` (the bundle's is open to every source; `vm create --ssh-allow`
-  replaces it) and the install's ports per `/run/nftables.d/<name>-ports.nft`, which each start
+  replaces it until `ssh-allow set` replaces it in turn) and the install's ports per `/run/nftables.d/<name>-ports.nft`, which each start
   of the install writes: the front's that something serves on (`tcp dport { <http port>, <https port> }
   accept` with a front route in a TLS mode; `tcp dport { <http port> } accept` for a front of L4
   routes alone in `acme` mode, the HTTP-01 challenge of their certificates; none otherwise, nor in

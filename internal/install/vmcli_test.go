@@ -130,7 +130,7 @@ func ctl(e *env, sock string, args ...string) (string, error) {
 
 // ctlCtx is ctl until ctx ends (an interrupt).
 func ctlCtx(ctx context.Context, e *env, sock string, args ...string) (string, error) {
-	return ctlTimes(ctx, e, sock, clientTimes{unit: time.Millisecond}, args...)
+	return ctlTimes(ctx, e, sock, clientTimes{unit: time.Millisecond, env: func(string) string { return "" }}, args...)
 }
 
 // ctlTimes is ctlCtx on the client's clocks times.

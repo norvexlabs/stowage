@@ -49,6 +49,7 @@ type fakeRclone struct {
 	swapErr          error // fails the swap of a volume named …swapFails
 	swapFails        string
 	dropped          []string // the volumes whose former data was deleted
+	frontPut         []string // the volumes the front's ACME state was put back into
 	// modTimes are objects' times other than the fixed one lsjson gives.
 	modTimes map[string]time.Time
 	// afterCat replaces an object once a download of it was served: a writer of the destination
@@ -69,7 +70,7 @@ func (f *fakeRclone) shell(c Cmd) ([]byte, error) {
 		f.volumes, f.staged = map[string][]byte{}, map[string][]byte{}
 	}
 	switch script := c.Args[len(c.Args)-1]; script {
-	case archiveScript:
+	case archiveScript, frontArchiveScript:
 		if rest != "/v:ro" {
 			return nil, fmt.Errorf("archived through %s", mount)
 		}
@@ -96,6 +97,16 @@ func (f *fakeRclone) shell(c Cmd) ([]byte, error) {
 		delete(f.staged, vol)
 	case dropVolumeScript:
 		f.dropped = append(f.dropped, vol)
+	case frontRestoreScript:
+		if rest != "/v" {
+			return nil, fmt.Errorf("the front's state put back through %s", mount)
+		}
+		b, err := io.ReadAll(c.Stdin)
+		if err != nil {
+			return nil, err
+		}
+		f.volumes[vol] = b
+		f.frontPut = append(f.frontPut, vol)
 	default:
 		return nil, fmt.Errorf("script %q", script)
 	}
@@ -231,6 +242,11 @@ func (f *fakeRclone) run(c Cmd) ([]byte, error) {
 				}
 				list = append(list, entry{filepath.Base(k), n, at})
 			}
+		}
+		// A file path the remote lacks: rclone exits 3 ("directory not found") on local, WebDAV
+		// and SFTP remotes, where a directory's listing answers an empty list.
+		if len(list) == 0 && strings.HasSuffix(last, ".age") && !slices.Contains(args, "--include") {
+			return nil, exitCode(3)
 		}
 		return json.Marshal(list)
 	}

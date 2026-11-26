@@ -223,7 +223,9 @@ refusal is the verb's Result.
   made again by --secrets: `<short>-stow backup config --dir D` with the old install's
   destination, then `<short>-stow restore OBJECT --unrecorded --dir D` loads a backup of it
   (--unrecorded: its digests' records went with it)`; on a release that runs no backups, `… made
-  again by --secrets: load a backup of it by hand, then `<short>-stow provision --dir D``), each `l4` route as `<name> <protocol>/<port>` followed by its endpoint when it has
+  again by --secrets: load a backup of it by hand, then `<short>-stow provision --dir D``; in the
+  `acme` or `dns-cloudflare` mode, then `the front waits for the restore, which brings its
+  certificates back (…): its routes are not served until then`), each `l4` route as `<name> <protocol>/<port>` followed by its endpoint when it has
   an `address_input` (`echo      tcp/17007 localhost:17007`) and where it listens (`· on
   192.0.2.7 alone` from its `bind_input`, else `· on every address, open to whoever reaches this
   host`, adding `(<BIND_INPUT> gives it one address)` when the route has a `bind_input`; `· not
@@ -737,7 +739,18 @@ refusal is the verb's Result.
   wait while one is awaited, and refuses `--set`) or `reset-db` says it is the install's; a release
   with neither a hook nor backups awaits nothing. While it awaits, no backup is taken (a timer's
   run and `backup run` are refused naming the way on, an upgrade takes none first): it would store
-  an empty machine beside the old one's backups. `status --json` says `made_again` for every
+  an empty machine beside the old one's backups. In the `acme` and `dns-cloudflare` TLS modes,
+  while a release that runs backups awaits its data, the front waits too: the stack starts
+  without it (`--scale stowage-front=0`, said by the start), so it asks its ACME CA for no
+  certificate before `restore` puts back the ACME account and certificates the backup holds (every
+  backup takes them in those modes; see "The front's certificates" under the installer on the
+  Kairos VM, which a Docker install's backups follow), and starts with the stack once the restore
+  is done — or once `provision` or `reset-db` ends the wait, asking its CA then (the start's line
+  ends `; the front waits for the restore, …` with no URL while it waits; a failed start of the
+  front after `provision` names the installer's re-run that starts it). A rehearsal of a
+  recovery on a throwaway machine runs its install with `--acme-ca` pointing at a staging ACME
+  directory (Let's Encrypt's: `https://acme-staging-v02.api.letsencrypt.org/directory`), so it
+  never spends the production CA's 5 duplicate certificates a week. `status --json` says `made_again` for every
   install made by `--secrets` from an export. The front's
   local CA the file holds is recorded (`.stowage-front-ca`, 0600) for an install in the
   `internal` mode (in another, it is left out, said), and put in the front's data volume before
@@ -1328,7 +1341,7 @@ keeps (`<dir>/<short>-stow`, the release it runs; another is refused).
   SSH" under the installer on the Kairos VM: `--keep-local N`, `backup run --output FILE|-`,
   `backup export`, `restore --input FILE|-`, the archive they stream) take a project's `pg-age-rclone`
   or `volumes-age-rclone` backup: the settings in `backup.yaml` (root's alone), the last run in `backup-last.json` and
-  the uploaded objects' digests a restore checks in `backup-digests.json` in the install directory, the volumes' archives and the dump encrypted to the recipients as they
+  the uploaded objects' digests a restore checks in `backup-digests.json` in the install directory, the volumes' archives (and, in the `acme` and `dns-cloudflare` TLS modes, the front's ACME account and certificates: "The front's certificates" there) and the dump encrypted to the recipients as they
   stream to the backup runner
   (`<name>-backup`, pulled with the stack's images, by digest, since a release of a project with
   the `docker` shape and a `pg-age-rclone` or `volumes-age-rclone` backup publishes one, and pulled again when the engine

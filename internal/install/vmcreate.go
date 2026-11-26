@@ -1195,12 +1195,8 @@ func (in *Installer) machine(ctx context.Context, c *VMCreate, p Platform) (Mach
 		return Machine{}, err
 	}
 	c.SSHKey = a["--ssh-key"] // the key the steps' ssh logs in with
-	for _, v := range c.SSHAllow {
-		p, err := netip.ParsePrefix(strings.TrimSpace(v))
-		if err != nil {
-			return Machine{}, fmt.Errorf("--ssh-allow: %q is not a source with its prefix (192.0.2.0/24, 2001:db8::/32)", v)
-		}
-		m.SSHAllow = append(m.SSHAllow, p.Masked())
+	if m.SSHAllow, err = parseSSHSources("--ssh-allow", c.SSHAllow); err != nil {
+		return Machine{}, err
 	}
 	switch {
 	case len(m.SSHAllow) == 0 && !p.ISO:

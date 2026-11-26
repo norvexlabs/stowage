@@ -765,23 +765,16 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 		})
 	}
 	if len(m.SSHAllow) > 0 {
-		var b strings.Builder
-		fmt.Fprintf(&b, "# SSH, from the sources `%s vm create --ssh-allow` gave.\n", ctl)
-		for _, p := range m.SSHAllow {
-			family := "ip"
-			if p.Addr().Is6() {
-				family = "ip6"
-			}
-			fmt.Fprintf(&b, "%s saddr %s tcp dport 22 accept\n", family, p.Masked())
-		}
+		// At every boot (/etc/nftables.d is not kept); once `ssh-allow set` recorded sources of its
+		// own (SSHAllowFile), the boot unit that runs `ssh-boot` after this stage writes them over.
 		boot = append(boot, stage{
 			Name:  name + ": SSH's sources",
-			Files: []cloudFile{{Path: SSHRules, Permissions: 0o644, Content: b.String()}},
+			Files: []cloudFile{{Path: SSHRules, Permissions: 0o644, Content: sshRules(fmt.Sprintf("SSH, from the sources `%s vm create --ssh-allow` gave.", ctl), m.SSHAllow)}},
 		}, stage{
 			// A step of its own, after the one that writes the file. The ruleset flushes its own
 			// table only: Docker's rules stay (a restart of nftables.service would flush them all).
 			Name:     name + ": the firewall with SSH's sources",
-			Commands: []string{"nft -f /etc/nftables.conf"},
+			Commands: []string{"nft -f " + FirewallConf},
 		})
 	}
 	if m.Timezone != "" {
@@ -1024,8 +1017,10 @@ const sshdNotReloaded = "stowage-sshd-not-reloaded"
 // sshdReload` the list's status stays a's or b's failure, and the reload's own is always 0.
 const sshdReload = "{ for u in ssh.service sshd.service; do systemctl try-reload-or-restart $u 2>/dev/null; done; true; }"
 
-// SSHRules is the firewall's SSH rule file on the VM: the bundle's opens SSH to every source, and
-// a cloud-config with Machine.SSHAllow replaces it.
+// SSHRules is the firewall's SSH rule file on the VM: the bundle's opens SSH to every source; a
+// cloud-config with Machine.SSHAllow replaces it at every boot (/etc/nftables.d is not kept); once
+// `ssh-allow set` recorded sources of its own (SSHAllowFile), `ssh-boot` writes them over at every
+// boot after the cloud-config's stage.
 const SSHRules = "/etc/nftables.d/ssh.nft"
 
 // zoneName is an IANA time zone name, as /usr/share/zoneinfo names its files.

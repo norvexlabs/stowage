@@ -1,0 +1,19 @@
+[Unit]
+Description={{.Name}}: SSH's sources `{{.Ctl}} ssh-allow set` recorded, over the cloud-config's
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
+# Only once `ssh-allow set` recorded sources (/etc/nftables.d is not kept: the image's rule, or the
+# seed's, is there at every boot until this unit writes them).
+ConditionPathExists=/usr/local/{{.Name}}/ssh-allow.yaml
+# After the cloud-config's boot stage, which writes the seed's sources, and the firewall's load.
+After=nftables.service cos-setup-boot.service
+# Before the host daemon, whose start reads and writes the same record and rule file.
+Before={{.Name}}-hostd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/{{.Ctl}} ssh-boot
+
+[Install]
+WantedBy=multi-user.target

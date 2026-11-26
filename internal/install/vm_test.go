@@ -999,10 +999,16 @@ type nftHost struct {
 	// listErr fails `nft list`; failOn fails a command whose last argument ends with it.
 	listErr error
 	failOn  string
+	// lockDir, when set: each load of the firewall records whether its lock was held (unlocked).
+	lockDir  string
+	unlocked int
 }
 
 func (h *nftHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 	h.ran = append(h.ran, c.Args)
+	if h.lockDir != "" && slices.Equal(c.Args, []string{"nft", "-f", FirewallConf}) && !firewallHeld(h.lockDir) {
+		h.unlocked++
+	}
 	switch {
 	case len(c.Args) > 1 && c.Args[1] == "list":
 		return nil, h.listErr
@@ -1015,8 +1021,15 @@ func (h *nftHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 func TestEveryStartOpensTheFrontsPortsInTheFirewall(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	host := &nftHost{}
-	in := &Installer{R: testRelease(t, "1.0.0"), O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host, Log: io.Discard}}
+	fw := filepath.Join(t.TempDir(), "nftables.d")
+	// Each load holds the firewall's lock, which the host daemon's SSH changes take too.
+	host := &nftHost{lockDir: fw}
+	defer func() {
+		if host.unlocked > 0 {
+			t.Errorf("%d loads without the firewall's lock", host.unlocked)
+		}
+	}()
+	in := &Installer{R: testRelease(t, "1.0.0"), O: Options{Dir: t.TempDir(), Firewall: fw, Host: host, Log: io.Discard}}
 	file := filepath.Join(in.O.Firewall, "notes-ports.nft")
 	env := NewEnvFile()
 	env.Set("STOWAGE_TLS_MODE", "internal")
@@ -1984,5 +1997,32 @@ func TestABootOfAnotherShortNameIsRefused(t *testing.T) {
 	}
 	if len(e.docker.ran("compose")) > 0 {
 		t.Error("the stack was brought up")
+	}
+}
+
+// A start that changes no file takes no lock: it needs no lock directory (the bundle's installer
+// run where /run/nftables.d cannot be made).
+func TestAStartChangingNoFirewallFileTakesNoLock(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	host := &nftHost{}
+	fw := filepath.Join(t.TempDir(), "nftables.d")
+	in := &Installer{R: testRelease(t, "1.0.0"), O: Options{Dir: t.TempDir(), Firewall: fw, Host: host, Log: io.Discard}}
+	env := NewEnvFile()
+	env.Set("STOWAGE_TLS_MODE", "internal")
+	env.Set(HTTPPortVar, "80")
+	env.Set(HTTPSPortVar, "443")
+	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
+		t.Fatal(err)
+	}
+	// The lock file goes: a start with nothing to change makes it again only if it takes the lock.
+	if err := os.Remove(filepath.Join(fw, ".firewall.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
+		t.Fatalf("a start that changes nothing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fw, ".firewall.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the lock was taken: %v", err)
 	}
 }

@@ -73,7 +73,9 @@ share; each shape's own fields and verbs are on its page:
   none — so a program compares what it would give with what the install holds; `restore_awaited` (`true`, absent otherwise) while
   an install given an export by `--secrets` awaits its data (from Stowage 0.48.0 every one whose release runs
   backups, or whose hook is given the export's provision values: until `restore` loads a backup,
-  or `provision` or `reset-db` ends the wait), `made_again` (`true`, absent otherwise; Docker and
+  or `provision` or `reset-db` ends the wait), `front_waits` (`true`, absent otherwise; Docker and the
+  VM, Stowage 0.50.0 or later) while it does in the `acme` or `dns-cloudflare` mode, its front held
+  until the restore brings its certificates back (its routes not served meanwhile), `made_again` (`true`, absent otherwise; Docker and
   the VM, Stowage 0.48.0 or later) for an install made by `--secrets` from another install's
   export (a file with `export: true`, which `secrets export` writes from Stowage 0.49.0; a file
   without it seeds a plain install), recorded before its `.env` and kept for good, and `volumes_split` while a restore left the

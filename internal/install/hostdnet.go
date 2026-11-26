@@ -1182,12 +1182,40 @@ func (h *Hostd) reloadBanner(ctx context.Context) error {
 // stopper is an armed timer: Stop disarms it.
 type stopper interface{ Stop() bool }
 
-// netRevert is one NIC's armed revert: its timer, and whether it fired (its function may still
+// netRevert is one owner's armed revert (a NIC's, by role, or SSH's sources', sshOwner): its timer, and whether it fired (its function may still
 // wait for netMu).
 type netRevert struct {
 	timer stopper
 	fired atomic.Bool
+	// why is what the undo is for (notConfirmed: a window's end): a confirmation refused names it;
+	// undo is the undo itself, which a later change may run first (setSSHAllow).
+	why  string
+	undo func(context.Context) error
 }
+
+// endedBy is how a confirmation refused names what ended the change: its armed undo's why.
+func (a *netRevert) endedBy() string {
+	switch {
+	case a == nil || a.why == notConfirmed:
+		return "the change's window ended"
+	case a.why == revertAsked:
+		return "a revert was asked"
+	case a.why == notApplied:
+		return "the change could not be applied"
+	case a.why == restartedUnconfirmed:
+		return "the host daemon restarted inside the window"
+	}
+	return "the change is being undone (" + a.why + ")"
+}
+
+// notConfirmed is the why of a window's end; restartedUnconfirmed that of a change the daemon's
+// start finds still awaiting confirmation.
+const (
+	notConfirmed         = "not confirmed in time"
+	restartedUnconfirmed = "the host daemon restarted before it was confirmed"
+	revertAsked          = "asked"                   // `… revert`
+	notApplied           = "it could not be applied" // a change's restore
+)
 
 // armTimer runs f after d: afterFunc's, else time.AfterFunc.
 func (h *Hostd) armTimer(d time.Duration, f func()) stopper {
@@ -1204,13 +1232,16 @@ func (h *Hostd) unit() time.Duration {
 	return h.Unit
 }
 
-// armRevert runs undo of owner's NIC's change (empty: the primary's) at deadline, as attempt (1 for a window's end); when undo fails, it is tried
+// armRevert runs undo of owner's change (a NIC's role, empty the primary's; or sshOwner) at deadline, as attempt (1 for a window's end); when undo fails, it is tried
 // again every revertRetrySecs, revertAttempts times in all: the VM may be unreachable until it
-// succeeds. A later change to that NIC's network disarms it (netDisarm); another NIC's revert
-// stays armed. netMu is held.
+// succeeds. A later change of the same owner disarms it (netDisarm); another owner's revert stays
+// armed. netMu is held.
 func (h *Hostd) armRevert(owner string, deadline time.Time, attempt int, why string, undo func(context.Context) error) {
 	h.netDisarm(owner)
 	a := &netRevert{}
+	// A retry is armed past the window's end: a confirmation from now on comes too late.
+	a.fired.Store(attempt > 1)
+	a.why, a.undo = why, undo
 	if h.netReverts == nil {
 		h.netReverts = map[string]*netRevert{}
 	}
@@ -1230,22 +1261,41 @@ func (h *Hostd) armRevert(owner string, deadline time.Time, attempt int, why str
 
 // undo runs undo now, as attempt; when it fails, armRevert tries it again. netMu is held.
 func (h *Hostd) undo(owner string, attempt int, why string, undo func(context.Context) error) error {
+	change := "network change"
+	if owner == sshOwner {
+		change = "change of SSH's sources"
+	}
 	err := undo(h.ctx)
 	switch {
+	case errors.Is(err, errNothingToUndo):
+		h.O.logf("%s (%s): %v", change, why, err)
+		return nil
 	case err == nil:
-		h.O.logf("network change undone: %s", why)
+		h.O.logf("%s undone: %s", change, why)
 	case h.ctx.Err() != nil:
-		h.O.logf("undoing the network change (%s): %v; the daemon stops: its start undoes it", why, err)
+		h.O.logf("undoing the %s (%s): %v; the daemon stops: its start undoes it", change, why, err)
 	case attempt < revertAttempts:
-		h.O.logf("undoing the network change (%s, attempt %d of %d): %v; trying again in %d s", why, attempt, revertAttempts, err, revertRetrySecs)
+		h.O.logf("undoing the %s (%s, attempt %d of %d): %v; trying again in %d s", change, why, attempt, revertAttempts, err, revertRetrySecs)
 		h.armRevert(owner, time.Now().Add(revertRetrySecs*h.unit()), attempt+1, why, undo)
 	default:
-		h.O.logf("undoing the network change (%s): %v; given up after %d attempts", why, err, revertAttempts)
+		h.O.logf("undoing the %s (%s): %v; given up after %d attempts", change, why, err, revertAttempts)
+		// The window ended: a confirmation still comes too late, and tries the undo again.
+		gaveUp := &netRevert{timer: stoppedTimer{}, why: why, undo: undo}
+		gaveUp.fired.Store(true)
+		if h.netReverts == nil {
+			h.netReverts = map[string]*netRevert{}
+		}
+		h.netReverts[owner] = gaveUp
 	}
 	return err
 }
 
-// netDisarm stops role's NIC's armed revert, one whose timer already fired included. netMu is held.
+// stoppedTimer is the timer of a revert that gave up: nothing left to stop.
+type stoppedTimer struct{}
+
+func (stoppedTimer) Stop() bool { return false }
+
+// netDisarm stops owner role's armed revert (a NIC's, or sshOwner), one whose timer already fired included. netMu is held.
 func (h *Hostd) netDisarm(role string) {
 	if a := h.netReverts[role]; a != nil {
 		a.timer.Stop()
@@ -1321,7 +1371,7 @@ func (h *Hostd) netResume() {
 			continue
 		}
 		if st.Pending != nil {
-			_ = h.undo(f.role, 1, "the host daemon restarted before it was confirmed", h.revertWindow(f, st.Pending.ID, st.Pending.Interface))
+			_ = h.undo(f.role, 1, restartedUnconfirmed, h.revertWindow(f, st.Pending.ID, st.Pending.Interface))
 			continue
 		}
 		// A daemon stopped between recording a change and applying it left networkd on another: the
@@ -1495,13 +1545,13 @@ func (h *Hostd) netSet(f netFiles, cur, next *NetConfig, secs int, arm bool) (ne
 		return st, err
 	}
 	if st.Pending != nil {
-		h.armRevert(f.role, st.Pending.Deadline, 1, "not confirmed in time", h.revertWindow(f, st.Pending.ID, st.Pending.Interface))
+		h.armRevert(f.role, st.Pending.Deadline, 1, notConfirmed, h.revertWindow(f, st.Pending.ID, st.Pending.Interface))
 	}
 	// The daemon's context, not the request's: a client that goes away (its SSH session cut by
 	// the change itself) does not make a change that worked fail.
 	if err := h.netApply(h.ctx, f, next, iface); err != nil {
 		h.netDisarm(f.role)
-		if uerr := h.undo(f.role, 1, "it could not be applied", h.restore(f, cur, iface)); uerr != nil {
+		if uerr := h.undo(f.role, 1, notApplied, h.restore(f, cur, iface)); uerr != nil {
 			return st, fmt.Errorf("%w; restoring the settings before it failed too, and is tried again every %d s: %v", err, revertRetrySecs, uerr)
 		}
 		return st, fmt.Errorf("%w: the settings before it are back", err)
@@ -1806,12 +1856,18 @@ func (h *Hostd) confirm() (NetAnswer, error) {
 	if st.Pending == nil {
 		return NetAnswer{}, fail(http.StatusConflict, "nothing awaits confirmation: a change not confirmed in its window, or before a restart or a reboot, is undone; %s (`%s network` shows the network)", f.inForce(), h.R.Ctl())
 	}
-	if a, p := h.netReverts[f.role], st.Pending; a != nil && a.fired.Load() {
-		h.netDisarm(f.role)
-		if err := h.undo(f.role, 1, "not confirmed in time", h.revertWindow(f, p.ID, p.Interface)); err != nil {
-			return NetAnswer{}, fail(http.StatusConflict, "the change's window ended: undoing it failed, and is tried again every %d s: %v; %s", revertRetrySecs, err, f.inForce())
+	// Ended: its timer fired, or none is armed past the deadline (an undo the daemon's stop cut, which
+	// its start does).
+	if a, p := h.netReverts[f.role], st.Pending; a != nil && a.fired.Load() || a == nil && time.Now().After(p.Deadline) {
+		ended, why := a.endedBy(), notConfirmed
+		if a != nil {
+			why = a.why // a retry keeps what it undoes for
 		}
-		return NetAnswer{}, fail(http.StatusConflict, "the change's window ended: the settings before it are back; %s", f.inForce())
+		h.netDisarm(f.role)
+		if err := h.undo(f.role, 1, why, h.revertWindow(f, p.ID, p.Interface)); err != nil {
+			return NetAnswer{}, fail(http.StatusConflict, "%s: undoing it failed, and is tried again every %d s: %v; %s", ended, revertRetrySecs, err, f.inForce())
+		}
+		return NetAnswer{}, fail(http.StatusConflict, "%s: the settings before it are back; %s", ended, f.inForce())
 	}
 	// Recorded first: a confirmation that is not recorded leaves the window armed.
 	st.Pending = nil
@@ -1858,7 +1914,7 @@ func (h *Hostd) revertNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.netDisarm(f.role)
-	if err := h.undo(f.role, 1, "asked", h.revertWindow(f, st.Pending.ID, st.Pending.Interface)); err != nil {
+	if err := h.undo(f.role, 1, revertAsked, h.revertWindow(f, st.Pending.ID, st.Pending.Interface)); err != nil {
 		replyErr(w, fmt.Errorf("%w (tried again every %d s)", err, revertRetrySecs))
 		return
 	}

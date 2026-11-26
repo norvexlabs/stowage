@@ -22,6 +22,8 @@
 # fails it past a rollback barrier is kept, as going back would leave nothing serving;
 # the root gives the VM a NIC for the role 1.0.1 adds (truenas_vm_power power-cycles it), which
 # `network attach` names from the next boot and `network set --role` re-addresses;
+# `ssh-allow set` adds an SSH source, confirmed over a new connection, and a list leaving this host
+# out shuts it out until its window ends, the confirmed list kept through the upgrade's reboot;
 # `network set` keeps the lease as a static address, a unique local IPv6 address beside it, and a
 # change not confirmed comes undone at its window's end and at a reboot; then `tofu destroy`, the
 # VM's zvol holding a snapshot (force_destroy), leaves nothing on TrueNAS. Along
@@ -46,7 +48,7 @@ vm_env
 # those, the steps they need (NEEDS, the state they leave) and the ones every run needs (the
 # project, its ship and its mirror, the VM, its install, and its destroy unless E2E_KEEP_VM keeps
 # it); a step checks what an earlier one left only when that one ran (ran <id>). Unset, every step.
-STEPS=(docker-k8s kit-vm vm install firewall listen tune retune l4 app-socket mirror-login disk seed audit front kits reset-db backups restore allow upgrade nic rollback fallback barrier cross network recovery destroy)
+STEPS=(docker-k8s kit-vm vm install firewall listen tune retune l4 app-socket mirror-login disk seed audit front kits reset-db backups restore allow sshallow upgrade nic rollback fallback barrier cross network recovery destroy)
 declare -A NEEDS=([kit-vm]=docker-k8s [kits]=docker-k8s [restore]=backups [upgrade]="retune backups allow" [nic]=upgrade [rollback]=upgrade [fallback]=rollback [barrier]=fallback [cross]=barrier)
 declare -A WANT=() RAN=()
 # want <id>: the step is asked for, with the steps it needs.
@@ -718,6 +720,28 @@ step_allow() {
 	! reach "$vm4" 5432 || fail "the L4 route's port still answers this host, which its allowlist no longer holds"
 }
 
+step_sshallow() {
+	step "ssh-allow on the VM: a source added, confirmed over a new connection; a list leaving this host out shuts it out until its window ends, then the list before it is back"
+	on_vm notes-stow ssh-allow --json >"$WORK/ssh-allow.json" 2>"$WORK/ssh-allow.err" && jq -e --arg a "$MIRROR_IP/32" '.from == "cloud-config" and (.sources | index($a))' "$WORK/ssh-allow.json" >/dev/null ||
+		{ cat "$WORK/ssh-allow.json" "$WORK/ssh-allow.err"; fail "ssh-allow does not show the seed's sources"; }
+	local allow=$MIRROR_IP/32 a
+	for a in "${HOST6[@]}"; do allow+=",$a/128"; done
+	on_vm notes-stow ssh-allow set "$allow,192.0.2.0/24" --revert-secs 30 --json >"$WORK/ssh-set.json" 2>"$WORK/ssh-set.err" && jq -e '.pending.secs_left > 0' "$WORK/ssh-set.json" >/dev/null ||
+		{ cat "$WORK/ssh-set.json" "$WORK/ssh-set.err"; fail "ssh-allow set"; }
+	# Each on_vm is a new connection: the confirmation proves the new list lets this host in.
+	on_vm notes-stow ssh-allow confirm --json >"$WORK/ssh-confirm.json" 2>"$WORK/ssh-confirm.err" && jq -e '.from == "set" and .pending == null' "$WORK/ssh-confirm.json" >/dev/null ||
+		{ cat "$WORK/ssh-confirm.json" "$WORK/ssh-confirm.err"; fail "ssh-allow confirm"; }
+	on_vm sudo nft list chain inet notes input | drained -q 'ip saddr 192.0.2.0/24 tcp dport 22 accept' || fail "the firewall does not hold the source ssh-allow set added"
+	# A list leaving this host out: the session that sets it stays, a new one is refused, and the
+	# window's end brings the confirmed list back.
+	on_vm notes-stow ssh-allow set 192.0.2.0/24 --revert-secs 30 >"$WORK/ssh-out.txt" 2>&1 || { cat "$WORK/ssh-out.txt"; fail "ssh-allow set leaving this host out"; }
+	! on_vm true 2>/dev/null || fail "a new SSH connection from this host is let in by a list without it"
+	local end=$((SECONDS + 90))
+	until on_vm true 2>/dev/null; do ((SECONDS < end)) || fail "SSH never let this host in again after the window"; sleep 5; done
+	on_vm notes-stow ssh-allow --json >"$WORK/ssh-back.json" 2>"$WORK/ssh-back.err" && jq -e --arg a "$MIRROR_IP/32" '.from == "set" and .pending == null and (.sources | index($a)) and (.sources | index("192.0.2.0/24"))' "$WORK/ssh-back.json" >/dev/null ||
+		{ cat "$WORK/ssh-back.json" "$WORK/ssh-back.err"; fail "the window's end did not bring the confirmed list back"; }
+}
+
 step_upgrade() {
 	step "ship beta 1.0.1, which names a second NIC and adds a required secret input, carry it through the mirror; the VM upgrades from it, given that input, and its health gate keeps it"
 	sed -i 's/^    uplink: { primary: true, reason: "the default route'"'"'s" }$/&\n    edge: { mtu: 1400, reason: "a NIC the root attaches" }/' "$P/stowage.yaml"
@@ -785,6 +809,11 @@ step_upgrade() {
 	# start opens it to the allowlist's sources again.
 	on_vm sudo nft list chain inet notes input | drained -q 'tcp dport 5432 ip saddr 192.0.2.1 accept' || fail "the upgraded boot lost the L4 route's allowlist"
 	! reach "$vm4" 5432 || fail "the L4 route's port answers this host after the upgrade"
+	# The list ssh-allow set outlives the reboot: the boot's unit writes it over the seed's sources.
+	if ran sshallow; then
+		[[ $(on_vm systemctl is-active notes-ssh.service) == active ]] || fail "the boot's unit did not write ssh-allow set's sources"
+		on_vm sudo nft list chain inet notes input | drained -q 'ip saddr 192.0.2.0/24 tcp dport 22 accept' || fail "the upgraded boot put the seed's SSH sources back over ssh-allow set's"
+	fi
 	assessment >"$WORK/assess.txt" || { cat "$WORK/assess.txt"; fail "the boot assessment cannot be read"; }
 	grep -qx 'enable_boot_assessment=' "$WORK/assess.txt" && grep -qx 'boot_assessment_tentative=' "$WORK/assess.txt" ||
 		{ cat "$WORK/assess.txt"; fail "the health gate did not mark the upgraded boot good"; }

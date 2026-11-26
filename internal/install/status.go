@@ -224,7 +224,9 @@ type DockerStatus struct {
 	// hook runs, no backup is taken, until restore, provision or reset-db;
 	// VolumesSplit: a restore left the volumes half restored (or one runs). Docker's as the VM's.
 	RestoreAwaited bool `json:"restore_awaited,omitempty"`
-	VolumesSplit   bool `json:"volumes_split,omitempty"`
+	// FrontWaits: while it awaits its data in an ACME mode, the front is held (frontWaits).
+	FrontWaits   bool `json:"front_waits,omitempty"`
+	VolumesSplit bool `json:"volumes_split,omitempty"`
 	// MadeAgain: the install was made by --secrets, from another install's export.
 	MadeAgain     bool      `json:"made_again,omitempty"`
 	Services      []Service `json:"services"`
@@ -464,6 +466,7 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 		Installed: &StatusRelease{Version: v, Revision: n, Installer: installerFor(ref, of, v, n)}}}
 	st.Installing, st.InstallFailed, _ = in.firstInstall()
 	st.RestoreAwaited = in.restoreAwaited()
+	st.FrontWaits = in.frontWaits(env)
 	st.MadeAgain = fileExists(in.path(madeAgainFile))
 	// As the VM's: not while a restore runs (it holds the mark from its database's swap to its last
 	// volume's), which holds the install's hostLock — a backup refuses to start on split volumes.

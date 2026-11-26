@@ -40,7 +40,7 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 	s := string(df)
 	for _, want := range []string{"FROM " + params.KairosInit + " AS kairos-init", "FROM " + params.Base + " AS image\n",
 		"-s install -v 0.0.0\n", `-s init --skip-step cisHardening -v "1.2.0-r2"`, "nftables open-vm-tools qemu-guest-agent tzdata", "apt-cache show tzdata-legacy", "/usr/share/notes-preload/", "/etc/notes/os-version",
-		"notes-preload.service", "chmod 0440 /etc/sudoers.d/10-notes", "notes-health.service", "notes-network.service", "notes-tune.service", "notes-tune-online.service", "notes-route6.service", "notes-tables.service", "ethtool",
+		"notes-preload.service", "chmod 0440 /etc/sudoers.d/10-notes", "notes-health.service", "notes-network.service", "notes-tune.service", "notes-tune-online.service", "notes-route6.service", "notes-tables.service", "notes-ssh.service", "ethtool",
 		"mv /usr/share/notes/08_grub.yaml \"$f\"", "sha256sum -c -", "shapes.kairos.kairos_init: its", "grep -qx 'AllowTcpForwarding no' /etc/ssh/sshd_config.d/05-kairos-hardening.conf",
 		"mv /etc/ssh/sshd_config.d/05-kairos-hardening.conf /usr/lib/notes/sshd_config.d/",
 		"printf 'Include /usr/lib/notes/sshd_config.d/*.conf\\n' > /etc/ssh/sshd_config.d/00-notes-hardening.conf",
@@ -228,6 +228,24 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 	for _, want := range []string{"ExecStart=/usr/sbin/notes-stow route6-boot\n", "After=network-online.target cos-setup-boot.service\n", "Before=docker.service\n", "ConditionPathExists=!/run/cos/live_mode\n", "WantedBy=multi-user.target\n"} {
 		if !strings.Contains(string(r6), want) {
 			t.Errorf("route6 unit lacks %q:\n%s", want, r6)
+		}
+	}
+	// The host daemon after the cloud-config's boot stage, whose load of the firewall takes no lock.
+	hd, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-hostd.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(hd), "After=docker.service cos-setup-boot.service\n") {
+		t.Errorf("hostd unit not after the boot stage:\n%s", hd)
+	}
+	// SSH's recorded sources after the cloud-config's boot stage, which writes the seed's.
+	sh, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-ssh.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"ExecStart=/usr/sbin/notes-stow ssh-boot\n", "After=nftables.service cos-setup-boot.service\n", "Before=notes-hostd.service\n", "ConditionPathExists=!/run/cos/live_mode\n", "ConditionPathExists=/usr/local/notes/ssh-allow.yaml\n", "Type=oneshot\n", "WantedBy=multi-user.target\n"} {
+		if !strings.Contains(string(sh), want) {
+			t.Errorf("ssh unit lacks %q:\n%s", want, sh)
 		}
 	}
 	// The services' tables before Docker restores their containers, once the network is up.

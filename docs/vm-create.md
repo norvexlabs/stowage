@@ -474,7 +474,10 @@ over SSH from your machine takes its host key with `--known-hosts-line`.
   --tune-profile`, recorded in the settings as `tune_profile`); the whole
   addressing, IPv4 and IPv6, is checked by the rules `network set` follows (below), a refusal
   starting "the VM's network:"; `--ssh-allow` (CIDR, repeatable or comma-separated,
-  IPv4 or IPv6; each masked to its prefix) the sources SSH accepts — without it SSH accepts every
+  IPv4 or IPv6; each masked to its prefix; an IPv4 network written IPv4-mapped,
+  `::ffff:a.b.c.d/N` with N of 96 or more, is taken as that IPv4 network, a shorter one refused) the
+  sources SSH accepts at the first boot
+  (`<short>-stow ssh-allow set` changes them later: see [vm.md](vm.md)) — without it SSH accepts every
   source, and the run warns; on a cloud (`aws`, `azure`, `gcp`, `scaleway`), whose VM answers on a public
   address, without it SSH accepts this machine's public address alone, as
   `https://checkip.amazonaws.com` sees it (logged: `SSH accepts this machine's public address
@@ -603,7 +606,9 @@ over SSH from your machine takes its host key with `--known-hosts-line`.
   which would take router advertisements, and after the override `<short>-stow network set`
   makes; the same sections as that override's — see `network set`) and reloads networkd; with `--ssh-allow`
   writes `/etc/nftables.d/ssh.nft` (`ip saddr <cidr> tcp dport 22 accept`, `ip6 saddr` for IPv6;
-  replacing the bundle's, open to every source) and then, in a step of its own, loads the
+  replacing the bundle's, open to every source; once `<short>-stow ssh-allow set` recorded sources
+  of its own, `/usr/local/<name>/ssh-allow.yaml`, `<name>-ssh.service` writes them over these after
+  the boot stage — see [vm.md](vm.md)) and then, in a step of its own, loads the
   firewall again (`nft -f /etc/nftables.conf`, never a restart of `nftables.service`, whose stop
   would flush Docker's rules); with `--timezone` links `/etc/localtime` to the zone and writes
   `/etc/timezone`; and writes the first install's settings, `/etc/<name>/install.yaml`

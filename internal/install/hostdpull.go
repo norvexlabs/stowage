@@ -202,7 +202,8 @@ func (h *Hostd) importArchive(ctx context.Context, r io.Reader, dir string, pg *
 	case err != nil:
 		return "", refused("it does not read as a backup's archive (%v)", err)
 	}
-	// Its first object names the backup: the first volume's archive, or the backup's last object.
+	// Its first object names the backup: the first volume's archive, else the front's (frontObject),
+	// else the backup's last object.
 	obj := first.Name
 	if len(pg.Volumes) > 0 {
 		base, ok := strings.CutSuffix(first.Name, "."+pg.Volumes[0]+".tar.age")
@@ -210,25 +211,38 @@ func (h *Hostd) importArchive(ctx context.Context, r io.Reader, dir string, pg *
 			return "", refused("it begins with %q, not the archive of the volume %s that a backup of %s begins with", first.Name, pg.Volumes[0], name)
 		}
 		obj = base + lastSuffix(pg)
+	} else if base, ok := strings.CutSuffix(first.Name, "."+FrontDataVolume+".tar.age"); ok {
+		obj = base + lastSuffix(pg)
 	}
 	if err := ownBackup(name, obj, target, pg); err != nil {
 		return "", err
 	}
+	// The volumes' archives, the front's when the backup took one (its install in an ACME mode),
+	// then the last object.
+	front := frontObject(obj)
 	want := []string{}
 	for _, v := range pg.Volumes {
 		want = append(want, volumeObject(obj, v))
 	}
-	want = append(want, obj)
-	hdr := first
-	for i, o := range want {
-		if i > 0 {
+	want = append(want, front, obj)
+	hdr, read := first, true // read: hdr is the next member's, not yet taken
+	for _, o := range want {
+		if !read {
 			hdr, err = tr.Next()
 			switch {
 			case errors.Is(err, io.EOF):
+				if o == front {
+					o = obj
+				}
 				return "", refused("it ends before %s: it is cut short", o)
 			case err != nil:
 				return "", refused("it does not read as a backup's archive (%v)", err)
 			}
+		}
+		read = false
+		if o == front && hdr.Name != front {
+			read = true // none: hdr is the last object's
+			continue
 		}
 		switch {
 		case hdr.Name != o:

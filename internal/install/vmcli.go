@@ -278,7 +278,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	dirFlag(netBoot)
 	tablesBoot := tablesBootCommand(func(*cobra.Command) (*Installer, error) { return in, prepare() })
 	dirFlag(tablesBoot)
-	root.AddCommand(install, boot, back, hostd, gate, netBoot, tuneBootCommand(r, stderr), route6BootCommand(r, stderr), tablesBoot, tuneCommand(in, prepare, terminal, true))
+	root.AddCommand(install, boot, back, hostd, gate, netBoot, tuneBootCommand(r, stderr), route6BootCommand(r, stderr), sshBootCommand(r, stderr), tablesBoot, tuneCommand(in, prepare, terminal, true))
 
 	var values bool
 	jsonFlag := func(cmd *cobra.Command) {
@@ -757,6 +757,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		return out.Value, err
 	}))
 	netCmd := networkCommand(c, name, stdout)
+	root.AddCommand(sshAllowCommand(c, stdout, stderr))
 	netAttach := netAttachCommand(r, &o.Dir, stdout)
 	dirFlag(netAttach)
 	netCmd.AddCommand(netAttach)
@@ -919,7 +920,19 @@ type hostClient struct {
 // shorten it); 0 is a second. margin is how long a follow's request may take past the wait it asks
 // for, whatever the unit; 0 is requestMargin. Only a test of a daemon that never answers
 // shortens it: a short one would fail a request a loaded machine answers late.
-type clientTimes struct{ unit, margin time.Duration }
+type clientTimes struct {
+	unit, margin time.Duration
+	// env reads the client's environment (SSH_CONNECTION); nil is the process's. Tests set it.
+	env func(string) string
+}
+
+// getenv is the client's environment variable key.
+func (c *hostClient) getenv(key string) string {
+	if c.env != nil {
+		return c.env(key)
+	}
+	return os.Getenv(key)
+}
 
 // second is the client's second.
 func (c *hostClient) second() time.Duration { return cmp.Or(c.unit, time.Second) }
@@ -1064,6 +1077,9 @@ func (c *hostClient) status(ctx context.Context, asJSON, values bool) error {
 			fmt.Fprintln(c.out, "           not finished: the stack is coming up, or the provision hook runs")
 		case st.RestoreAwaited:
 			fmt.Fprintf(c.out, "           awaiting its data: made again by --secrets: %s\n", awaitedHint(c.runsBackups, func(args string) string { return "sudo " + c.ctl + " " + args }))
+		}
+		if st.FrontWaits {
+			fmt.Fprintln(c.out, "           the front waits for the restore, which brings its certificates back (an `acme` or `dns-cloudflare` mode): its routes are not served until then")
 		}
 	}
 	if st.Channel != "" {

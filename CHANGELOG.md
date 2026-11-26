@@ -3,6 +3,35 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.50.0]
+
+### Added
+
+- A Kairos VM's SSH sources can be changed after its first boot: `<short>-stow ssh-allow set
+  CIDR,…` replaces them, and the change comes undone unless `ssh-allow confirm`, run over a new
+  SSH connection, keeps it within its window (`--revert-secs`; every change has one), as `network
+  set` does; `ssh-allow` shows them, what set them and a change awaiting confirmation, `ssh-allow
+  revert` undoes it now, `--json` on each. From the first `set`, every boot writes them over the
+  sources `vm create --ssh-allow` gave, which are the first boot's alone (an OS built by
+  0.50.0 or later, whatever release made the seed). The app socket reads the sources but never
+  changes them.
+- In the `acme` and `dns-cloudflare` TLS modes, every backup now holds the front's ACME account and
+  certificates, and a restore onto a machine made again by `--secrets` puts them back: rebuilding a
+  machine no longer asks the CA for its certificates again, which met Let's Encrypt's limit of 5
+  duplicate certificates a week. A backup taken before 0.50.0 restores as before, the front then
+  asking for them. Rehearse a recovery with `--acme-ca` pointing at a staging directory.
+
+### Fixed
+
+- `network confirm` is refused once the window has ended and its undo failed (tried again, or given
+  up), and tries the undo again: before, it kept a change its window had already ended.
+
+### Changed
+
+- A machine made again by `--secrets` in the `acme` or `dns-cloudflare` mode keeps its front stopped
+  until the restore brings its certificates back (or `provision` ends the wait): its routes are not
+  served meanwhile. `status` says so (`front_waits` in `--json`).
+
 ## [0.49.0] - 2026-11-26
 
 ### Changed

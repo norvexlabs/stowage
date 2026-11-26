@@ -182,7 +182,9 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     on, the wait for the IPv6 default route before Docker: `<short>-stow route6-boot`; see
     `network set` below), `<name>-tables.service` (the
     services' nftables tables the last start loaded, at each boot before Docker: `<short>-stow
-    tables-boot`; see "A service's nftables table" ([host](host.md)) under the installer) and
+    tables-boot`; see "A service's nftables table" ([host](host.md)) under the installer),
+    `<name>-ssh.service` (once `ssh-allow set` recorded SSH's sources, at each boot after the
+    cloud-config's stage: `<short>-stow ssh-boot`; see `ssh-allow` ([vm](vm.md))) and
     `<name>-backup.timer` (not enabled: the host daemon starts it) with `<name>-backup.service` (the
     scheduled backup); see "The installer
     on the Kairos VM" below;

@@ -175,6 +175,10 @@ func (s rcloneStore) discard(ctx context.Context, obj string, logf func(string, 
 
 func (s rcloneStore) size(ctx context.Context, obj string) (int64, error) {
 	out, err := s.h.rclone(ctx, s.in, s.conf, nil, "lsjson", "--files-only", "--no-mimetype", s.shown(obj))
+	if rcloneNotFound(err) {
+		// lsjson of a file path the remote lacks: exit 3 (local, WebDAV, SFTP), not an empty list.
+		return 0, errObjectAbsent
+	}
 	if err != nil {
 		return 0, err
 	}
