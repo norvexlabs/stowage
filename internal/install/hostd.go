@@ -358,9 +358,9 @@ type Status struct {
 	// Boot is the system Kairos booted: active, passive (the fallback) or recovery; empty off
 	// Kairos.
 	Boot string `json:"boot,omitempty"`
-	// ResetFailed: on the recovery system, Kairos's automatic reset (kairos-reset.service, which
-	// lays the system out at a first boot) failed, so the VM stays there; it holds the unit's last
-	// journal lines. Empty otherwise.
+	// ResetFailed: on the recovery system, the reset that lays the system out at a first boot (the
+	// network stage's, or kairos-reset.service) failed, so the VM stays there; it holds the
+	// journal's lines telling why. Empty otherwise.
 	ResetFailed string `json:"reset_failed,omitempty"`
 	// Fallback: Kairos booted the passive system because the last upgrade's boot failed its health
 	// gate, or `rollback` chose it.
@@ -1120,7 +1120,7 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	st.Pressure = h.pressureStatus(st.Disk)
 	st.Boot = bootMode(h.O.cos())
 	if st.Boot == "recovery" {
-		st.ResetFailed = resetFailed(r.Context(), h.Host)
+		st.ResetFailed = resetFailed(r.Context(), h.Host, h.O.oem(), m.Name)
 	}
 	st.Fallback = fileExists(filepath.Join(h.O.cos(), upgradeFailure))
 	if st.Boot == "active" {
@@ -1170,23 +1170,113 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, st)
 }
 
-// kairosReset is Kairos's automatic reset unit.
+// kairosReset is Kairos's reset unit, which a boot with `kairos.reset` on its command line runs.
 const kairosReset = "kairos-reset.service"
 
-// resetLines bounds the journal lines resetFailed tells.
-const resetLines = 15
+// kairosNetwork runs Kairos's network stage, where an auroraboot disk's first boot runs its
+// automatic reset: the image's step (/system/oem/52_<name>_reset_settle.yaml), then
+// /oem/01_reset.yaml's. A reset that succeeds reboots the VM before the stage ends, and its
+// after-reset stage removes /oem/01_reset.yaml; a reset that gives up fails a step, never the
+// unit, and yip drops a failed step's output.
+const kairosNetwork = "cos-setup-network.service"
 
-// resetFailed says, when kairosReset failed in this boot, so with its last journal lines; empty
-// when it did not fail, or its state cannot be read (the next status asks again).
-func resetFailed(ctx context.Context, host Tool) string {
-	if st, _, err := unitStatus(ctx, host, kairosReset); err != nil || st != "failed" {
+// resetLines bounds the lines resetFailed tells, and resetTail the bytes of the image's step's
+// log it reads them from: the log's end, a debug reset's output before it.
+const (
+	resetLines = 15
+	resetTail  = 16 << 10
+)
+
+// resetToldLine matches the lines of the image's step's log a status tells: the step's own (udev's
+// queue, the reset's exit status) and kairos-agent's errors; resetLineMax bounds each.
+var resetToldLine = regexp.MustCompile(`^udev's queue .*; the reset runs$|^the reset failed \(exit status [0-9]+\)$|failed to reset|failed initializing spec|partition not found`)
+
+const resetLineMax = 300
+
+// FirstResetLog is where the image's first-boot reset step writes its reset's output, in the OEM
+// partition: yip keeps no output of a step that fails.
+func FirstResetLog(oem, name string) string { return filepath.Join(oem, "."+name+"-first-reset.log") }
+
+// resetFailed says, when a reset failed in this boot, why; empty when none did, while
+// kairosNetwork still runs (its next step tries the reset again), or when a state cannot be read
+// (the next status asks again). A first boot's reset failed when the network stage ended on the
+// recovery system with the disk's reset still due: /oem/01_reset.yaml there, /oem/.autoreset.skip
+// not.
+func resetFailed(ctx context.Context, host Tool, oem, name string) string {
+	if st, _, err := unitStatus(ctx, host, kairosReset); err == nil && st == "failed" {
+		out, err := host.Run(ctx, Cmd{Args: []string{"journalctl", "--unit", kairosReset, "--boot", "--no-pager", "--output", "cat", "--lines", strconv.Itoa(resetLines)}})
+		if err != nil || strings.TrimSpace(string(out)) == "" {
+			return kairosReset + " failed (`journalctl -u " + kairosReset + " -b` on the VM tells why)"
+		}
+		return kairosReset + " failed: " + joinLines(strings.Split(strings.TrimSpace(string(out)), "\n"))
+	}
+	if !fileExists(filepath.Join(oem, "01_reset.yaml")) || fileExists(filepath.Join(oem, ".autoreset.skip")) {
 		return ""
 	}
-	out, err := host.Run(ctx, Cmd{Args: []string{"journalctl", "--unit", kairosReset, "--boot", "--no-pager", "--output", "cat", "--lines", strconv.Itoa(resetLines)}})
-	if err != nil || strings.TrimSpace(string(out)) == "" {
-		return kairosReset + " failed (`journalctl -u " + kairosReset + " -b` on the VM tells why)"
+	// A unit systemd does not know has not ended: the stage runs under no other name.
+	if st, queued, err := unitStatus(ctx, host, kairosNetwork); err != nil || st == noBootUnit || !unitEnded(st, queued) {
+		return ""
 	}
-	return kairosReset + " failed: " + strings.Join(strings.Fields(strings.ReplaceAll(strings.TrimSpace(string(out)), "\n", " | ")), " ")
+	log := FirstResetLog(oem, name)
+	why := "the first boot's reset failed: the network stage ended on the recovery system, its reset still due (`journalctl -u " + kairosNetwork + " -b` and " + log + " on the VM tell more)"
+	raw, err := readTail(log, resetTail)
+	if err != nil {
+		return why + "; the image's reset step left no log"
+	}
+	// The log is root's alone (the reset's debug output reads the system's configuration): the
+	// status, which the admin group and the app socket read, tells only the step's own lines and
+	// the reset's errors, each bounded.
+	var lines []string
+	for _, l := range strings.Split(string(raw), "\n") {
+		if l = strings.TrimSpace(l); resetToldLine.MatchString(l) {
+			if len(l) > resetLineMax {
+				l = l[:resetLineMax] + "…"
+			}
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) == 0 {
+		return why + "; its log tells no error"
+	}
+	if len(lines) > resetLines {
+		lines = lines[len(lines)-resetLines:]
+	}
+	return why + ": " + joinLines(lines)
+}
+
+// joinLines is lines on one line, joined by " | ", each one's runs of blanks made one space.
+func joinLines(lines []string) string {
+	return strings.Join(strings.Fields(strings.Join(lines, " | ")), " ")
+}
+
+// readTail is file's last limit bytes, or the whole file when it is shorter, from the first line
+// that starts within them: a line cut at the start is dropped, so a tail holding no line's start
+// is empty.
+func readTail(file string, limit int64) ([]byte, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	off := max(0, fi.Size()-limit)
+	b := make([]byte, fi.Size()-off)
+	n, err := f.ReadAt(b, off)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	b = b[:n]
+	if off > 0 {
+		if i := bytes.IndexByte(b, '\n'); i >= 0 {
+			b = b[i+1:]
+		} else {
+			b = nil
+		}
+	}
+	return b, nil
 }
 
 // readBootID is the boot id the kernel publishes in file; empty when it cannot be read.

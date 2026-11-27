@@ -1,5 +1,58 @@
-name: "{{.Name}}: settle udev before the Kairos auto-reset"
+name: "{{.Name}}: the resets read the partitions once udev has recorded them"
 stages:
+  # An auroraboot disk's first boot lays the system out from its recovery system: its
+  # /oem/01_reset.yaml runs, in this stage, `udevadm trigger` and at once `kairos-agent reset`,
+  # which reads udev's database while the trigger rewrites it and gives up when it finds no
+  # partition. Kairos runs a stage directory by directory, /system/oem first, each read as its
+  # turn comes: this step runs before that file's and settles udev's queue between the trigger
+  # and the reset. A reset that succeeds runs the after-reset stage, which removes
+  # /oem/01_reset.yaml (auroraboot's step there) before /oem is read, and asks systemd for the
+  # reboot. A reset that fails leaves that file's own step to try once more, and its output in
+  # /oem/.{{.Name}}-first-reset.log. No other step of the stage runs after this one on that boot
+  # (Kairos's own network steps, in /system/oem's 00_ files, run before it; the seed has none), so
+  # none races the reboot. Kairos 4.6.0 (kairos-agent's GetCloudInitPaths, runstage and
+  # reset) and auroraboot 0.29.0 (rawDiskFirstBoot.go) do so: internal/kairos/testdata holds
+  # them, and a test refuses another release of either until it is read again.
+  network:
+    - name: "Reset the recovery system's first boot once udev's queue is drained"
+      if: '[ -f /run/cos/recovery_mode ] && [ ! -f /oem/.autoreset.skip ] && [ -f /oem/01_reset.yaml ]'
+      commands:
+        - |
+          udevadm trigger
+          start=$(date +%s)
+          if udevadm settle --timeout=120; then
+            settled="udev's queue drained in $(( $(date +%s) - start )) s"
+          else
+            settled="udev's queue still busy after 120 s"
+          fi
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $settled" > /run/{{.Name}}-first-reset
+          # The reset's debug output reads the system's configuration: its log is root's alone (the
+          # reset itself keeps the stage's umask). A log that cannot be written never keeps the
+          # reset from running.
+          log=/oem/.{{.Name}}-first-reset.log
+          (umask 077 && : > "$log") 2>/dev/null || log=/dev/null
+          echo "$settled; the reset runs" >> "$log"
+          kairos-agent --debug reset --unattended --reboot >> "$log" 2>&1
+          rc=$?
+          rm -f /run/{{.Name}}-first-reset
+          # A reset that succeeded asked systemd for the reboot: the boot ends.
+          [ "$rc" -eq 0 ] && exit 0
+          # Its after-reset stage removed the log once the system was laid out: no failure to keep.
+          [ -e "$log" ] && echo "the reset failed (exit status $rc)" >> "$log"
+          exit 1
+  # The reset this step ran succeeded: /oem/.{{.Name}}-first-reset says when udev's queue drained,
+  # and in how long. Any reset that succeeded, /oem/01_reset.yaml's retry included, removes the log
+  # of one that failed before it.
+  after-reset:
+    - name: "Record the first boot's reset after udev's queue"
+      if: '[ -f /run/{{.Name}}-first-reset ]'
+      commands:
+        - cp /run/{{.Name}}-first-reset /oem/.{{.Name}}-first-reset
+    - name: "Remove the log of a first-boot reset that failed"
+      commands:
+        - rm -f /oem/.{{.Name}}-first-reset.log
+  # A reset asked for on the command line (`kairos.reset`, the boot menu's reset entry) runs
+  # kairos-reset.service: udev's queue is drained before it too.
   initramfs:
     - if: '(grep -q "kairos.reset" /proc/cmdline || [ -f /run/cos/autoreset_mode ])'
       only_service_manager: "systemd"
@@ -17,4 +70,4 @@ stages:
           content: |
             [Service]
             ExecStartPre=-/usr/bin/udevadm trigger
-            ExecStartPre=-/usr/bin/udevadm settle --timeout=30
+            ExecStartPre=-/usr/bin/udevadm settle --timeout=120

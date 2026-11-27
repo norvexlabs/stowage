@@ -403,6 +403,14 @@ step_install() {
 	# The first boot keeps the cloud-config it pulled as /oem/95_userdata, which no later boot pulls
 	# again (the upgrade's boot is judged against it): a changed user-data is never applied.
 	userdata=$(on_vm sudo stat -c "'%Y %s'" /oem/95_userdata) || fail "the first boot kept no user-data (/oem/95_userdata)"
+	# The first boot's reset was the image's step, once udev's queue drained after its trigger
+	# (52_notes_reset_settle.yaml), not auroraboot's (/oem/01_reset.yaml, whose reset reads udev's
+	# database while its trigger rewrites it): that step's reset succeeded, its after-reset stage
+	# recording it and removing its log, and auroraboot's removing that file.
+	reset=$(on_vm sudo cat /oem/.notes-first-reset) || reset=
+	[[ $reset == *"udev's queue drained in "* ]] || fail "the first boot's reset was not the image's, after udev's queue: /oem/.notes-first-reset holds '${reset:-nothing}'"
+	on_vm sudo sh -c "'test ! -e /oem/01_reset.yaml && test ! -e /oem/.notes-first-reset.log'" ||
+		fail "the first boot's reset left /oem/01_reset.yaml (a recovery boot would reset again) or its failure's log, or SSH failed"
 	vm4=$(getent ahostsv4 "$ADDR" | awk '{print $1; exit}') # `getent hosts` gives IPv6 first
 	[[ -n $vm4 ]] || fail "$ADDR has no IPv4 address"
 }

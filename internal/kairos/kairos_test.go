@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"go.yaml.in/yaml/v3"
+
 	"github.com/google/go-containerregistry/pkg/authn"
 
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -175,6 +177,67 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		if !slices.Contains(got, want) {
 			t.Errorf("context lacks %s (has %v)", want, got)
 		}
+	}
+	// The first boot's reset: in the network stage (where auroraboot's /oem/01_reset.yaml runs it,
+	// after this directory's), on that file's first boot alone, udev's queue drained between the
+	// trigger and the reset, its output kept; its success recorded by the after-reset stage; a
+	// reset from the command line (kairos-reset.service) waits for udev's queue too.
+	raw, err := os.ReadFile(filepath.Join(dir, "files/system/oem/52_notes_reset_settle.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	type step struct {
+		If       string   `yaml:"if"`
+		Commands []string `yaml:"commands"`
+		Files    []struct {
+			Path, Content string
+		} `yaml:"files"`
+	}
+	var reset struct {
+		Stages map[string][]step `yaml:"stages"`
+	}
+	if err := yaml.Unmarshal(raw, &reset); err != nil {
+		t.Fatalf("52_notes_reset_settle.yaml: %v", err)
+	}
+	one := func(stage string) step {
+		if len(reset.Stages[stage]) != 1 {
+			t.Fatalf("52_notes_reset_settle.yaml: stage %s: %+v", stage, reset.Stages)
+		}
+		return reset.Stages[stage][0]
+	}
+	if len(reset.Stages) != 3 {
+		t.Errorf("52_notes_reset_settle.yaml: stages %+v", reset.Stages)
+	}
+	ns := one("network")
+	if ns.If != "[ -f /run/cos/recovery_mode ] && [ ! -f /oem/.autoreset.skip ] && [ -f /oem/01_reset.yaml ]" || len(ns.Commands) != 1 {
+		t.Errorf("the reset step: %+v", ns)
+	} else {
+		cmd := ns.Commands[0]
+		at := func(s string) int {
+			i := strings.Index(cmd, s)
+			if i < 0 {
+				t.Errorf("the reset step lacks %q:\n%s", s, cmd)
+			}
+			return i
+		}
+		order := []string{"udevadm trigger\n", "udevadm settle --timeout=120", "> /run/notes-first-reset\n", "log=/oem/.notes-first-reset.log\n", "(umask 077 && : > \"$log\") 2>/dev/null || log=/dev/null\n", "echo \"$settled; the reset runs\" >> \"$log\"\n",
+			"kairos-agent --debug reset --unattended --reboot >> \"$log\" 2>&1\n", "rm -f /run/notes-first-reset\n", "[ \"$rc\" -eq 0 ] && exit 0\n", "[ -e \"$log\" ] && echo \"the reset failed (exit status $rc)\" >> \"$log\"\n", "exit 1\n"}
+		if strings.HasPrefix(cmd, "umask") || strings.Contains(cmd, "\numask") {
+			t.Errorf("the reset step sets its umask for the reset itself:\n%s", cmd)
+		}
+		for i := 1; i < len(order); i++ {
+			if at(order[i-1]) >= at(order[i]) {
+				t.Errorf("the reset step runs %q before %q:\n%s", order[i], order[i-1], cmd)
+			}
+		}
+	}
+	if ar := reset.Stages["after-reset"]; len(ar) != 2 || ar[0].If != "[ -f /run/notes-first-reset ]" || !slices.Equal(ar[0].Commands, []string{"cp /run/notes-first-reset /oem/.notes-first-reset"}) ||
+		ar[1].If != "" || !slices.Equal(ar[1].Commands, []string{"rm -f /oem/.notes-first-reset.log"}) {
+		t.Errorf("the after-reset steps: %+v", ar)
+	}
+	if ir := one("initramfs"); len(ir.Files) != 1 || ir.Files[0].Path != "/etc/systemd/system/kairos-reset.service.d/10-udev-settle.conf" ||
+		!strings.Contains(ir.Files[0].Content, "ExecStartPre=-/usr/bin/udevadm settle --timeout=120\n") {
+		t.Errorf("kairos-reset.service's settle: %+v", ir)
 	}
 	unit, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-expand.service"))
 	if err != nil {
@@ -948,6 +1011,66 @@ func TestTheBundleNamesItsKairosInitRelease(t *testing.T) {
 	}
 	if !strings.Contains(dockerfile, "use kairos-init "+KairosInitRelease+"\"") || !strings.Contains(string(grub), "(kairos-init "+KairosInitRelease+")") {
 		t.Errorf("the Dockerfile or 08_grub.yaml names another release than %s", KairosInitRelease)
+	}
+}
+
+// The first boot's reset step (files/system/oem/52_NAME_reset_settle.yaml) relies on how the
+// pinned releases run it, read in their source, copied in testdata: auroraboot's first-boot
+// config (its /oem file, the sentinels its reset step tests, its trigger then its reset in the
+// network stage, the file removed after the reset) and Kairos's run order (/system/oem's files
+// before /oem's, the after-reset stage before the reboot). Another release of either is refused
+// until its source is read again and copied there.
+func TestTheFirstBootResetStepMatchesItsReleases(t *testing.T) {
+	t.Parallel()
+	tag, _, _ := strings.Cut(strings.TrimPrefix(Auroraboot, "quay.io/kairos/auroraboot:"), "@")
+	ab, err := os.ReadFile("testdata/auroraboot-" + tag + "-rawDiskFirstBoot.go.txt")
+	if err != nil {
+		t.Fatalf("%v: read auroraboot %s's pkg/ops/rawDiskFirstBoot.go, check 52_NAME_reset_settle.yaml against it, and copy it there", err, tag)
+	}
+	for _, want := range []string{
+		`resetCloudInitFile = "01_reset.yaml"`, `oemMountDir         = "/oem/"`, `autoresetSkipFile   = "/oem/.autoreset.skip"`,
+		`recoveryModeSentry  = "/run/cos/recovery_mode"`, `stageNetwork         = "network"`, `stageAfterReset      = "after-reset"`,
+		"Commands: []string{udevadmTriggerCmd},\n\t\t\t\t},\n\t\t\t\t{\n\t\t\t\t\tName:     \"Run auto reset\",\n\t\t\t\t\tCommands: []string{autoresetCmd},",
+		`If:       ` + "`" + `[ -f "` + "` + recoveryModeSentry + `" + `" ] && [ ! -f "` + "` + autoresetSkipFile + `" + `" ]` + "`",
+		`Commands: []string{"rm " + oemMountDir + resetCloudInitFile},`,
+	} {
+		if !strings.Contains(string(ab), want) {
+			t.Errorf("auroraboot %s's first-boot config no longer holds %q: check 52_NAME_reset_settle.yaml against it", tag, want)
+		}
+	}
+	k, err := os.ReadFile("testdata/kairos-" + KairosInitRelease + "-stages.txt")
+	if err != nil {
+		t.Fatalf("%v: read Kairos %s's agent (GetCloudInitPaths, runstage, the reset's end, the reboot) and yip's executor, check 52_NAME_reset_settle.yaml against them, and copy them there", err, KairosInitRelease)
+	}
+	for _, want := range []string{
+		`return []string{"/system/oem", "/oem/", "/usr/local/cloud-config/"}`,
+		"err = cfg.CloudInitRunner.Run(s, cloudInitPaths...)",
+		"for _, source := range args {\n\t\tif err := e.runStage(stage, source, fs, console); err != nil {",
+		"err = r.resetHook(cnst.AfterResetHook, false)",
+		"\treturn Hook(r.cfg, hook)\n",
+		`SH("reboot")`,
+	} {
+		if !strings.Contains(string(k), want) {
+			t.Errorf("Kairos %s no longer holds %q: check 52_NAME_reset_settle.yaml against it", KairosInitRelease, want)
+		}
+	}
+	// No Kairos network step runs after the image's on that boot: its reset's reboot would race it.
+	_, files, ok := strings.Cut(string(k), "## kairos-init/pkg/bundled/cloudconfigs: the files with a network or network.* stage (installed in /system/oem)\n")
+	if !ok || strings.TrimSpace(files) == "" {
+		t.Errorf("Kairos %s's testdata lists no file with a network stage", KairosInitRelease)
+	}
+	for _, l := range strings.Split(strings.TrimSpace(files), "\n") {
+		if f, _, _ := strings.Cut(l, " "); f >= "52_" {
+			t.Errorf("Kairos %s's %s has a network stage after 52_NAME_reset_settle.yaml's: its steps race the reset's reboot", KairosInitRelease, f)
+		}
+	}
+	// The step tests what auroraboot's does, and the file it leaves.
+	raw, err := os.ReadFile("files/system/oem/52_NAME_reset_settle.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "if: '[ -f /run/cos/recovery_mode ] && [ ! -f /oem/.autoreset.skip ] && [ -f /oem/01_reset.yaml ]'\n") {
+		t.Errorf("52_NAME_reset_settle.yaml's network step tests other than auroraboot's: %s", raw)
 	}
 }
 

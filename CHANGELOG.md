@@ -3,6 +3,19 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.50.1]
+
+### Fixed
+
+- A VM's first boot no longer stays in its recovery system when the disk's automatic reset reads
+  the partitions while udev is still recording them (`EFI partition not found`; seen on about
+  one boot in three on some clouds): the OS bundle now runs that reset itself once udev's queue
+  has drained (the waits added before never ran on these disks). This takes a disk built by
+  0.50.1 or later.
+- `status --json`'s `reset_failed` now tells a first boot's failed reset, so a program waiting on
+  the VM's install (the OpenTofu provider's `stowage_vm_install`) stops at once with the reason
+  rather than waiting out its timeout.
+
 ## [0.50.0] - 2026-11-26
 
 ### Added

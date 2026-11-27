@@ -1,0 +1,92 @@
+# Kairos v4.6.0 (github.com/kairos-io/kairos, tag v4.6.0, commit e907b16445b7fd1021fc250b50518c508132cf2a): what a stage's run order and a reset's end are, verbatim.
+
+## agent/pkg/constants/constants.go
+func GetCloudInitPaths() []string {
+	return []string{"/system/oem", "/oem/", "/usr/local/cloud-config/"}
+}
+
+## agent/pkg/utils/runstage.go
+	// Run all stages for each of the default cloud config paths + extra cloud config paths
+	for _, s := range []string{stageBefore, stage, stageAfter} {
+		if analyze {
+			cfg.CloudInitRunner.Analyze(s, cloudInitPaths...)
+		} else {
+			err = cfg.CloudInitRunner.Run(s, cloudInitPaths...)
+			if err != nil {
+				allErrors = multierror.Append(allErrors, err)
+			}
+		}
+	}
+
+## agent/pkg/action/reset.go
+func (r *ResetAction) resetHook(hook string, chroot bool) error {
+	if chroot {
+		extraMounts := map[string]string{}
+		persistent := r.spec.Partitions.Persistent
+		if persistent != nil && persistent.MountPoint != "" {
+			extraMounts[persistent.MountPoint] = cnst.UsrLocalPath
+		}
+		oem := r.spec.Partitions.OEM
+		if oem != nil && oem.MountPoint != "" {
+			extraMounts[oem.MountPoint] = cnst.OEMPath
+		}
+		return ChrootHook(r.cfg, hook, r.spec.Active.MountPoint, extraMounts)
+	}
+	return Hook(r.cfg, hook)
+}
+	err = r.resetHook(cnst.AfterResetHook, false)
+	if err != nil {
+		return err
+	}
+
+	r.recordState()
+
+	// Do not reboot/poweroff on cleanup errors
+	err = cleanup.Cleanup(err)
+	if err != nil {
+		return err
+	}
+
+	return err
+}
+
+## agent/internal/agent/hooks/lifecycle.go
+func (s Lifecycle) Run(c sdkConfig.Config, spec sdkSpec.Spec) error {
+	c.Logger.Logger.Debug().Msg("Running Lifecycle hook")
+	if spec.ShouldReboot() {
+		c.Logger.Logger.Info().Msg(gracePeriodMessage("Rebooting node"))
+		time.Sleep(lifecycleGracePeriod)
+		utils.Reboot()
+	}
+
+	if spec.ShouldShutdown() {
+		c.Logger.Logger.Info().Msg(gracePeriodMessage("Powering off node"))
+		time.Sleep(lifecycleGracePeriod)
+		utils.PowerOFF()
+	}
+	c.Logger.Logger.Debug().Msg("Finish Lifecycle hook")
+	return nil
+}
+
+## sdk/utils/utils.go
+func Reboot() {
+	pterm.Info.Println("Rebooting node")
+	SH("reboot") //nolint:errcheck
+}
+
+## yip v1.27.0 pkg/executor/default.go (go.mod: github.com/mudler/yip v1.27.0)
+func (e *DefaultExecutor) Run(stage string, fs vfs.FS, console plugins.Console, args ...string) error {
+	var errs error
+	e.logger.Infof("Running stage: %s\n", stage)
+	for _, source := range args {
+		if err := e.runStage(stage, source, fs, console); err != nil {
+			errs = multierror.Append(errs, err)
+		}
+	}
+	e.logger.Infof("Done executing stage '%s'\n", stage)
+	return errs
+}
+
+## kairos-init/pkg/bundled/cloudconfigs: the files with a network or network.* stage (installed in /system/oem)
+00_datasource.yaml network
+00_home_dir_owner_fix.yaml network

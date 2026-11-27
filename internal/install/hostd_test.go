@@ -38,8 +38,9 @@ type fakeHost struct {
 	// boot is the ActiveState of <name>.service, and judge of <name>-health.service; empty is
 	// active; judge "<error>": systemctl fails to read it.
 	boot, judge string
-	// reset is the ActiveState of kairos-reset.service; empty is active.
-	reset string
+	// reset is the ActiveState of kairos-reset.service, network of cos-setup-network.service;
+	// empty is active.
+	reset, network string
 	// editErr fails grub2-editenv; remountErr fails a remount, roErr a remount read-only;
 	// rebootErr fails `systemctl reboot`; editAfterReboot, once it failed, fails grub2-editenv.
 	editErr, remountErr, roErr, rebootErr, editAfterReboot error
@@ -98,6 +99,11 @@ func (f *fakeHost) Run(ctx context.Context, c Cmd) ([]byte, error) {
 			st = f.judge
 		case kairosReset:
 			st = f.reset
+		case kairosNetwork:
+			if f.network == "<error>" {
+				return nil, errors.New("Failed to connect to bus")
+			}
+			st = f.network
 		default:
 			return nil, fmt.Errorf("asked about %v", c.Args)
 		}
@@ -211,6 +217,7 @@ func (f *fakeHost) calls() [][]string {
 // a test of the disk's space sets Statfs itself, so none depends on the machine's free space.
 func daemon(e *env, host *fakeHost) *Hostd {
 	o := e.installer(vm).O
+	o.OEM = e.t.TempDir()
 	return &Hostd{R: e.r, O: o, Host: host, Unit: time.Millisecond, Run: e.t.TempDir(), State: e.t.TempDir(), Networkd: e.t.TempDir(), RunNetworkd: e.t.TempDir(), Issue: e.t.TempDir(), InstallNet: filepath.Join(e.t.TempDir(), "install-network.yaml"), Systemd: e.t.TempDir(), Stowage: testStowage,
 		Statfs: roomyDisk}
 }
@@ -355,6 +362,90 @@ func TestStatusTellsAFailedAutomaticReset(t *testing.T) {
 		if call(t, d.Handler(), "GET", "/v1/status", nil, &st); st.ResetFailed != c.want {
 			t.Errorf("%s, reset %q: reset_failed %q, want %q", c.mode, c.reset, st.ResetFailed, c.want)
 		}
+	}
+}
+
+// An auroraboot disk's reset runs in the network stage: once its unit has ended on the recovery
+// system with the reset still due (/oem/01_reset.yaml there, no /oem/.autoreset.skip), it failed,
+// told with the image's step's log (its last resetLines lines); a reset done or skipped, a unit
+// still running (its next step tries again) or unknown to systemd, or another system is not told;
+// a log past resetTail is read from its end.
+func TestStatusTellsAFirstBootResetFailedInTheNetworkStage(t *testing.T) {
+	t.Parallel()
+	why := func(oem string) string {
+		return "the first boot's reset failed: the network stage ended on the recovery system, its reset still due (`journalctl -u " + kairosNetwork + " -b` and " + FirstResetLog(oem, "notes") + " on the VM tell more)"
+	}
+	// The debug lines between (the configuration the reset read among them) are never told.
+	const log = "udev's queue drained in 1 s; the reset runs\nDEBU config: users: ops: passwd: secret\n  ERR failed to read udev info for device /dev/sda1\n\nfailed initializing spec: EFI partition not found\nthe reset failed (exit status 1)\n"
+	const told = ": udev's queue drained in 1 s; the reset runs | failed initializing spec: EFI partition not found | the reset failed (exit status 1)"
+	var many, kept []string
+	for i := range resetLines + 1 {
+		l := fmt.Sprintf("failed to reset: try %d", i)
+		many = append(many, l)
+		if i > 0 {
+			kept = append(kept, l)
+		}
+	}
+	for _, c := range []struct {
+		name, mode, network string
+		due, skip           bool
+		log, want           string // want: after why, "-" for nothing
+	}{
+		{"failed, unit ended", "recovery", "", true, false, log, told},
+		{"failed, unit failed", "recovery", "failed", true, false, log, told},
+		{"failed, unit inactive", "recovery", "inactive", true, false, log, told},
+		{"no log", "recovery", "", true, false, "", "; the image's reset step left no log"},
+		{"the last lines", "recovery", "", true, false, strings.Join(many, "\n"), ": " + strings.Join(kept, " | ")},
+		{"the unit still runs", "recovery", "activating", true, false, log, "-"},
+		{"the unit queued", "recovery", "queued", true, false, log, "-"},
+		{"the unit unknown", "recovery", noBootUnit, true, false, log, "-"},
+		{"the unit's state unread", "recovery", "<error>", true, false, log, "-"},
+		{"no error in the log", "recovery", "", true, false, "DEBU config: users: ops: passwd: secret\n", "; its log tells no error"},
+		{"a long line", "recovery", "", true, false, "failed to reset: " + strings.Repeat("z", resetLineMax), ": failed to reset: " + strings.Repeat("z", resetLineMax-len("failed to reset: ")) + "…"},
+		{"a long log", "recovery", "", true, false, strings.Repeat("x", resetTail) + "\n" + strings.Join(many, "\n"), ": " + strings.Join(kept, " | ")},
+		{"a long log cut in its first line", "recovery", "", true, false, strings.Repeat("y", resetTail+1) + "\nthe reset failed (exit status 2)", ": the reset failed (exit status 2)"},
+		{"a long log holding no line's start", "recovery", "", true, false, strings.Repeat("y", resetTail+1) + " failed to reset", "; its log tells no error"},
+		{"no reset due", "recovery", "", false, false, log, "-"},
+		{"the reset skipped", "recovery", "", true, true, log, "-"},
+		{"another system", "active", "", true, false, log, "-"},
+	} {
+		e := vmEnv(t, "1.0.0")
+		d := daemon(e, &fakeHost{network: c.network})
+		d.O.Cos = t.TempDir()
+		for f, w := range map[string]bool{filepath.Join(d.O.Cos, c.mode+"_mode"): true, filepath.Join(d.O.OEM, "01_reset.yaml"): c.due,
+			filepath.Join(d.O.OEM, ".autoreset.skip"): c.skip} {
+			if w {
+				if err := os.WriteFile(f, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if c.log != "" {
+			if err := os.WriteFile(FirstResetLog(d.O.OEM, "notes"), []byte(c.log), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want := ""
+		if c.want != "-" {
+			want = why(d.O.OEM) + c.want
+		}
+		var st Status
+		if call(t, d.Handler(), "GET", "/v1/status", nil, &st); st.ResetFailed != want {
+			t.Errorf("%s: reset_failed %q, want %q", c.name, st.ResetFailed, want)
+		}
+	}
+	// kairos-reset.service's failure, the boot's own reset, is told first.
+	e := vmEnv(t, "1.0.0")
+	d := daemon(e, &fakeHost{reset: "failed"})
+	d.O.Cos = t.TempDir()
+	for _, f := range []string{filepath.Join(d.O.Cos, "recovery_mode"), filepath.Join(d.O.OEM, "01_reset.yaml")} {
+		if err := os.WriteFile(f, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var st Status
+	if call(t, d.Handler(), "GET", "/v1/status", nil, &st); st.ResetFailed != kairosReset+" failed: the boot's journal" {
+		t.Errorf("kairos-reset.service failed, a first-boot reset due: reset_failed %q", st.ResetFailed)
 	}
 }
 

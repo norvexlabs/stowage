@@ -100,6 +100,9 @@ type Options struct {
 	// Kairos marks the system it booted (<mode>_mode, upgrade_failure); empty is /run/cos. The
 	// host daemon and the health gate read both from their Options too: they are set in one place.
 	BootIDFile, Cos string
+	// OEM is Kairos's OEM partition, where a disk's first-boot reset and its log are; empty is
+	// /oem.
+	OEM string
 	// Channel is the channel a VM install follows for its updates, recorded at the first install.
 	Channel string
 	// Settings is the settings file a VM's first install takes its values from (SettingsFile when
@@ -222,6 +225,9 @@ func (o *Options) logf(format string, a ...any) { fmt.Fprintf(o.Log, format+"\n"
 
 // cos is where Kairos marks the system it booted.
 func (o *Options) cos() string { return cmp.Or(o.Cos, kairosCos) }
+
+// oem is Kairos's OEM partition's mount point.
+func (o *Options) oem() string { return cmp.Or(o.OEM, oemDir) }
 
 // kairosCos is the directory Kairos marks its boot's mode in (active_mode, recovery_mode,
 // live_mode…).

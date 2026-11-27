@@ -1690,9 +1690,17 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `status --json --values` gives them (the operator's socket alone: the app socket answers any
   `values` query 403);
   `boot`;
-  `reset_failed`: on the recovery system, Kairos's automatic reset (`kairos-reset.service`, the
-  first boot's) failed in this boot, so the VM stays there — `kairos-reset.service failed: ` and
-  the unit's last 15 journal lines joined by ` | `, absent otherwise; `status` prints it after
+  `reset_failed`: on the recovery system, the reset that lays the system out failed in this boot,
+  so the VM stays there — a disk's first boot's, once `cos-setup-network.service` (Kairos's
+  `network` stage, which runs it) has ended with the reset still due (`/oem/01_reset.yaml`
+  there, `/oem/.autoreset.skip` not): `the first boot's reset failed: …` and, from the end of
+  the OS bundle's reset step's log (`/oem/.<name>-first-reset.log`, root's alone: udev's queue,
+  the reset's debug output, its exit status), the step's own lines and the reset's errors (never
+  its debug output), the last 15 joined by ` | `, each cut at 300 characters — or `the image's
+  reset step left no log`, or `its log tells no error`;
+  or `kairos-reset.service`'s (a boot with `kairos.reset` on its command line):
+  `kairos-reset.service failed: ` and the unit's last 15 journal lines joined by ` | ` —, absent
+  otherwise; `status` prints it after
   the boot (`boot       recovery (the first boot gave up: …)`);
   `fallback`: Kairos booted the passive system; `on_trial`: the boot runs an upgrade's new system, which the gate has not judged yet; `boot_id`: the kernel's id of this boot, which changes with every reboot; `boot_settled`: this boot is over — `<name>.service` (the boot's install, upgrade or going back) and `<name>-health.service` (the health gate, ordered after it) have each ended: active, failed, absent, or inactive with no job queued (skipped by its condition, stopped, or never started as a dependency failed) —, so what the status says of this boot changes no more but by a job (`false` while either runs or is queued, or when their state cannot be read; `true` on Docker, which has no boot units); `boot_judged`: the health gate's last verdict in this boot, its `boot.judged` entry (`seq`, `verdict`, `on_trial`, `reboots`, and when set `reason`, `kept`, `error`; kept through the journal's rotations), absent before the verdict, and when it cannot be told, `boot_judged_error` then saying why (this boot's id or the journal cannot be read) — settled with an install, no `boot_judged` and no `boot_judged_error`, the gate ended without a verdict, which `status` says (`judged     no verdict: …`; `judged     unknown: …` for an error); a `went_back` whose `reboots` is `false` gets no reboot from the gate; `status` prints `judged` with the verdict, and `settling` while the boot is not settled (or the units' state cannot be read); `registry_login`: the host the VM holds a login for (`registry-login`; the release's own registry's or the mirror's), never the login, absent when it holds none, and `registry_login_error` when the file held cannot be read (naming it and the fix; `status` prints `login      unreadable: …`); `events`: the event journal's last `seq`, 0 before the first, which a client follows with `GET events?after=` — `null` when the journal cannot be read, `events_error` then saying why (a client never takes a cursor from such a status); `failed_boot`: the last boot the gate found
   unhealthy — `release`, `at`, `reason`, `kept` when the gate kept it, `dir`, `seq` (the event journal's last entry as it was kept); absent once the journal's last verdict, after it in the journal, is a boot on trial (an upgrade's) judged `healthy` — the passive system's boot after a fallback keeps it told), `GET health` (`{"ready", "reason"}`), `GET services` (each with its `exit_code`, and when set — each absent when false, 0 or empty — `id`, `oom_killed`, `mem_limit_bytes`, `restarts`),

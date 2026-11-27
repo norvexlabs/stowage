@@ -678,16 +678,6 @@ const afterInstallMove = `set -e; ls /oem/9[0-9]_custom.yaml >/dev/null; mkdir -
 // the OS live, with the seed, to install it.
 const notLive = "[ ! -e /run/cos/live_mode ]"
 
-// resetSettle is the drop-in of Kairos's automatic reset (kairos-reset.service, which runs
-// `kairos-agent reset`): udev's queue drained first, bounded, so the reset finds the partitions
-// udev has recorded. A queue still busy after the bound leaves the reset to try (the `-`).
-const resetSettle = "# The automatic reset reads the partitions udev records: its queue is drained first.\n[Service]\nExecStartPre=-/usr/bin/udevadm settle --timeout=120\n"
-
-// resetSettleDropIn is resetSettle's path.
-func resetSettleDropIn(name string) string {
-	return "/etc/systemd/system/kairos-reset.service.d/10-" + name + "-udev-settle.conf"
-}
-
 type stage struct {
 	Name     string               `yaml:"name"`
 	If       string               `yaml:"if,omitempty"` // a shell test: the step runs when it holds
@@ -905,12 +895,7 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 			{Path: path.Dir(KairosDHCPDropIn(name, "20-dhcp-legacy")), Permissions: 0o755}},
 		Files: []cloudFile{{Path: DUIDConf(name), Permissions: 0o644, Content: duidConf},
 			{Path: KairosDHCPDropIn(name, "20-dhcp"), Permissions: 0o644, Content: kairosDHCPDUID},
-			{Path: KairosDHCPDropIn(name, "20-dhcp-legacy"), Permissions: 0o644, Content: kairosDHCPDUID}}}, {
-		// The disk holds the recovery system alone: its first boot's automatic reset lays the
-		// system out, and reads the partitions udev records. Its unit waits for udev's queue.
-		Name:  name + ": the automatic reset after udev's queue",
-		Files: []cloudFile{{Path: resetSettleDropIn(name), Permissions: 0o644, Content: resetSettle}},
-	}}
+			{Path: KairosDHCPDropIn(name, "20-dhcp-legacy"), Permissions: 0o644, Content: kairosDHCPDUID}}}}
 	if len(links) > 0 {
 		// Before the booted system's udev names the NICs: each by its role from then on.
 		names := stage{Name: name + ": the interfaces' names", Files: links}

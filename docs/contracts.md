@@ -171,8 +171,18 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     named `<prefix>/<name>-<key>:sha256-<hex>` (its digest), which `<name>-preload.service`
     `docker load`s at every boot (an A/B upgrade brings the new archives);
   - `<name>-expand.service` and `/system/oem/01_<name>_expand.yaml`: the persistent partition grows
-    to fill the disk at boot; `/system/oem/52_<name>_reset_settle.yaml`: udev settles before the
-    first-boot reset;
+    to fill the disk at boot; `/system/oem/52_<name>_reset_settle.yaml`: the first boot's reset of a
+    disk (its recovery system laying the system out, in Kairos's `network` stage, where the disk's
+    `/oem/01_reset.yaml` runs it with no wait after its `udevadm trigger`) runs from this step
+    first — `udevadm trigger`, then `udevadm settle --timeout=120` (the reset tried after the
+    bound all the same), then `kairos-agent reset --unattended --reboot` —, on the recovery
+    system while `/oem/01_reset.yaml` is there and `/oem/.autoreset.skip` is not; a reset that
+    succeeds writes when udev's queue drained, and in how long, to `/oem/.<name>-first-reset`
+    (its `after-reset` stage), one that fails keeps its output in
+    `/oem/.<name>-first-reset.log` (`0600`) and leaves `/oem/01_reset.yaml`'s own to try once
+    more, and any reset that succeeds removes that log; a
+    reset asked for on the command line (`kairos.reset`, `kairos-reset.service`) waits for udev's
+    queue too (`/etc/systemd/system/kairos-reset.service.d/10-udev-settle.conf`);
   - `/usr/sbin/<short>-stow`, the installer with the release as the bundle carries it, and its units
     `<name>.service` (the boot), `<name>-health.service` (the health gate),
     `<name>-hostd.service` (the host daemon), `<name>-network.service` (the network override),

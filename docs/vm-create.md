@@ -579,11 +579,7 @@ over SSH from your machine takes its host key with `--known-hosts-line`.
   updates and upgrades take it.
 - The cloud-config (`#cloud-config`, Kairos's stages, applied at every boot) sets the host name
   in the `initramfs` stage, before the network starts (a DHCP request carries it, so a DHCP
-  server that registers names registers it), and there too makes Kairos's automatic reset
-  (`kairos-reset.service`, the first boot's, which lays the system out from the recovery
-  system the disk holds) wait for udev's queue before it reads the partitions:
-  `/etc/systemd/system/kairos-reset.service.d/10-<name>-udev-settle.conf`, `udevadm settle
-  --timeout=120`, the reset tried after the bound all the same; with the host name, it writes
+  server that registers names registers it); with the host name, it writes
   `/etc/systemd/networkd.conf.d/10-<name>-duid.conf` (`[DHCPv4]` and `[DHCPv6]`
   `DUIDType=link-layer`) and `/etc/systemd/network/20-dhcp.network.d/10-<name>-duid.conf`
   and `20-dhcp-legacy.network.d/10-<name>-duid.conf` (`[DHCPv4] ClientIdentifier=duid`, over

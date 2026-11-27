@@ -192,7 +192,6 @@ func cloudSettings(t *testing.T, userData string) (Settings, cloudConfig) {
 		"/run":                             "the image's",
 		"/etc/notes":                       "the install and its daemon, as root",
 		"/etc/nftables.d":                  "nft, as root",
-		"/etc/systemd/system/kairos-reset.service.d": "systemd",
 	}
 	for stageName, steps := range cc.Stages {
 		for _, s := range steps {
@@ -255,7 +254,7 @@ func TestVMCreateWritesTheDiskTheSeedAndTheSteps(t *testing.T) {
 	}
 	boot := cc.Stages["boot"]
 	u := boot[0].Users["ops"]
-	if ini := cc.Stages["initramfs"]; len(ini) != 2 || ini[0].Hostname != "notes-1" || ini[1].Hostname != "" || boot[0].Hostname != "" {
+	if ini := cc.Stages["initramfs"]; len(ini) != 1 || ini[0].Hostname != "notes-1" || boot[0].Hostname != "" {
 		t.Errorf("the host name is set in the initramfs stage, and in boot only by the recovery system's step cloudSettings checks: %+v", cc.Stages)
 	}
 	if !slices.Equal(u.Groups, []string{"admin"}) || u.Passwd != "!" || !slices.Equal(u.SSHAuthorizedKeys, []string{v.keyLine}) {
@@ -1348,10 +1347,8 @@ func TestTheSeedNamesAndAddressesTheNICs(t *testing.T) {
 	for path, want := range map[string]string{
 		"initramfs:/etc/systemd/network/10-atlas-uplink.link": "[Match]\nMACAddress=02:00:00:00:00:0a\n\n[Link]\nName=uplink\n",
 		"initramfs:/etc/systemd/network/10-atlas-edge.link":   "[Match]\nMACAddress=02:00:00:00:00:0b\n\n[Link]\nName=edge\n",
-		// The first boot's automatic reset waits for udev's queue before it reads the partitions.
-		"initramfs:/etc/systemd/system/kairos-reset.service.d/10-atlas-udev-settle.conf": "[Service]\nExecStartPre=-/usr/bin/udevadm settle --timeout=120\n",
-		"boot:/etc/systemd/network/05-atlas-static.network":                              "[Match]\nName=uplink\n\n[Network]\nDHCP=ipv4\n",
-		"boot:/etc/systemd/network/10-atlas-edge.network":                                "[Match]\nName=edge\n\n[Network]\nDHCP=ipv4\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n\n[DHCPv4]\nUseGateway=no\nUseRoutes=no\nUseDNS=no\nSendHostname=no\n\n[Link]\nRequiredForOnline=no\n",
+		"boot:/etc/systemd/network/05-atlas-static.network":   "[Match]\nName=uplink\n\n[Network]\nDHCP=ipv4\n",
+		"boot:/etc/systemd/network/10-atlas-edge.network":     "[Match]\nName=edge\n\n[Network]\nDHCP=ipv4\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n\n[DHCPv4]\nUseGateway=no\nUseRoutes=no\nUseDNS=no\nSendHostname=no\n\n[Link]\nRequiredForOnline=no\n",
 		// A NIC no role names is left up and unaddressed, its master kept, by a file sorting after
 		// the roles' and before Kairos's 20-dhcp.network (staged, moved into place below).
 		"boot:/etc/systemd/network/15-atlas-unnamed.network.staged": "`at-stow network` lists it, `at-stow network attach` names it.\n[Match]\nName=en* eth*\nKind=!*\n\n[Link]\nRequiredForOnline=no\n\n[Network]\nKeepMaster=yes\nDHCP=no\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n",
