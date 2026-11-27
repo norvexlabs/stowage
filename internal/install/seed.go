@@ -652,7 +652,9 @@ func connectIssue(m Machine, ctl string) string {
 	return s + "\n"
 }
 
-// The cloud-config Kairos reads (yip's stages): written at every boot, as /etc is not kept.
+// The cloud-config Kairos reads (yip's stages): written at every boot, as most of /etc is not kept.
+// Kairos keeps /etc/systemd and /etc/ssh (its persistent state paths), where a file the seed writes
+// stays until the host daemon removes it: the network files of a role, the seed's host key.
 type cloudConfig struct {
 	Install *cloudInstall      `yaml:"install,omitempty"`
 	Stages  map[string][]stage `yaml:"stages"`
@@ -669,10 +671,13 @@ type cloudInstall struct {
 	Poweroff bool   `yaml:"poweroff"`
 }
 
-// afterInstallMove moves the cloud-config the installer kept (one 9N_custom.yaml a source it read,
-// 90 the first) into 95_userdata, the first as its userdata.yaml; the stage fails without one.
-const afterInstallMove = `set -e; ls /oem/9[0-9]_custom.yaml >/dev/null; mkdir -p /oem/95_userdata; ` +
-	`for f in /oem/9[0-9]_custom.yaml; do n=$(basename "$f"); [ "$n" = 90_custom.yaml ] && n=userdata.yaml; mv -f "$f" "/oem/95_userdata/$n"; done`
+// afterInstallMove moves the cloud-configs the installer kept into 95_userdata, the first as its
+// userdata.yaml; the stage fails without one. The installer (kairos-agent's CopyCloudConfig) names
+// them 9<index>_custom.yaml in the order it read their sources, the index zero-padded to the
+// widest (90 to 99 up to ten, 900 on from eleven), so they sort in that order.
+const afterInstallMove = `set -e; n=0; for f in /oem/9*_custom.yaml; do i=${f#/oem/9}; i=${i%_custom.yaml}; ` +
+	`case "$i" in ''|*[!0-9]*) continue;; esac; t=${f##*/}; [ "$n" -gt 0 ] || { t=userdata.yaml; mkdir -p /oem/95_userdata; }; ` +
+	`mv -f "$f" "/oem/95_userdata/$t"; n=$((n+1)); done; [ "$n" -gt 0 ]`
 
 // notLive is the test of a stage that runs on the installed system only: the installer ISO boots
 // the OS live, with the seed, to install it.

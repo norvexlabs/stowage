@@ -67,24 +67,31 @@ const (
 	diagBootLines  = 2000
 )
 
-// assessment is Kairos's boot assessment environment in the COS_STATE partition mounted at dir.
+// assessment is Kairos's boot assessment environment in the COS_STATE partition mounted at dir;
+// mounted: dir must be a mount (Kairos's own, cosState).
 type assessment struct {
-	dir  string
-	host Tool
+	dir     string
+	host    Tool
+	mounted bool
 }
 
-// assessmentIn is the boot assessment of the state directory state (empty: Kairos's), set through
-// host: the gate's and the daemon's one way to it.
+// assessmentIn is the boot assessment of the state directory state (empty: Kairos's, which must
+// be a mount), set through host: the gate's and the daemon's one way to it.
 func assessmentIn(state string, host Tool) assessment {
-	return assessment{cmp.Or(state, cosState), host}
+	return assessment{cmp.Or(state, cosState), host, state == ""}
 }
 
 func (a assessment) file() string { return filepath.Join(a.dir, assessFile) }
 
-// read returns the environment's variables; none when it has no file.
+// read returns the environment's variables; none when it has no file. Without the file, Kairos's
+// dir that is not a mount (the partition elsewhere, or not mounted) is an error: the gate would
+// take every boot as off trial, and never send a failed upgrade back.
 func (a assessment) read() (map[string]string, error) {
 	raw, err := os.ReadFile(a.file())
 	if errors.Is(err, os.ErrNotExist) {
+		if a.mounted && !mountPoint(a.dir) {
+			return nil, fmt.Errorf("%s is not a mounted partition: Kairos mounts COS_STATE, which holds %s, there", a.dir, assessFile)
+		}
 		return map[string]string{}, nil
 	}
 	if err != nil {
@@ -100,6 +107,16 @@ func (a assessment) read() (map[string]string, error) {
 		}
 	}
 	return vars, nil
+}
+
+// mountPoint reports whether dir is the root of a mounted filesystem: its device is not its
+// parent's (COS_STATE is a partition of its own).
+func mountPoint(dir string) bool {
+	var d, p syscall.Stat_t
+	if syscall.Stat(dir, &d) != nil || syscall.Stat(filepath.Dir(filepath.Clean(dir)), &p) != nil {
+		return false
+	}
+	return d.Dev != p.Dev
 }
 
 // trial reports whether GRUB booted this system on trial: assessment enabled, and the attempt
@@ -324,14 +341,18 @@ func killedBySignal(err error) bool {
 	return ok && ws.Signaled() && (ws.Signal() == syscall.SIGTERM || ws.Signal() == syscall.SIGKILL)
 }
 
-// trial reads the boot assessment: whether GRUB booted the active system on trial.
+// trial reads the boot assessment: whether GRUB booted the active system on trial. Another
+// system is never on trial: its assessment is not read.
 func (g *Gate) trial() (assessment, bool, error) {
 	a := assessmentIn(g.State, g.Host)
+	if bootMode(g.In.O.cos()) != "active" {
+		return a, false, nil
+	}
 	vars, err := a.read()
 	if err != nil {
 		return a, false, fmt.Errorf("the boot assessment: %w", err)
 	}
-	return a, bootMode(g.In.O.cos()) == "active" && trial(vars), nil
+	return a, trial(vars), nil
 }
 
 // noInstall is the gate of a boot with no install yet: there is nothing to judge. The OS a first

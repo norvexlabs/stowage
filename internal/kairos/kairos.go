@@ -166,6 +166,37 @@ var own = []string{"containerd.io", "docker-ce", "docker-compose-plugin", "dracu
 // Own are the packages the build's last step finds installed, sorted.
 func (Params) Own() []string { return own }
 
+// unitDir is where the bundle's units are, in its tree and in the image: /usr/lib leaves with the
+// image, where /etc/systemd is Kairos's persistent state (Dockerfile.tmpl).
+const unitDir = "files/usr/lib/systemd/system"
+
+// Units are the bundle's own units (files/usr/lib/systemd/system/NAME*), by their names in the
+// image, sorted: 02_NAME_retire.yaml parks the copies earlier bundles left in /etc.
+func (p Params) Units() []string {
+	var out []string
+	entries, _ := files.ReadDir(unitDir)
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), placeholder) {
+			out = append(out, strings.Replace(e.Name(), placeholder, p.Name, 1))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Enabled are the units of Units that multi-user.target wants (their [Install] section): the
+// image links them into /usr/lib's multi-user.target.wants.
+func (p Params) Enabled() []string {
+	var out []string
+	for _, u := range p.Units() {
+		raw, _ := files.ReadFile(unitDir + "/" + strings.Replace(u, p.Name, placeholder, 1))
+		if strings.Contains(string(raw), "\n[Install]\nWantedBy=multi-user.target\n") {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
 // Absent are the purged packages the build fails on finding after its purges, sorted.
 func (p Params) Absent() []string {
 	out := append(p.undeclared(Purged), p.undeclared(PurgedAfterInit)...)

@@ -162,8 +162,33 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   bundle's own (`containerd.io`, `docker-ce`, `docker-compose-plugin`, `dracut`,
   `linux-image-generic`, `nftables`, `openssh-server`, `systemd`, `systemd-resolved`,
   `systemd-sysv`), is not
-  installed, or one of the masked timers below is not masked, or when the tmpfiles rules of
-  `/etc/resolv.conf` are not the bundle's alone or systemd-resolved is not enabled. On top of it:
+  installed, or one of the masked timers below is not masked, or `grub2-editenv` (kairos-init's
+  link to GRUB's, which the health gate writes the boot assessment with) is not there, or when the
+  tmpfiles rules of `/etc/resolv.conf` are not the bundle's alone or systemd-resolved is not
+  enabled. Right after kairos-init's stages, before any step edits one, the build checks the
+  sha256 of each kairos-init file it edits or relies on — `/etc/cos/grub.cfg`,
+  `/etc/cos/bootargs.cfg`, and `/system/oem/`'s `00_datasource.yaml`, `00_rootfs.yaml`,
+  `05_network.yaml`, `08_grub.yaml` and `09_systemd_services.yaml` — against kairos-init v4.6.0's,
+  and fails naming the file, `shapes.kairos.kairos_init` and the release to use (`its <file> is
+  not the one this stowage relies on: use kairos-init v4.6.0`). Nothing of the bundle's own is in
+  Kairos's persistent state paths (kairos-init's `PERSISTENT_STATE_PATHS`, `/etc/systemd` and
+  `/etc/ssh` among them), which every boot fills from its image without deleting a file or
+  overwriting a newer one, so a file there would outlive its release and reach an older one on a
+  rollback: its units, their drop-ins (`/usr/lib/systemd/system/docker.service.d/10-<name>-after-nftables.conf`,
+  `ssh.service.d` and `ssh.socket.d`'s `10-<name>-live.conf`), the links enabling them
+  (`/usr/lib/systemd/system/multi-user.target.wants`, `getty.target.wants`), its networkd file and
+  its SSH settings are in `/usr/lib`, which leaves with the image; only the alias
+  `vmtoolsd.service`, the masks below and the SSH `Include` are in `/etc`, each the same in every
+  release. `/system/oem/02_<name>_retire.yaml` parks (moves) what earlier bundles shipped there —
+  the units by name, the links enabling them, the `ssh` units' drop-ins, Docker's
+  `after-nftables.conf` when it is theirs (its content), `/etc/systemd/network/00-<name>-sriov.network`
+  and `/etc/ssh/sshd_config.d/10-<name>.conf` — into `/etc/systemd/<name>-retired/` under each
+  one's own path, in Kairos's `initramfs` stage (the persistent paths mounted, systemd not yet
+  started), logging `parked in /etc/systemd/<name>-retired: <paths>` (`could not park in …:
+  <paths>`, the step failing, for one it cannot move); a rollback to such a bundle gets its own
+  back from its image on that boot. An operator's change to a unit of the bundle is a drop-in
+  (`systemctl edit <unit>`, in `/etc/systemd/system/<unit>.d/`), which stays: a whole copy of the
+  unit in `/etc/systemd/system` (`systemctl edit --full`) is parked at every boot (beside a copy parked before, numbered: none is replaced). The links enabling the bundle's units are the image's, which `systemctl disable` does not remove: `systemctl mask <unit>` turns one off, and stays; a unit an earlier bundle's links left disabled is enabled again by this one. On top of it:
   - Docker CE and its compose plugin from Docker's apt repository (unpinned: the version of the
     day of the build), the containerd image store on, data under `/usr/local/docker` (the
     persistent partition), started after `nftables`;
@@ -171,7 +196,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     named `<prefix>/<name>-<key>:sha256-<hex>` (its digest), which `<name>-preload.service`
     `docker load`s at every boot (an A/B upgrade brings the new archives);
   - `<name>-expand.service` and `/system/oem/01_<name>_expand.yaml`: the persistent partition grows
-    to fill the disk at boot; `/system/oem/52_<name>_reset_settle.yaml`: the first boot's reset of a
+    to fill the disk at boot, when it is the disk's last partition and more than 16 MiB follow it; `/system/oem/52_<name>_reset_settle.yaml`: the first boot's reset of a
     disk (its recovery system laying the system out, in Kairos's `network` stage, where the disk's
     `/oem/01_reset.yaml` runs it with no wait after its `udevadm trigger`) runs from this step
     first — `udevadm trigger`, then `udevadm settle --timeout=120` (the reset tried after the
@@ -201,9 +226,8 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   - Kairos's `/system/oem/08_grub.yaml` (its GRUB boot assessment) without the step that marks
     every boot of the active system good as it starts: the health gate marks it. A boot of the
     active entry chosen once (`next_entry`, which an upgrade sets) is judged too, and while a failed
-    attempt is marked that choice boots the passive system as well. The build fails
-    when kairos-init's file is not the one this copy is derived from (by its sha256), naming
-    `shapes.kairos.kairos_init` and the release to use. An OS upgrade also refreshes the boot
+    attempt is marked that choice boots the passive system as well (kairos-init's file, its sha256
+    checked as above, is the one this copy is derived from). An OS upgrade also refreshes the boot
     loader on the EFI partition (shim, GRUB and its `grub.cfg`, when the partition has room for
     them);
   - Kairos's `/system/oem/09_systemd_services.yaml` without its fixed `net.core.rmem_max`
@@ -234,7 +258,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     (`/etc/nftables.d/ssh.nft`), `/run/nftables.d` made at boot for the install's ports, and a
     forward chain including the install's `nftables.d` (see "The firewall" ([vm](vm.md)) under the installer on
     the Kairos VM);
-  - SSH by key only (`/etc/ssh/sshd_config.d/10-<name>.conf`), over kairos-init's SSH hardening
+  - SSH by key only (`/usr/lib/<name>/sshd_config.d/10-<name>.conf`, read after it), over kairos-init's SSH hardening
     (`/usr/lib/<name>/sshd_config.d/05-kairos-hardening.conf`, in the image itself, read first
     through `/etc/ssh/sshd_config.d/00-<name>-hardening.conf`'s `Include`, so a rollback to a
     release on an older OpenSSH never reads it: modern ciphers, key exchanges
@@ -245,8 +269,8 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     refused (`/usr/lib/<name>/sshd_config.d/00-<name>.conf`, read before kairos-init's, which allows
     it by key: a cloud's datasource writes its metadata's SSH keys for root); the build fails when
     that drop-in no longer sets `AllowTcpForwarding no`, and when sshd's effective settings
-    (`sshd -T`) are not `PermitRootLogin no`, `AllowTcpForwarding no`, `MaxAuthTries 4` and
-    `PasswordAuthentication no`, naming the setting and the value it found; kairos-init's CIS hardening step is not run (its shell umask,
+    (`sshd -T`) are not `PermitRootLogin no`, `AllowTcpForwarding no`, `MaxAuthTries 4`,
+    `PasswordAuthentication no`, `KbdInteractiveAuthentication no` and `PubkeyAuthentication yes`, naming the setting and the value it found; kairos-init's CIS hardening step is not run (its shell umask,
     password ageing and lockout would reach the install's files and the operator's account), the
     build failing when its module blocklist (`/etc/modprobe.d/cis-blocklist.conf`) or a umask of
     027 (`/etc/profile`, `/etc/profile.d`, `/etc/bash.bashrc`, `/etc/login.defs`) is there; an

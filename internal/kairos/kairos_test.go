@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -15,6 +16,8 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -47,7 +50,7 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 		"mv /etc/ssh/sshd_config.d/05-kairos-hardening.conf /usr/lib/notes/sshd_config.d/",
 		"printf 'Include /usr/lib/notes/sshd_config.d/*.conf\\n' > /etc/ssh/sshd_config.d/00-notes-hardening.conf",
 		"! test -e /etc/modprobe.d/cis-blocklist.conf", "umask[[:space:]]+0*27([^0-7]|$)' /etc/profile /etc/profile.d", "UMASK[[:space:]]+0*27", "sed -i '/^        net\\.core\\.rmem_max: 7500000$/d'",
-		`sed -i -E 's/^( +providers: \[.*)\]$/\1, "scaleway"]/' "$f"`, `|| fail "sshd's effective setting is`} {
+		`sed -i -E 's/^( +providers: \[.*)\]$/\1, "scaleway"]/' "$f"`, `|| fail "sshd's effective setting is`, "command -v grub2-editenv >/dev/null ||"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("Dockerfile lacks %q", want)
 		}
@@ -96,7 +99,7 @@ func TestTheImagesSSHSettingsHoldOverKairosInits(t *testing.T) {
 	}
 	usr := dir("usr/lib/notes/sshd_config.d", map[string][]byte{"05-kairos-hardening.conf": kairosInit})
 	include := "Include /usr/lib/notes/sshd_config.d/*.conf"
-	etc := dir("etc/ssh/sshd_config.d", map[string][]byte{"00-notes-hardening.conf": []byte(include + "\n")})
+	etc := map[string][]byte{"00-notes-hardening.conf": []byte(include + "\n")}
 	df, err := Dockerfile(params)
 	if err != nil {
 		t.Fatal(err)
@@ -172,8 +175,8 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"files/usr/sbin/notes-preload", "files/etc/systemd/system/notes-preload.service",
-		"files/etc/systemd/system/notes-expand.service", "files/system/oem/01_notes_expand.yaml", "files/etc/sudoers.d/10-notes"} {
+	for _, want := range []string{"files/usr/sbin/notes-preload", "files/usr/lib/systemd/system/notes-preload.service",
+		"files/usr/lib/systemd/system/notes-expand.service", "files/system/oem/01_notes_expand.yaml", "files/etc/sudoers.d/10-notes"} {
 		if !slices.Contains(got, want) {
 			t.Errorf("context lacks %s (has %v)", want, got)
 		}
@@ -239,14 +242,14 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		!strings.Contains(ir.Files[0].Content, "ExecStartPre=-/usr/bin/udevadm settle --timeout=120\n") {
 		t.Errorf("kairos-reset.service's settle: %+v", ir)
 	}
-	unit, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-expand.service"))
+	unit, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system/notes-expand.service"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(unit), "run-stage notes.expand") {
 		t.Errorf("expand unit = %s", unit)
 	}
-	gate, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-health.service"))
+	gate, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system/notes-health.service"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +257,7 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		t.Errorf("health unit = %s", gate)
 	}
 	// The network override is rendered before networkd starts.
-	nw, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-network.service"))
+	nw, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system/notes-network.service"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +267,7 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		}
 	}
 	// The tuning runs before the network and Docker, after the kernel's own settings.
-	tu, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-tune.service"))
+	tu, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system/notes-tune.service"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +277,7 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		}
 	}
 	// Again once the network is up (its MTU), before Docker reads its file.
-	tuo, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-tune-online.service"))
+	tuo, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system/notes-tune-online.service"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +287,7 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		}
 	}
 	// The IPv6 default route waited for, once the network is up, before Docker starts.
-	r6, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-route6.service"))
+	r6, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system/notes-route6.service"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +297,7 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		}
 	}
 	// The host daemon after the cloud-config's boot stage, whose load of the firewall takes no lock.
-	hd, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-hostd.service"))
+	hd, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system/notes-hostd.service"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +305,7 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		t.Errorf("hostd unit not after the boot stage:\n%s", hd)
 	}
 	// SSH's recorded sources after the cloud-config's boot stage, which writes the seed's.
-	sh, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-ssh.service"))
+	sh, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system/notes-ssh.service"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +315,7 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		}
 	}
 	// The services' tables before Docker restores their containers, once the network is up.
-	tb, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-tables.service"))
+	tb, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system/notes-tables.service"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +325,7 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		}
 	}
 	// Azure's virtual function stays networkd's to leave alone, on Hyper-V alone.
-	vf, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/network/00-notes-sriov.network"))
+	vf, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/network/00-notes-sriov.network"))
 	if err != nil || !strings.Contains(string(vf), "Virtualization=microsoft\nDriver=mlx4_en mlx4_core mlx5_core mana\n") || !strings.Contains(string(vf), "Unmanaged=yes") {
 		t.Errorf("the VF's network file: %v\n%s", err, vf)
 	}
@@ -332,7 +335,7 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 			"\nStartLimitIntervalSec=3h\nStartLimitBurst=6\n\n[Service]\n", "\nRestart=on-failure\nRestartSec=15min\n"},
 		"notes-backup.timer": {"OnCalendar=*-*-* 03:00:00 UTC\n", "Persistent=true\n", "RandomizedDelaySec=15min\n"},
 	} {
-		raw, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system", unit))
+		raw, err := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system", unit))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -346,7 +349,7 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 	if df, _ := Dockerfile(params); strings.Contains(string(df), "notes-backup") {
 		t.Error("the bundle enables the backup timer")
 	}
-	if raw, _ := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-backup.timer")); strings.Contains(string(raw), "[Install]") {
+	if raw, _ := os.ReadFile(filepath.Join(dir, "files/usr/lib/systemd/system/notes-backup.timer")); strings.Contains(string(raw), "[Install]") {
 		t.Error("the backup timer has an [Install] section")
 	}
 	// Kairos's boot assessment with every step but the one that marks each boot good at once.
@@ -1074,6 +1077,299 @@ func TestTheFirstBootResetStepMatchesItsReleases(t *testing.T) {
 	}
 }
 
+// kairosInitFile is kairos-init's file of that name, as its release writes it (testdata).
+func kairosInitFile(t *testing.T, name string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "kairos-init-"+KairosInitRelease, name))
+	if err != nil {
+		t.Fatalf("%v: copy kairos-init %s's %s there, as it writes it", err, KairosInitRelease, name)
+	}
+	return raw
+}
+
+// persistentPaths are kairos-init's PERSISTENT_STATE_PATHS (00_rootfs.yaml): what every boot fills
+// from its image without deleting or overwriting a newer file.
+func persistentPaths(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	blocks := 0
+	in := false
+	for l := range strings.Lines(string(kairosInitFile(t, "00_rootfs.yaml"))) {
+		f := strings.TrimSpace(l)
+		switch {
+		case f == "PERSISTENT_STATE_PATHS: >-":
+			blocks++
+			in = true
+		case in && strings.HasPrefix(f, "/"):
+			out = append(out, f)
+		default:
+			in = false
+		}
+	}
+	if blocks != 1 || !slices.Contains(out, "/etc/systemd") || !slices.Contains(out, "/etc/ssh") {
+		t.Fatalf("kairos-init %s's 00_rootfs.yaml: %d PERSISTENT_STATE_PATHS blocks, %v", KairosInitRelease, blocks, out)
+	}
+	return out
+}
+
+// Nothing the bundle ships is under Kairos's persistent state paths, where it would outlive its
+// release (rollback included): its files tree holds none, and its Dockerfile writes there only
+// the alias, the masks and the SSH Include, the same in every release.
+func TestTheBundlePutsNothingInKairossPersistentState(t *testing.T) {
+	t.Parallel()
+	paths := persistentPaths(t)
+	under := func(p string) bool {
+		return slices.ContainsFunc(paths, func(d string) bool { return p == d || strings.HasPrefix(p, d+"/") })
+	}
+	ctx := t.TempDir()
+	if err := WriteContext(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	err := filepath.WalkDir(filepath.Join(ctx, "files"), func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		n++
+		if rel, _ := filepath.Rel(filepath.Join(ctx, "files"), p); under("/" + filepath.ToSlash(rel)) {
+			t.Errorf("the bundle ships /%s, under Kairos's persistent state", rel)
+		}
+		return nil
+	})
+	if err != nil || n == 0 {
+		t.Fatalf("walk: %v, %d files", err, n)
+	}
+	df, err := Dockerfile(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := []string{"/etc/systemd/system/vmtoolsd.service", "/etc/systemd/system/multipathd.service", "/etc/systemd/system/$u",
+		"/etc/ssh/sshd_config.d/05-kairos-hardening.conf", "/etc/ssh/sshd_config.d/00-notes-hardening.conf",
+		"/etc/systemd/system/\"$u\"", "/etc/systemd/system.control/\"$u\"", "/etc/ssh", "/etc/systemd", "/etc/modprobe.d/cis-blocklist.conf"}
+	for _, m := range regexp.MustCompile(`/(?:etc|home|opt|root|var)/[^\s;'|)]*`).FindAll(df, -1) {
+		p := strings.TrimRight(string(m), ",.:")
+		if under(p) && !slices.Contains(allowed, p) {
+			t.Errorf("the Dockerfile names %s, under Kairos's persistent state", p)
+		}
+	}
+	if !strings.Contains(string(df), "for u in notes-expand.service notes-health.service notes-hostd.service notes-network.service notes-preload.service notes-route6.service notes-ssh.service notes-tables.service notes-tune-online.service notes-tune.service notes.service docker.service nftables.service; do \\\n           ln -sf /usr/lib/systemd/system/$u $w/$u; done") {
+		t.Errorf("the Dockerfile does not enable the bundle's units from /usr/lib:\n%s", df)
+	}
+}
+
+// The bundle's own units: every unit file of its tree, those with an [Install] section enabled.
+func TestTheBundlesUnitsAreItsTreesUnits(t *testing.T) {
+	t.Parallel()
+	units := params.Units()
+	if len(units) != 13 || !slices.Contains(units, "notes.service") || !slices.Contains(units, "notes-backup.timer") {
+		t.Errorf("units: %v", units)
+	}
+	enabled := params.Enabled()
+	if len(enabled) != 11 || slices.Contains(enabled, "notes-backup.timer") || slices.Contains(enabled, "notes-backup.service") || !slices.Contains(enabled, "notes.service") {
+		t.Errorf("enabled: %v", enabled)
+	}
+}
+
+// The step parking what earlier bundles left in the persistent /etc, run on a root: exactly their
+// files go, under their own paths, and a second run finds nothing.
+func TestTheRetireStepParksEarlierBundlesFiles(t *testing.T) {
+	t.Parallel()
+	ctx := t.TempDir()
+	if err := WriteContext(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(ctx, "files/system/oem/02_notes_retire.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Stages map[string][]struct {
+			Name               string   `yaml:"name"`
+			OnlyServiceManager string   `yaml:"only_service_manager"`
+			Commands           []string `yaml:"commands"`
+		} `yaml:"stages"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Stages) != 1 || len(doc.Stages["initramfs"]) != 1 || len(doc.Stages["initramfs"][0].Commands) != 1 || doc.Stages["initramfs"][0].OnlyServiceManager != "systemd" {
+		t.Fatalf("02_notes_retire.yaml: %+v", doc)
+	}
+	script := doc.Stages["initramfs"][0].Commands[0]
+	if strings.Count(script, "cd / || exit 1\n") != 1 {
+		t.Fatalf("the step does not start at /:\n%s", script)
+	}
+	run := func(root string) (string, error) {
+		cmd := exec.Command("sh", "-c", strings.Replace(script, "cd / || exit 1\n", "cd '"+root+"' || exit 1\n", 1))
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	root := t.TempDir()
+	write := func(p, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(root, filepath.Dir(p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, p), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := func(p, target string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(root, filepath.Dir(p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(root, p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wants := "etc/systemd/system/multi-user.target.wants/"
+	parked := []string{"etc/systemd/system/notes.service", "etc/systemd/system/notes-backup.timer", "etc/systemd/system/notes-tune.service",
+		"etc/systemd/system/ssh.service.d/10-notes-live.conf", "etc/systemd/system/ssh.socket.d/10-notes-live.conf",
+		"etc/systemd/network/00-notes-sriov.network", "etc/ssh/sshd_config.d/10-notes.conf", "etc/systemd/system/docker.service.d/after-nftables.conf"}
+	for _, p := range parked {
+		write(p, "x\n")
+	}
+	write("etc/systemd/system/docker.service.d/after-nftables.conf", "[Unit]\nAfter=nftables.service\nWants=nftables.service\n")
+	link(wants+"notes.service", "/etc/systemd/system/notes.service")
+	link(wants+"notes-tune.service", "/etc/systemd/system/notes-tune.service")
+	parked = append(parked, wants+"notes.service", wants+"notes-tune.service")
+	// What is not an earlier bundle's stays: another's unit, a link elsewhere, a mask, an alias,
+	// a drop-in of other content, an operator's mask of a unit of the bundle, the SSH Include and
+	// the seed's key.
+	kept := []string{"etc/systemd/system/notes-gateway-0123abcd.service", "etc/systemd/system/docker.service.d/override.conf",
+		"etc/ssh/sshd_config.d/00-notes-hardening.conf", "etc/ssh/sshd_config.d/01-notes-seed-host-key.conf", "etc/systemd/network/10-notes-uplink.network"}
+	for _, p := range kept {
+		write(p, "x\n")
+	}
+	for p, target := range map[string]string{wants + "docker.service": "/lib/systemd/system/docker.service", wants + "notes-health.service": "/usr/lib/systemd/system/notes-health.service",
+		"etc/systemd/system/apt-daily.timer": "/dev/null", "etc/systemd/system/vmtoolsd.service": "/usr/lib/systemd/system/open-vm-tools.service",
+		"etc/systemd/system/notes-ssh.service": "/dev/null"} {
+		link(p, target)
+		kept = append(kept, p)
+	}
+	out, err := run(root)
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	for _, p := range parked {
+		if _, err := os.Lstat(filepath.Join(root, p)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s is not parked: %v", p, err)
+		}
+		if _, err := os.Lstat(filepath.Join(root, "etc/systemd/notes-retired", p)); err != nil {
+			t.Errorf("%s is not in the parked files: %v", p, err)
+		}
+		if !strings.Contains(out, " /"+p) {
+			t.Errorf("the step does not say it parked /%s: %s", p, out)
+		}
+	}
+	for _, p := range kept {
+		if _, err := os.Lstat(filepath.Join(root, p)); err != nil {
+			t.Errorf("%s is parked", p)
+		}
+	}
+	if l, _ := os.Readlink(filepath.Join(root, "etc/systemd/notes-retired", wants, "notes.service")); l != "/etc/systemd/system/notes.service" {
+		t.Errorf("the parked link points at %q", l)
+	}
+	if out, err := run(root); err != nil || out != "" {
+		t.Errorf("a second run: %v: %q", err, out)
+	}
+	// Docker's drop-in of another content is not the earlier bundle's.
+	write("etc/systemd/system/docker.service.d/after-nftables.conf", "[Unit]\nAfter=nftables.service\n")
+	if out, err := run(root); err != nil || out != "" {
+		t.Errorf("another after-nftables.conf: %v: %q", err, out)
+	}
+	// A copy parked before is never replaced: the same one again goes, another (an operator's,
+	// say) is parked beside it, numbered, and a third after it.
+	retired := filepath.Join(root, "etc/systemd/notes-retired/etc/systemd/system")
+	for i, content := range []string{"x\n", "operator's\n", "third\n"} {
+		write("etc/systemd/system/notes.service", content)
+		if out, err := run(root); err != nil || out != "parked in /etc/systemd/notes-retired: /etc/systemd/system/notes.service\n" {
+			t.Errorf("parking notes.service again (%d): %v: %q", i, err, out)
+		}
+	}
+	for name, want := range map[string]string{"notes.service": "x\n", "notes.service.1": "operator's\n", "notes.service.2": "third\n"} {
+		if raw, err := os.ReadFile(filepath.Join(retired, name)); err != nil || string(raw) != want {
+			t.Errorf("parked %s: %q, %v", name, raw, err)
+		}
+	}
+	// The same as a numbered copy goes too; a link the same as the one parked goes, another
+	// link is parked beside it.
+	write("etc/systemd/system/notes.service", "operator's\n")
+	link(wants+"notes.service", "/etc/systemd/system/notes.service")
+	if out, err := run(root); err != nil || out != "parked in /etc/systemd/notes-retired: /"+wants+"notes.service /etc/systemd/system/notes.service\n" {
+		t.Errorf("parking copies parked before: %v: %q", err, out)
+	}
+	if _, err := os.Lstat(filepath.Join(root, wants, "notes.service")); err == nil {
+		t.Error("the same link was not removed")
+	}
+	for _, name := range []string{"notes.service.3", "multi-user.target.wants/notes.service.1"} {
+		if _, err := os.Lstat(filepath.Join(retired, name)); err == nil {
+			t.Errorf("the same copy was parked twice: %s", name)
+		}
+	}
+	// A file it cannot park fails the step, naming it; the others are parked.
+	write("etc/systemd/system/notes-route6.service", "x\n")
+	write("etc/ssh/sshd_config.d/10-notes.conf", "x\n")
+	if err := os.RemoveAll(filepath.Join(root, "etc/systemd/notes-retired/etc/ssh")); err != nil {
+		t.Fatal(err)
+	}
+	write("etc/systemd/notes-retired/etc/ssh", "a file where the parked copies' directory goes")
+	out, err = run(root)
+	if err == nil || !strings.Contains(out, "could not park in /etc/systemd/notes-retired: /etc/ssh/sshd_config.d/10-notes.conf\n") ||
+		!strings.Contains(out, "parked in /etc/systemd/notes-retired: /etc/systemd/system/notes-route6.service\n") {
+		t.Errorf("a file it cannot park: %v: %s", err, out)
+	}
+}
+
+// Each kairos-init file the build checks by its sum is testdata's copy, and each copy is checked.
+func TestTheBuildPinsKairosInitsFiles(t *testing.T) {
+	t.Parallel()
+	entries, err := os.ReadDir(filepath.Join("testdata", "kairos-init-"+KairosInitRelease))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins := regexp.MustCompile(`\b[0-9a-f]{64}:(/[^ ;]+)`).FindAllStringSubmatch(dockerfile, -1)
+	if len(pins) != len(entries) || len(pins) == 0 {
+		t.Errorf("the Dockerfile pins %d files, testdata holds %d", len(pins), len(entries))
+	}
+	for _, e := range entries {
+		dir := "/system/oem/"
+		if strings.HasSuffix(e.Name(), ".cfg") {
+			dir = "/etc/cos/"
+		}
+		want := fmt.Sprintf("%x:%s%s", sha256.Sum256(kairosInitFile(t, e.Name())), dir, e.Name())
+		if !strings.Contains(dockerfile, want) {
+			t.Errorf("the Dockerfile does not pin %s", want)
+		}
+	}
+	// After kairos-init's stages, before a step edits one of them (each names it f=<path>).
+	at := strings.Index(dockerfile, "sha256sum -c --status")
+	if at < 0 {
+		t.Fatal("the Dockerfile checks no sum (sha256sum -c --status)")
+	}
+	run := strings.LastIndex(dockerfile[:at], "RUN ")
+	if i := strings.Index(dockerfile, "/kairos-init -s init"); i < 0 || run < 0 || i > run {
+		t.Fatal("the sums are not checked in a step after kairos-init's init stage")
+	}
+	var before strings.Builder
+	for l := range strings.Lines(dockerfile[:run]) {
+		if !strings.HasPrefix(strings.TrimSpace(l), "#") {
+			before.WriteString(l)
+		}
+	}
+	for _, p := range pins {
+		// Its directory and its name alike: a step reaching it by a cd, a glob or a variable
+		// names one of them.
+		if dir, base := path.Split(p[1]); strings.Contains(before.String(), strings.TrimSuffix(dir, "/")) || strings.Contains(before.String(), base) {
+			t.Errorf("a step names %s or its directory before its sum is checked", p[1])
+		}
+		if _, err := files.Open("files" + p[1]); err == nil {
+			t.Errorf("the bundle's files ship %s, which kairos-init writes", p[1])
+		}
+	}
+}
+
 // writeGPT writes a raw disk holding a GPT with a recovery partition of mib, as auroraboot writes
 // one, which sizes the state partition; the file spans its partitions (sparse).
 func writeGPT(t *testing.T, path string, mib int64) {
@@ -1671,5 +1967,105 @@ func TestDiskBuilderStaleIsOneContainers(t *testing.T) {
 	_, _ = c.Write([]byte("40%\r"))
 	if shown.String() != "40%\r" {
 		t.Errorf("a progress redraw held back: %q", shown.String())
+	}
+}
+
+// The step growing the persistent partition runs when it is the disk's last partition (yip grows
+// that one) and the disk has more than 16 MiB after it.
+func TestTheExpandStepGrowsTheLastPartitionAlone(t *testing.T) {
+	t.Parallel()
+	var doc struct {
+		Stages map[string][]struct {
+			If string `yaml:"if"`
+		} `yaml:"stages"`
+	}
+	tmpl, err := files.ReadFile("files/system/oem/01_NAME_expand.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := render("expand", string(tmpl), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	steps := doc.Stages["notes.expand"]
+	if len(steps) != 2 || strings.Count(steps[0].If, "/sys/") != 5 || strings.Count(steps[0].If, "blkid -L COS_PERSISTENT") != 1 {
+		t.Fatalf("the expand step: %+v", steps)
+	}
+	for _, c := range []struct {
+		name  string
+		parts map[string][2]int // start, size
+		total int
+		grows bool
+	}{
+		{"last, space after", map[string][2]int{"vda1": {2048, 1000}, "vda4": {10000, 5000}}, 100000, true},
+		{"last, 16 MiB after", map[string][2]int{"vda1": {2048, 1000}, "vda4": {10000, 5000}}, 15000 + 32768, false},
+		{"last, more than 16 MiB after", map[string][2]int{"vda1": {2048, 1000}, "vda4": {10000, 5000}}, 15000 + 32769, true},
+		{"another after", map[string][2]int{"vda4": {10000, 5000}, "vda5": {15000, 1000}}, 100000, false},
+	} {
+		sys := t.TempDir()
+		write := func(p, v string) {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(sys, p)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(sys, p), []byte(v+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write("block/vda/size", strconv.Itoa(c.total))
+		for p, v := range c.parts {
+			write("block/vda/"+p+"/start", strconv.Itoa(v[0]))
+			write("block/vda/"+p+"/size", strconv.Itoa(v[1]))
+		}
+		if err := os.MkdirAll(filepath.Join(sys, "class/block"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(sys, "block/vda/vda4"), filepath.Join(sys, "class/block/vda4")); err != nil {
+			t.Fatal(err)
+		}
+		script := strings.ReplaceAll(strings.Replace(steps[0].If, "blkid -L COS_PERSISTENT", "echo /dev/vda4", 1), "/sys/", sys+"/")
+		err := exec.Command("sh", "-c", script).Run()
+		if (err == nil) != c.grows {
+			t.Errorf("%s: grows %v (%v)", c.name, err == nil, err)
+		}
+	}
+}
+
+// What the OS bundle relies on in the pinned releases, read in their source, copied in testdata:
+// every boot fills the persistent paths without deleting or overwriting a newer file (rsync -u,
+// no --delete), Kairos parks only unit symlinks to nothing (so the bundle parks its own files:
+// 02_NAME_retire.yaml, in the initramfs stage, which runs chrooted in the system's root once the
+// persistent paths are mounted, before systemd starts), kairos-init links grub2-editenv, yip grows a labelled partition only when
+// it is the disk's last, and auroraboot sizes the recovery partition as disks.go computes it.
+// Another release is refused until its source is read again and copied there.
+func TestTheBundleMatchesItsReleasesContracts(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile("testdata/kairos-" + KairosInitRelease + "-contracts.txt")
+	if err != nil {
+		t.Fatalf("%v: read Kairos %s's immucore, agent, kairos-init, yip's layout and auroraboot's sizing, check the bundle against them, and copy them there", err, KairosInitRelease)
+	}
+	tag, _, _ := strings.Cut(strings.TrimPrefix(Auroraboot, "quay.io/kairos/auroraboot:"), "@")
+	for _, want := range []string{
+		`_, err := CommandWithPath(fmt.Sprintf("rsync -aquAX %s %s", src, dst))`,
+		"const staleUnitDir = \"etc/systemd/kairos-stale-units\"\n\tfor _, entry := range entries {\n\t\tname := entry.Name()\n\t\tif entry.Type()&os.ModeSymlink == 0 {\n\t\t\tcontinue",
+		`If: "test -f /usr/bin/grub-editenv && ! test -e /usr/bin/grub2-editenv",`,
+		"\"ln -s /usr/bin/grub-editenv /usr/bin/grub2-editenv\",",
+		"## yip v1.27.0 pkg/plugins/layout.go", "} else if !isLast {", "skipping expansion: it would grow the last partition instead\", label, dev.Device)\n\t\t\t\treturn nil",
+		"## auroraboot " + tag + " pkg/ops/rawDiskGeneration.go", "return uint(sourceSize + 200), nil", "return recoveryImageSize*2 + 150",
+		"s.QuarantineStaleUnitsDagStep(g, herd.WithWeakDeps(cnst.OpMountBind))",
+		"herd.WithWeakDeps(cnst.OpMountBaseOverlay, cnst.OpKcryptUnlock, cnst.OpMountOEM, cnst.OpMountBind, cnst.OpMountBind, cnst.OpCustomMounts, cnst.OpOverlayMount, cnst.OpQuarantineStaleUnits),",
+		"data, err := bundled.EmbeddedConfigs.ReadFile(filepath.Join(\"cloudconfigs\", file.Name()))", "err = os.WriteFile(outputPath, data, 0644)",
+		"Path:        \"/etc/cos/grub.cfg\",\n\t\t\t\t\tPermissions: 0644,\n\t\t\t\t\tOwner:       0,\n\t\t\t\t\tGroup:       0,\n\t\t\t\t\tContent:     bundled.GrubCfg,",
+		"Content:     bundled.BootArgsCfg,",
+		"\t\t\t\tchroot := internalUtils.NewChroot(s.Rootdir)\n\t\t\t\treturn chroot.RunCallback(func() error {\n\t\t\t\t\t_ = internalUtils.RunStage(\"initramfs\")",
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("the releases no longer hold %q: check the bundle against them", want)
+		}
+	}
+	if imageExtraMiB != 200 || recoveryExtraMiB != 150 {
+		t.Errorf("disks.go sizes the recovery partition otherwise than auroraboot %s", tag)
 	}
 }

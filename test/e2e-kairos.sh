@@ -119,10 +119,13 @@ docker cp "$ctr:/etc/notes/os-version" "$WORK/os-version"
 [[ $(cat "$WORK/os-version") == 1.0.0 ]] || fail "os-version is $(cat "$WORK/os-version")"
 docker cp "$ctr:/etc/kairos-release" "$WORK/kairos-release"
 grep -q '^KAIROS_FLAVOR="ubuntu"' "$WORK/kairos-release" || fail "not a Kairos image"
-docker cp "$ctr:/etc/systemd/system/notes-tune.service" "$WORK/tune.service" && grep -q '^ExecStart=/usr/sbin/notes-stow tune-boot$' "$WORK/tune.service" ||
+docker cp "$ctr:/usr/lib/systemd/system/notes-tune.service" "$WORK/tune.service" && grep -q '^ExecStart=/usr/sbin/notes-stow tune-boot$' "$WORK/tune.service" ||
 	fail "the bundle does not tune the network at boot"
-[[ $(docker cp "$ctr:/etc/systemd/system/multi-user.target.wants/notes-tune.service" - | tar -tvf - 2>/dev/null) == *"-> /etc/systemd/system/notes-tune.service"* ]] ||
+[[ $(docker cp "$ctr:/usr/lib/systemd/system/multi-user.target.wants/notes-tune.service" - | tar -tvf - 2>/dev/null) == *"-> /usr/lib/systemd/system/notes-tune.service"* ]] ||
 	fail "the tuning unit is not enabled"
+# Nothing of the bundle's own in Kairos's persistent /etc/systemd and /etc/ssh but the SSH Include.
+own=$(docker export "$ctr" | tar -t | grep -E '^etc/(systemd|ssh)/.*notes' | grep -vx 'etc/ssh/sshd_config.d/00-notes-hardening.conf' || true)
+[[ -z $own ]] || fail "the bundle ships files of its own in Kairos's persistent /etc: $own"
 docker cp "$ctr:/usr/sbin/ethtool" "$WORK/ethtool" || fail "the bundle has no ethtool"
 docker cp "$ctr:/usr/share/notes-preload" "$WORK/preload"
 for img in api web postgres front backup chown; do

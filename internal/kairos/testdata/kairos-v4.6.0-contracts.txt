@@ -1,0 +1,214 @@
+# Kairos v4.6.0 (github.com/kairos-io/kairos, tag v4.6.0, commit e907b16445b7fd1021fc250b50518c508132cf2a), yip v1.27.0 and auroraboot v0.29.0: what the OS bundle and the VM's host daemon rely on, verbatim.
+
+## immucore/internal/utils/mounts.go (the persistent state paths filled at every boot)
+	// This has the --update flag to avoid overwriting newer files in dst.
+	// This also has a weird bug in which if the source is a file and destination is a symlink.
+	// According to docs it should overwrite the symlink as its of a different type but it does not.
+	// Doing it the other way around (symlink source to file destination) does overwrite it so be careful with this.
+	// So we rely in that behaviour but if its fixed in the future we might need to change this.
+	// Reported here:
+	// https://github.com/RsyncProject/rsync/issues/827
+	_, err := CommandWithPath(fmt.Sprintf("rsync -aquAX %s %s", src, dst))
+	return err
+}
+
+## immucore/internal/utils/systemd_units.go (Kairos parks only unit symlinks to nothing)
+const staleUnitDir = "etc/systemd/kairos-stale-units"
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+
+## immucore/pkg/state/steps.go (COS_STATE's mount)
+	err = g.Add(cnst.OpMountState,
+		TimedCallback(cnst.OpMountState,
+			func(_ context.Context) error {
+				stateDevice := internalUtils.GetState()
+				fstab, err := op.MountOPWithFstabFn(
+					stateDevice,
+					s.path("/run/initramfs/cos-state"),
+					internalUtils.DiskFSType(stateDevice),
+
+## immucore/pkg/state/steps_shared.go (the boot's sentinels)
+			switch runtime.BootState {
+			case state.Active:
+				sentinel = "active_mode"
+			case state.Passive:
+				sentinel = "passive_mode"
+			case state.Recovery:
+				sentinel = "recovery_mode"
+			case state.AutoReset:
+				sentinel = "autoreset_mode"
+			case state.LiveCD:
+				sentinel = "live_mode"
+			case state.Unknown:
+				sentinel = string(state.Unknown)
+				return err
+			}
+
+			// In-RAM boots also get an additive sentinel so tooling can tell
+			// them apart from a regular Active install. The BootState sentinel
+			// above is already active_mode (kairos-sdk forces BootState=Active
+			// when kairos.ram is present) so existing gates keep firing.
+			if s.InRAM {
+				internalUtils.KLog.Logger.Info().Str("to", cnst.InRAMSentinelName).Msg("Setting in-RAM sentinel file")
+				if err = os.WriteFile(filepath.Join(sdkConstants.SentinelDir, cnst.InRAMSentinelName), []byte("1"), os.ModePerm); err != nil {
+					return err
+
+## immucore/internal/constants/constants.go
+	InRAMSentinelName = "in_ram_mode"
+
+## sdk/constants/constants.go
+	SentinelDir = "/run/cos"
+
+## agent/pkg/elemental/elemental.go (the installer's cloud-configs)
+
+// CopyCloudConfig will check if there is a cloud init in the config and store it on the target.
+// Files are named 9<index>_custom.yaml with the index zero-padded to the width
+// of the highest one, so they sort in list order and the last entry, the
+// launch cloud-config, is applied last. Up to ten entries keep 90..99.
+func (e *Elemental) CopyCloudConfig(cloudInit []string) (err error) {
+	e.config.Logger.Infof("List of cloud inits to copy: %+v\n", cloudInit)
+
+## agent/pkg/action/upgrade.go (the upgrade's order: transition image, gate, finalize handoff, moves)
+	u.Info("deploying image %s to %s", upgradeImg.Source.Value(), upgradeImg.File)
+	_, err = e.DeployImage(&upgradeImg, true, u.spec.ExcludedPaths...)
+	if err != nil {
+		u.Error("Failed deploying image to file '%s': %s", upgradeImg.File, err)
+		return err
+	}
+	cleanup.Push(func() error { return e.DiscardImage(&upgradeImg) })
+	if err = u.runFinalizeStep(&upgradeImg); err != nil {
+		return err
+	}
+	if !u.spec.RecoveryUpgrade() && bootedFrom != state.Passive {
+		// backup current active.img to passive.img before overwriting the active.img
+		u.Info("Backing up current active image")
+		source := filepath.Join(u.spec.Partitions.State.MountPoint, "cOS", constants.ActiveImgFile)
+		u.Info("Moving %s to %s", source, u.spec.Passive.File)
+		err = u.config.Fs.Rename(source, u.spec.Passive.File)
+		if err != nil {
+	u.Info("Moving %s to %s", upgradeImg.File, finalImageFile)
+	err = u.config.Fs.Rename(upgradeImg.File, finalImageFile)
+func (u *UpgradeAction) runFinalizeStep(upgradeImg *sdkImages.Image) error {
+	current, err := ReadKairosInitVersionFromFs(u.config.Fs, CurrentKairosReleaseFile(u.config.Fs))
+	if err != nil {
+		return fmt.Errorf("reading current KAIROS_INIT_VERSION: %w", err)
+	}
+	target, err := ReadKairosInitVersionFromFs(u.config.Fs, filepath.Join(upgradeImg.MountPoint, constants.KairosReleaseFile))
+	if err != nil {
+		return fmt.Errorf("reading target KAIROS_INIT_VERSION from the deployed rootfs: %w", err)
+	}
+	if err := RefuseIfTargetIsDowngrade(current, target); err != nil {
+		return err
+	}
+	return u.handoffFinalizeToTarget(upgradeImg)
+	binds := u.finalizeHandoffBinds()
+	callback := func() error {
+		u.Info("Handing off upgrade finalize to target kairos-agent (%s)", constants.TargetKairosAgentPath)
+		out, err := u.config.Runner.Run(constants.TargetKairosAgentPath, "upgrade-finalize", "--context-file", ctxPathInsideTarget)
+
+## kairos-init/pkg/stages/steps_init.go
+			Name: "Link grub-editenv to grub2-editenv",
+			//OnlyIfOs: "Ubuntu.*|Alpine.*", // Maybe not needed and just checking if the file exists is enough
+			// test if the file exists and if the link does not exist
+			If: "test -f /usr/bin/grub-editenv && ! test -e /usr/bin/grub2-editenv",
+			Commands: []string{
+				"ln -s /usr/bin/grub-editenv /usr/bin/grub2-editenv",
+			},
+
+## yip v1.27.0 pkg/plugins/layout.go (Kairos v4.6.0's go.mod: github.com/mudler/yip v1.27.0)
+	l.Debugf("Checking for layout expansion on device %s", dev.Device)
+	if s.Layout.Expand != nil {
+		// Expansion always grows the last partition of the disk. When the device
+		// was selected by label, make sure that label is on the last partition,
+		// otherwise we would silently grow a different partition over it.
+		if label := strings.TrimSpace(s.Layout.Device.Label); label != "" {
+			isLast, err := labelIsOnLastPartition(dev, label, fs)
+			if err != nil {
+				l.Debugf("Could not tell which partition holds label %s (%s), expanding the last partition", label, err.Error())
+			} else if !isLast {
+				l.Warnf("Label %s is not on the last partition of %s, skipping expansion: it would grow the last partition instead", label, dev.Device)
+				return nil
+			}
+
+## auroraboot v0.29.0 pkg/ops/rawDiskGeneration.go (commit 1781716c4353e8cdf558b6e18120ce5dc8708d43; the recovery partition's sizing)
+func recoveryImageSize(sourceSize uint64, configuredSize int64) (uint, error) {
+	if configuredSize > 0 {
+		if uint64(configuredSize) < sourceSize {
+			return 0, fmt.Errorf("configured recovery image size %d MB is smaller than source size %d MB", configuredSize, sourceSize)
+		}
+		return uint(configuredSize), nil
+	}
+	return uint(sourceSize + 200), nil
+}
+
+func recoveryPartitionSize(recoveryImageSize uint) uint {
+	// The partition must hold both the recovery image and a transition image
+	// during recovery upgrades, plus space for copied boot artifacts.
+	return recoveryImageSize*2 + 150
+}
+
+## immucore/pkg/dag/dag_normal_boot.go (the initramfs stage after the persistent paths' binds and Kairos's parking)
+	s.LogIfError(s.QuarantineStaleUnitsDagStep(g, herd.WithWeakDeps(cnst.OpMountBind)), "quarantine stale systemd units")
+	s.LogIfError(s.InitramfsStageDagStep(g,
+		herd.WithDeps(cnst.OpMountRoot, cnst.OpDiscoverState, cnst.OpLoadConfig, cnst.OpWriteFstab),
+		herd.WithWeakDeps(cnst.OpMountBaseOverlay, cnst.OpKcryptUnlock, cnst.OpMountOEM, cnst.OpMountBind, cnst.OpMountBind, cnst.OpCustomMounts, cnst.OpOverlayMount, cnst.OpQuarantineStaleUnits),
+
+## immucore/pkg/state/steps_shared.go (the initramfs stage chrooted in the system's root)
+		case "initramfs":
+			// Not sure if it will work under UKI where the s.Rootdir is the current root already
+			internalUtils.KLog.Logger.Info().Msg("Running initramfs stage")
+			if internalUtils.IsUKI() {
+				_ = internalUtils.RunStage("initramfs")
+				return nil
+			} else {
+				chroot := internalUtils.NewChroot(s.Rootdir)
+				return chroot.RunCallback(func() error {
+					_ = internalUtils.RunStage("initramfs")
+					return nil
+				})
+			}
+
+## agent/pkg/action/version_gate.go (the refusal of a system an older kairos-init built)
+	}
+	if target.LessThan(current) || (target.Equal(current) && targetAhead < currentAhead) {
+		return fmt.Errorf(
+			"refusing to upgrade: target KAIROS_INIT_VERSION %q is older than current %q "+
+				"(this tracks build tooling, not the image's KAIROS_VERSION or base image, "+
+
+## kairos-init/pkg/stages/steps_install.go (the cloud-configs and GRUB's files written as kairos-init embeds them, whatever the base)
+	for _, file := range files {
+		if !file.IsDir() {
+			data, err := bundled.EmbeddedConfigs.ReadFile(filepath.Join("cloudconfigs", file.Name()))
+			if err != nil {
+				l.Logger.Error().Err(err).Str("file", file.Name()).Msg("Failed to read embedded file")
+				continue
+			}
+
+			// check if /system/oem exists and create it if not
+			if _, err = os.Stat("/system/oem"); os.IsNotExist(err) {
+				err = os.MkdirAll("/system/oem", 0755)
+				if err != nil {
+					l.Logger.Error().Err(err).Str("dir", "/system/oem").Msg("Failed to create directory")
+					continue
+				}
+			}
+			outputPath := filepath.Join("/system/oem/", file.Name())
+			err = os.WriteFile(outputPath, data, 0644)
+			if err != nil {
+				{
+					Path:        "/etc/cos/grub.cfg",
+					Permissions: 0644,
+					Owner:       0,
+					Group:       0,
+					Content:     bundled.GrubCfg,
+				},
+				{
+					Path:        "/etc/cos/bootargs.cfg",
+					Permissions: 0644,
+					Owner:       0,
+					Group:       0,
+					Content:     bundled.BootArgsCfg,
+				},

@@ -32,9 +32,12 @@ type fakeHost struct {
 	ran    [][]string
 	config string // the Docker config kairos-agent ran with
 	out    string // what kairos-agent prints
+	out2   string // what it prints next, in a write of its own
 	err    error  // kairos-agent fails
 	// gate, when set, holds kairos-agent until it is closed.
 	gate chan struct{}
+	// agent, when set, runs as kairos-agent does, before it ends.
+	agent func()
 	// boot is the ActiveState of <name>.service, and judge of <name>-health.service; empty is
 	// active; judge "<error>": systemctl fails to read it.
 	boot, judge string
@@ -186,6 +189,12 @@ func (f *fakeHost) Run(ctx context.Context, c Cmd) ([]byte, error) {
 		f.config = string(raw)
 	}
 	_, _ = io.WriteString(c.Stream, f.out)
+	if f.out2 != "" {
+		_, _ = io.WriteString(c.Stream, f.out2)
+	}
+	if f.agent != nil {
+		f.agent()
+	}
 	return nil, f.err
 }
 
@@ -1410,6 +1419,144 @@ func TestDecodeBodyRefusesWhatIsNoRequest(t *testing.T) {
 		err := decodeBodyUpTo(httptest.NewRecorder(), r, &v, 1024)
 		if _, ok := Refusal(err); err == nil || ok != refused {
 			t.Errorf("%s: %v, refused %v, want %v", body, err, ok, refused)
+		}
+	}
+}
+
+// bootMode reads immucore's sentinels: each system it marks, a reset of the disk as the recovery
+// system it runs, a kairos.ram boot as the active system Kairos marks, none off Kairos.
+func TestBootModeReadsEveryKairosSentinel(t *testing.T) {
+	t.Parallel()
+	for marks, want := range map[string]string{"": "", "active_mode": "active", "passive_mode": "passive", "recovery_mode": "recovery",
+		"autoreset_mode": "recovery", "live_mode": "live", "active_mode in_ram_mode": "active", "upgrade_failure": ""} {
+		dir := t.TempDir()
+		for _, m := range strings.Fields(marks) {
+			if err := os.WriteFile(filepath.Join(dir, m), []byte("1"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := bootMode(dir); got != want {
+			t.Errorf("%q: %q, not %q", marks, got, want)
+		}
+	}
+}
+
+// An upgrade kairos-agent said it refused, or failed to write the image of, before it handed its
+// finalize to the new system, both images as they were, leaves this system the active one: the
+// next job needs no reboot. One that moved an image, failed once the finalize began (it may have
+// labelled the images, written GRUB's entries), or failed without saying why keeps the mark until
+// the reboot.
+func TestAFailedUpgradeThatMovedNoSystemNeedsNoReboot(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		moved bool
+		out   string
+		kept  bool
+	}{
+		"refused":                  {out: "deploying image\nrefusing to upgrade: target KAIROS_INIT_VERSION \"v4.4.0\" is older\n"},
+		"not written":              {out: "ERROR Failed deploying image to file '/run/cos/transition.img': pull: unauthorized\n"},
+		"said nothing":             {kept: true},
+		"moved one":                {moved: true, out: "refusing to upgrade: target KAIROS_INIT_VERSION\n", kept: true},
+		"failed in the finalize":   {out: "refusing to upgrade: target KAIROS_INIT_VERSION\nINFO Handing off upgrade finalize to target kairos-agent (/usr/bin/kairos-agent)\n", kept: true},
+		"finalize said in a split": {out: "Failed deploying image to file\n" + strings.Repeat("x", 100) + "Handing off upgrade fina", kept: true},
+	} {
+		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+		p.release("2.0.0", 1, nil)
+		host := &fakeHost{err: errors.New("kairos-agent failed"), out: c.out}
+		if name == "finalize said in a split" {
+			host.out2 = "lize to target kairos-agent\n"
+		}
+		d := daemon(p.env, host)
+		boots(t, d, "active", nil)
+		// The images of one size and time: only which file each is tells a move.
+		active, passive := filepath.Join(d.State, "cOS", "active.img"), filepath.Join(d.State, passiveImage)
+		at := time.Unix(1700000000, 0)
+		for _, img := range []string{active, passive} {
+			if err := os.WriteFile(img, []byte("A"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(img, at, at); err != nil {
+				t.Fatal(err)
+			}
+		}
+		host.agent = func() {
+			if c.moved {
+				_ = os.Rename(active, passive)
+				_ = os.WriteFile(active, []byte("B"), 0o644)
+				_ = os.Chtimes(active, at, at)
+			}
+		}
+		if err := os.WriteFile(newBaselineFile(d.O.Dir), []byte("notes 1.0.0 (revision 1)\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		hh := d.Handler()
+		if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, nil); code != 202 {
+			t.Fatalf("%s: %d", name, code)
+		}
+		j := waitJob(t, hh)
+		if j.State != "failed" || !strings.Contains(j.Error, "kairos-agent failed") {
+			t.Errorf("%s: %+v", name, j)
+		}
+		said := strings.Contains(strings.Join(j.Log, "\n"), "kairos-agent moved no system: this system stays the active one, and the next upgrade or rollback needs no reboot")
+		// What the job staged for the boot into 2.0.0 is put back as it was: the running
+		// release's own pending crossing stays, no inputs are left staged.
+		if raw, err := os.ReadFile(newBaselineFile(d.O.Dir)); c.kept == (err == nil && string(raw) == "notes 1.0.0 (revision 1)\n") {
+			t.Errorf("%s: the crossing's mark: %q %v", name, raw, err)
+		}
+		if fileExists(filepath.Join(d.Run, osWritten)) != c.kept || said == c.kept {
+			t.Errorf("%s: marked %v, said %v", name, fileExists(filepath.Join(d.Run, osWritten)), said)
+		}
+		e := errOf{}
+		code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true}, &e)
+		if c.kept != (code == 409 && strings.Contains(e.Error, "reboot first")) {
+			t.Errorf("%s: a dry run after: %d %+v", name, code, e)
+		}
+	}
+}
+
+// A job whose marks for the boot into it fail to stage runs no kairos-agent: what it staged is
+// put back (the running release's pending crossing, its inputs, no first-install mark), and the
+// next job needs no reboot. Staging it could not read first keeps the mark.
+func TestAnOSJobThatStagedNothingNeedsNoReboot(t *testing.T) {
+	t.Parallel()
+	for name, unreadable := range map[string]bool{"staged": false, "unreadable": true} {
+		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+		host := &fakeHost{}
+		d := daemon(p.env, host)
+		in, _ := d.run()
+		dir := in.O.Dir
+		if err := os.WriteFile(newBaselineFile(dir), []byte("notes 1.0.0 (revision 1)\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if unreadable {
+			if err := os.Mkdir(osUpgradeFile(dir), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		j, err := d.startJob("upgrade", "notes:2.0.0", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.osJob(j, in, "notes:2.0.0", "reg/notes", "reg/notes/notes-os@sha256:x", false, "upgrades the install", func() error {
+			_ = os.Remove(newBaselineFile(dir))
+			_ = os.WriteFile(stagedInputsFile(dir), []byte("{}"), 0o600)
+			return errors.New("no space left on device")
+		})
+		st := waitJob(t, d.Handler())
+		log := strings.Join(st.Log, "\n")
+		if strings.Contains(fmt.Sprint(host.calls()), "kairos-agent") || st.State != "failed" {
+			t.Errorf("%s: %+v %v", name, st, host.calls())
+		}
+		if unreadable {
+			if !fileExists(filepath.Join(d.Run, osWritten)) || !strings.Contains(log, "kairos-agent did not run, but what the job staged for the boot could not be read before it: reboot before the next upgrade or rollback") {
+				t.Errorf("%s: %s", name, log)
+			}
+			continue
+		}
+		raw, _ := os.ReadFile(newBaselineFile(dir))
+		if fileExists(filepath.Join(d.Run, osWritten)) || string(raw) != "notes 1.0.0 (revision 1)\n" || fileExists(stagedInputsFile(dir)) ||
+			!strings.Contains(log, "kairos-agent did not run: this system stays the active one, and the next upgrade or rollback needs no reboot") {
+			t.Errorf("%s: crossing %q, %s", name, raw, log)
 		}
 	}
 }

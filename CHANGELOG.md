@@ -3,6 +3,31 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.51.0]
+
+### Fixed
+
+- A VM no longer keeps a newer release's services after a rollback or a failed upgrade's
+  fallback: the OS bundle's services and their settings now leave with its system image. What
+  earlier bundles left behind is set aside (not deleted) at the first boot of this release; a
+  service an operator replaced whole is set aside too, where one changed by a drop-in stays.
+- An upgrade that Kairos refuses before it touches the systems (an image built with an older
+  kairos-init, a pull that failed), or that fails before Kairos runs, no longer blocks `rollback`
+  and the next `upgrade` until a reboot, nor drops what the running release had pending for its
+  next boot (a `reset-db --new-baseline` crossing to retry).
+- A machine whose installer read more than ten cloud-configs keeps them all as its user-data.
+- The health gate refuses to judge a boot when Kairos's state partition is not mounted where it
+  reads the boot assessment, rather than taking an upgrade's first boot as an ordinary one.
+- The persistent partition is grown only when it is the disk's last partition.
+- `status` names the recovery system while it resets the disk (it named no system), and the
+  installer's live boot.
+
+### Changed
+
+- The OS bundle's build fails, naming the file, when a kairos-init file it edits or relies on is
+  not kairos-init v4.6.0's, and when the tool the health gate writes the boot assessment with is
+  missing.
+
 ## [0.50.1] - 2026-11-27
 
 ### Fixed

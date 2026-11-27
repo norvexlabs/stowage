@@ -1654,3 +1654,47 @@ func TestTheUnnamedNICsFileThatDoesNotMoveIsSaid(t *testing.T) {
 		t.Errorf("%t %v %q", ok, err, stderr)
 	}
 }
+
+// The installer's cloud-configs (9<index>_custom.yaml, zero-padded to the widest index) move into
+// 95_userdata in their order, the first as userdata.yaml; none fails the stage.
+func TestAfterInstallMoveTakesTheInstallersCloudConfigs(t *testing.T) {
+	t.Parallel()
+	if strings.Count(afterInstallMove, "/oem/") != 4 {
+		t.Fatalf("afterInstallMove names /oem/ otherwise than this test replaces: %s", afterInstallMove)
+	}
+	for _, c := range []struct {
+		have, want []string
+		first      string
+		fails      bool
+	}{
+		{have: []string{"90_custom.yaml"}, want: []string{"userdata.yaml"}, first: "90_custom.yaml"},
+		{have: []string{"99_custom.yaml", "91_custom.yaml", "90_custom.yaml"}, want: []string{"91_custom.yaml", "99_custom.yaml", "userdata.yaml"}, first: "90_custom.yaml"},
+		{have: []string{"910_custom.yaml", "900_custom.yaml", "901_custom.yaml"}, want: []string{"901_custom.yaml", "910_custom.yaml", "userdata.yaml"}, first: "900_custom.yaml"},
+		{have: []string{"9x_custom.yaml", "90_custom.yaml"}, want: []string{"userdata.yaml"}, first: "90_custom.yaml"},
+		{have: []string{"9x_custom.yaml"}, fails: true},
+		{fails: true},
+	} {
+		oem := t.TempDir()
+		for _, f := range c.have {
+			if err := os.WriteFile(filepath.Join(oem, f), []byte(f), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		out, err := exec.Command("sh", "-c", strings.ReplaceAll(afterInstallMove, "/oem/", oem+"/")).CombinedOutput()
+		if (err != nil) != c.fails {
+			t.Errorf("%v: %v: %s", c.have, err, out)
+			continue
+		}
+		entries, _ := os.ReadDir(filepath.Join(oem, "95_userdata"))
+		var got []string
+		for _, e := range entries {
+			got = append(got, e.Name())
+		}
+		if !slices.Equal(got, c.want) {
+			t.Errorf("%v: 95_userdata holds %v, not %v", c.have, got, c.want)
+		}
+		if raw, _ := os.ReadFile(filepath.Join(oem, "95_userdata", "userdata.yaml")); !c.fails && string(raw) != c.first {
+			t.Errorf("%v: userdata.yaml is %q, not %s", c.have, raw, c.first)
+		}
+	}
+}

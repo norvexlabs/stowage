@@ -45,24 +45,28 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 
 # Docker keeps its data on the persistent partition (/usr/local), so images and containers survive
 # an A/B upgrade, and starts after nftables, whose ruleset flush would drop Docker's chains.
-RUN mkdir -p /etc/docker /etc/systemd/system/docker.service.d \
+RUN mkdir -p /etc/docker /usr/lib/systemd/system/docker.service.d \
     && printf '{\n  "data-root": "/usr/local/docker",\n  "features": {"containerd-snapshotter": true}\n}\n' > /etc/docker/daemon.json \
-    && printf '[Unit]\nAfter=nftables.service\nWants=nftables.service\n' > /etc/systemd/system/docker.service.d/after-nftables.conf
+    && printf '[Unit]\nAfter=nftables.service\nWants=nftables.service\n' > /usr/lib/systemd/system/docker.service.d/10-{{.Name}}-after-nftables.conf
 
 # Everything the image adds lives outside /usr/local, /var, /oem, /opt and /home: Kairos mounts
-# persistent storage there, which would hide it.
+# persistent storage there, which would hide it. Its units, their drop-ins and the links enabling
+# them live in /usr/lib, never in /etc/systemd or /etc/ssh: those are Kairos's persistent state,
+# which every boot fills from its image without deleting or overwriting a newer file, so a file
+# there outlives the release that shipped it and reaches an older one after a rollback
+# (files/system/oem/02_NAME_retire.yaml parks the copies earlier bundles left there). The alias
+# and the mask below stay in /etc: each takes the name of its package's unit in /usr/lib, and is
+# the same in every release.
 COPY files/ /
 RUN chmod 0440 /etc/sudoers.d/10-{{.Name}} \
     && chmod 0755 /usr/sbin/{{.Name}}-preload \
     && mkdir -p /etc/{{.Name}} \
     && echo "{{.OSVersion}}" > /etc/{{.Name}}/os-version \
-    && mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/getty.target.wants \
+    && w=/usr/lib/systemd/system/multi-user.target.wants && mkdir -p $w /usr/lib/systemd/system/getty.target.wants \
     && (getent group admin >/dev/null || groupadd --system admin) \
-    && for u in {{.Name}}-expand.service {{.Name}}-preload.service {{.Name}}.service {{.Name}}-health.service {{.Name}}-hostd.service {{.Name}}-network.service {{.Name}}-tune.service {{.Name}}-tune-online.service {{.Name}}-route6.service {{.Name}}-tables.service {{.Name}}-ssh.service; do \
-           ln -sf /etc/systemd/system/$u /etc/systemd/system/multi-user.target.wants/$u; done \
-    && ln -sf /lib/systemd/system/docker.service /etc/systemd/system/multi-user.target.wants/docker.service \
-    && ln -sf /lib/systemd/system/nftables.service /etc/systemd/system/multi-user.target.wants/nftables.service \
-    && ln -sf /lib/systemd/system/serial-getty@.service /etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service \
+    && for u in{{range .Enabled}} {{.}}{{end}} docker.service nftables.service; do \
+           ln -sf /usr/lib/systemd/system/$u $w/$u; done \
+    && ln -sf /usr/lib/systemd/system/serial-getty@.service /usr/lib/systemd/system/getty.target.wants/serial-getty@ttyS0.service \
     && ln -sf /usr/lib/systemd/system/open-vm-tools.service /etc/systemd/system/vmtoolsd.service \
     && ln -sf /dev/null /etc/systemd/system/multipathd.service
 
@@ -93,10 +97,11 @@ RUN set -e; f=/usr/lib/dracut/modules.d/70crypt/crypt-generator.sh; \
 # which every boot fills from its image without deleting, so a file left there by a newer image
 # would reach an older one's sshd on a rollback, which refuses settings it does not know and
 # does not start. On a system without that directory the Include reads nothing. The image's own
-# settings that differ from the drop-in's sit beside it, named to be read first (sshd keeps a
-# keyword's first value): root's login refused, where the drop-in allows it by key, as a cloud's
-# datasource writes its metadata's SSH keys (on Scaleway, every key of the project) for root.
-# The build fails, naming the check, when sshd's effective settings are not these.
+# settings sit beside it (files/usr/lib/NAME/sshd_config.d): those that differ from the drop-in's
+# named to be read first (sshd keeps a keyword's first value): root's login refused, where the
+# drop-in allows it by key, as a cloud's datasource writes its metadata's SSH keys (on Scaleway,
+# every key of the project) for root; the login by key alone, which the drop-in leaves unset,
+# after it. The build fails, naming the check, when sshd's effective settings are not these.
 RUN set -e; fail() { echo "os bundle: $*" >&2; exit 1; }; \
     /kairos-init -s init --skip-step cisHardening -v "{{.OSVersion}}"; \
     rm /kairos-init; \
@@ -107,7 +112,7 @@ RUN set -e; fail() { echo "os bundle: $*" >&2; exit 1; }; \
     printf 'Include /usr/lib/{{.Name}}/sshd_config.d/*.conf\n' > /etc/ssh/sshd_config.d/00-{{.Name}}-hardening.conf; \
     k="$(mktemp -d)"; ssh-keygen -q -t ed25519 -N '' -f "$k/key"; mkdir -p /run/sshd; \
     sshd -T -h "$k/key" > "$k/effective" || fail "sshd -T refuses the image's SSH settings"; \
-    for s in 'permitrootlogin no' 'allowtcpforwarding no' 'maxauthtries 4' 'passwordauthentication no'; do \
+    for s in 'permitrootlogin no' 'allowtcpforwarding no' 'maxauthtries 4' 'passwordauthentication no' 'kbdinteractiveauthentication no' 'pubkeyauthentication yes'; do \
         grep -qx "$s" "$k/effective" || fail "sshd's effective setting is '$(grep "^${s%% *} " "$k/effective" || echo "${s%% *} absent")', not '$s'"; done; \
     rm -rf "$k"; \
     ! test -e /etc/modprobe.d/cis-blocklist.conf || fail "kairos-init's CIS module blocklist is installed"; \
@@ -121,6 +126,32 @@ RUN set -e; fail() { echo "os bundle: $*" >&2; exit 1; }; \
     rm -rf /var/lib/apt/lists/*; \
     n=$(find /lib/modules/ -name '*.ko*' | wc -l); \
     [ "$n" -ge 100 ] || fail "only $n kernel modules after the reinstall"
+
+# The kairos-init files the bundle edits or relies on, each as kairos-init v4.6.0 writes it, from
+# the files it embeds, whatever the base (internal/kairos/testdata holds them, and a test the sums):
+# the build fails, naming the file, when one differs, before any step below edits it.
+#   /etc/cos/grub.cfg: the entries' ids (cos, fallback, recovery), the fallback's
+#     extra_passive_cmdline, next_entry read once into selected_entry, which the bundle's boot
+#     assessment reads (files/usr/share/NAME/08_grub.yaml).
+#   /etc/cos/bootargs.cfg: its consoles and its last line (setKernelCmd), edited below.
+#   /system/oem/00_datasource.yaml: its providers' list, extended below.
+#   /system/oem/00_rootfs.yaml: PERSISTENT_STATE_PATHS, /etc/systemd and /etc/ssh among them,
+#     where the bundle puts nothing of its own (its units are in /usr/lib).
+#   /system/oem/05_network.yaml: 20-dhcp.network and 20-dhcp-legacy.network, which the VM's seed
+#     extends, and the network files the seed's sort before.
+#   /system/oem/08_grub.yaml: the boot assessment the bundle's copy is derived from.
+#   /system/oem/09_systemd_services.yaml: cos-setup-boot and cos-setup-network, which the bundle's
+#     units and its host daemon follow; its receive buffer ceiling and iscsid, edited below.
+RUN set -e; for p in \
+        2305a392d0d6ff6a7ff813e644280e644282efb5c881eeff23e747f176660146:/etc/cos/grub.cfg \
+        853c9039b6b992e2f1e4c9110821dc271b145d285e50b178102ff4046d524c66:/etc/cos/bootargs.cfg \
+        dc2ad88a597d0431c0bb5a0df4b2808ff0c583a403fca8a0256dde75c9b37083:/system/oem/00_datasource.yaml \
+        71a599186fa434cfb514f018d08b39083acb25f54cea427098124f6d49da5d16:/system/oem/00_rootfs.yaml \
+        ea498b34897864778ec018a5fb9208dc31f2096e97d8e89f4e3aa36e7e3b2752:/system/oem/05_network.yaml \
+        a8d0b7ba11e554651ffaa7ec1cf132b217679be3bc387675ea1ad4ca40d104e5:/system/oem/08_grub.yaml \
+        1820acca62043f3257e1f0f0211a86e6784dd2cd3f8d8c90e7e45c10169cb289:/system/oem/09_systemd_services.yaml; do \
+        echo "${p%%:*}  ${p#*:}" | sha256sum -c --status - || \
+            { echo "shapes.kairos.kairos_init: its ${p#*:} is not the one this stowage relies on: use kairos-init v4.6.0" >&2; exit 1; }; done
 
 # The initrd's network is dropped at switch-root (files/usr/lib/systemd/network): the build fails
 # when the initrd the init stage built does not carry dracut's default network, the hook that
@@ -308,19 +339,18 @@ RUN set -e; c="$(systemd-tmpfiles --cat-config | grep -E '^[^#]*[[:space:]]/etc/
     [ "$(systemctl is-enabled systemd-resolved.service)" = enabled ] || { echo "systemd-resolved is not enabled: /etc/resolv.conf would link to nothing" >&2; exit 1; }
 
 # Kairos's boot assessment, with the health gate as its judge: the bundle's copy of 08_grub.yaml
-# leaves out the step that marks every boot of the active system good (files/usr/share/NAME). The
-# build fails when kairos-init's file is no longer the one that copy is derived from, naming the
-# release it is derived from.
+# (kairos-init's, its sum checked above) leaves out the step that marks every boot of the active
+# system good (files/usr/share/NAME).
 RUN set -e; f=/system/oem/08_grub.yaml; \
-    echo "a8d0b7ba11e554651ffaa7ec1cf132b217679be3bc387675ea1ad4ca40d104e5  $f" | sha256sum -c - || \
-        { echo "shapes.kairos.kairos_init: its $f is not the one this stowage's boot assessment is derived from: use kairos-init v4.6.0" >&2; exit 1; }; \
     mv /usr/share/{{.Name}}/08_grub.yaml "$f"; \
     rmdir /usr/share/{{.Name}}; \
     ! grep -q 'Remove GRUB sentinels' "$f"
 
-# The build fails when a package of the bundle's own boot or a declared one is not installed, or a
-# timer is not masked.
-RUN set -e; for p in{{range .Own}} {{.}}{{end}}; do \
+# The build fails when a package of the bundle's own boot or a declared one is not installed, a
+# timer is not masked, or grub2-editenv (kairos-init's link to GRUB's), which the health gate
+# writes the boot assessment with, is not there.
+RUN set -e; command -v grub2-editenv >/dev/null || { echo "the OS bundle has no grub2-editenv, which the health gate writes the boot assessment with: use kairos-init v4.6.0" >&2; exit 1; }; \
+    for p in{{range .Own}} {{.}}{{end}}; do \
         dpkg-query -W -f='${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^ii' || { echo "the OS bundle lacks $p, a package of its own" >&2; exit 1; }; done; \
 {{- range $n, $_ := .Packages}}
     dpkg-query -W -f='${db:Status-Abbrev}' {{$n}} 2>/dev/null | grep -q '^ii' || { echo "host.packages.{{$n}}: not installed" >&2; exit 1; }; \

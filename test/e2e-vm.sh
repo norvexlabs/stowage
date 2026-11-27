@@ -257,6 +257,16 @@ vm_mirror
 mirror "$WORK/r1.oci.tar" --disks qcow2
 grep -q '^Exported notes 1.0.0' "$WORK/r1.oci.tar.txt" || { cat "$WORK/r1.oci.tar.txt"; fail "export of 1.0.0"; }
 
+# units_from_usr: systemd runs every unit of the bundle from its image's /usr/lib, none from the
+# persistent /etc.
+units_from_usr() {
+	local paths
+	paths=$(on_vm "systemctl show -p Id -p FragmentPath -p DropInPaths notes.service notes-hostd.service notes-health.service notes-tune.service notes-ssh.service notes-backup.timer ssh.service docker.service") || fail "systemctl show on the VM ($1)"
+	[[ $(grep -c '^FragmentPath=/usr/lib/systemd/system/notes' <<<"$paths") == 6 ]] && ! grep -qE '^(FragmentPath|DropInPaths)=.*/etc/systemd/system/(notes|ssh\.service\.d/10-notes|docker\.service\.d/after-nftables)' <<<"$paths" &&
+		grep -q '^DropInPaths=.*/usr/lib/systemd/system/docker.service.d/10-notes-after-nftables.conf' <<<"$paths" ||
+		{ printf '%s\n' "$paths"; fail "systemd does not run the bundle's units from /usr/lib ($1)"; }
+}
+
 step_docker_k8s() {
 	step "this release on Docker and on a kind cluster, beside the VMs: each issues a kit before any VM exists"
 	DOCKER_OPERATOR=("${OPERATOR[@]}")
@@ -407,6 +417,7 @@ step_install() {
 	# (52_notes_reset_settle.yaml), not auroraboot's (/oem/01_reset.yaml, whose reset reads udev's
 	# database while its trigger rewrites it): that step's reset succeeded, its after-reset stage
 	# recording it and removing its log, and auroraboot's removing that file.
+	units_from_usr "on the first boot"
 	reset=$(on_vm sudo cat /oem/.notes-first-reset) || reset=
 	[[ $reset == *"udev's queue drained in "* ]] || fail "the first boot's reset was not the image's, after udev's queue: /oem/.notes-first-reset holds '${reset:-nothing}'"
 	on_vm sudo sh -c "'test ! -e /oem/01_reset.yaml && test ! -e /oem/.notes-first-reset.log'" ||
@@ -458,11 +469,11 @@ step_listen() {
 		[[ $(on_vm sudo $t -S FORWARD | awk 'NR == 1') == '-P FORWARD DROP' ]] || { on_vm sudo $t -S FORWARD; fail "$t's FORWARD policy is not DROP"; }
 	done
 	# /oem holds the boot's state alone: the user-data kept, GRUB's environment, the seed host key's
-	# retirement, the first boot's pin of the one NIC to its MAC and the file system's lost+found; no
-	# other cloud-config lands there beside them.
+	# retirement, the first boot's pin of the one NIC to its MAC, the record of the first boot's
+	# reset and the file system's lost+found; no other cloud-config lands there beside them.
 	on_vm sudo ls -A /oem >"$WORK/oem.txt" || fail "ls /oem on the VM"
-	! grep -vxE '95_userdata|96_notes-uplink-pinned\.yaml|grubenv|lost\+found|notes-seed-host-key\.retired' "$WORK/oem.txt" ||
-		{ on_vm sudo ls -la /oem; fail "/oem holds more than the user-data, the NIC's pin, grubenv and the host key's retirement"; }
+	! grep -vxE '95_userdata|96_notes-uplink-pinned\.yaml|grubenv|lost\+found|notes-seed-host-key\.retired|\.notes-first-reset' "$WORK/oem.txt" ||
+		{ on_vm sudo ls -la /oem; fail "/oem holds more than the user-data, the NIC's pin, grubenv, the host key's retirement and the first reset's record"; }
 }
 
 step_tune() {
@@ -773,6 +784,19 @@ step_upgrade() {
 	on_vm sudo notes-stow backup config --keep-local 2 >"$WORK/keep-config.txt" 2>&1 || { cat "$WORK/keep-config.txt"; fail "backup config --keep-local"; }
 	local relay=relay-$RANDOM$RANDOM
 	printf 'RELAY_TOKEN: %s\n' "$relay" | on_vm "umask 077; cat >/tmp/relay.yaml" || fail "writing the answers file on the VM"
+	# An earlier bundle's files in Kairos's persistent /etc, as it shipped them (its units, the links
+	# enabling them, their drop-ins, the SR-IOV network, the SSH settings): the boot into 1.0.1 parks
+	# each one, and systemd runs the image's units.
+	on_vm sudo sh -c "'set -e; cd /usr/lib/systemd/system
+		for u in notes*.service notes*.timer; do cp \$u /etc/systemd/system/; echo /etc/systemd/system/\$u; done
+		for l in multi-user.target.wants/notes*; do ln -s /etc/systemd/system/\${l#*/} /etc/systemd/system/\$l; echo /etc/systemd/system/\$l; done
+		for d in ssh.service.d ssh.socket.d; do mkdir -p /etc/systemd/system/\$d; cp \$d/10-notes-live.conf /etc/systemd/system/\$d/; echo /etc/systemd/system/\$d/10-notes-live.conf; done
+		mkdir -p /etc/systemd/system/docker.service.d; cp docker.service.d/10-notes-after-nftables.conf /etc/systemd/system/docker.service.d/after-nftables.conf
+		echo /etc/systemd/system/docker.service.d/after-nftables.conf
+		cp /usr/lib/systemd/network/00-notes-sriov.network /etc/systemd/network/; echo /etc/systemd/network/00-notes-sriov.network
+		cp /usr/lib/notes/sshd_config.d/10-notes.conf /etc/ssh/sshd_config.d/; echo /etc/ssh/sshd_config.d/10-notes.conf'" >"$WORK/earlier-bundle.txt" ||
+		fail "planting an earlier bundle's files in /etc"
+	(($(wc -l <"$WORK/earlier-bundle.txt") == 29)) || { cat "$WORK/earlier-bundle.txt"; fail "the earlier bundle's files planted are not its 29"; }
 	boot=$(boot_id)
 	# Under --json: its Result alone on standard output, the release installed as its job ends (1.0.0);
 	# its text, the job's log among it, on standard error. The input 1.0.1 adds is staged root-only
@@ -790,6 +814,11 @@ step_upgrade() {
 	# removes it; the gate marks the boot good.
 	back_on 1.0.1 active "after the upgrade" "$boot"
 	healthy_postgres "after the upgrade"
+	# shellcheck disable=SC2016
+	on_vm sudo sh -c "'for f in $(tr '\n' ' ' <"$WORK/earlier-bundle.txt"); do { test -e \$f || test -L \$f; } && echo \"left: \$f\"; { test -e /etc/systemd/notes-retired\$f || test -L /etc/systemd/notes-retired\$f; } || echo \"not parked: \$f\"; done; true'" >"$WORK/parked.txt" ||
+		fail "reading the earlier bundle's files on the VM"
+	[[ ! -s $WORK/parked.txt ]] || { cat "$WORK/parked.txt"; fail "the boot into 1.0.1 did not park the earlier bundle's files"; }
+	units_from_usr "after the upgrade"
 	# The backup the upgrade took first survives on the host, listed as local, pulled over SSH.
 	pre_upgrade=$(on_vm notes-stow backup list | awk '/local: kept on the host/ {print $1}')
 	[[ $pre_upgrade == notes-full-*-1.0.0-r1.pgdump.age ]] || { on_vm notes-stow backup list; fail "the backup the upgrade took first is not listed as kept on the host"; }

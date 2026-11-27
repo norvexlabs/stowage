@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -355,8 +356,8 @@ type Status struct {
 	Pressure *DiskPressure `json:"disk_pressure,omitempty"`
 	// Cert is a byo install's certificate: its end, and a warning from 30 days before it.
 	Cert *CertStatus `json:"cert,omitempty"`
-	// Boot is the system Kairos booted: active, passive (the fallback) or recovery; empty off
-	// Kairos.
+	// Boot is the system Kairos booted (bootMode): active, passive (the fallback), recovery (also
+	// resetting the disk) or live; empty off Kairos.
 	Boot string `json:"boot,omitempty"`
 	// ResetFailed: on the recovery system, the reset that lays the system out at a first boot (the
 	// network stage's, or kairos-reset.service) failed, so the VM stays there; it holds the
@@ -1288,11 +1289,15 @@ func readBootID(file string) string {
 	return strings.TrimSpace(string(raw))
 }
 
-// bootMode is the system Kairos booted — active, passive or recovery — as it marks it in dir;
-// empty when it marks none (not a Kairos boot).
+// bootMode is the system Kairos booted — active (a kairos.ram boot too, which Kairos marks so),
+// passive, recovery (also when it resets the disk: autoreset) or live (an installer's medium) — as
+// it marks it in dir (immucore's sentinels); empty when it marks none (not a Kairos boot).
 func bootMode(dir string) string {
-	for _, m := range []string{"active", "passive", "recovery"} {
+	for _, m := range []string{"active", "passive", "recovery", "autoreset", "live"} {
 		if fileExists(filepath.Join(dir, m+"_mode")) {
+			if m == "autoreset" {
+				return "recovery"
+			}
 			return m
 		}
 	}
@@ -2547,15 +2552,30 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 
 // osJob ends job j: it writes the OS of release tag from src into the passive slot, mark run
 // first, and reboots into it (unless reboot is false: the next boot runs it), whose boot does
-// what does says. The written mark is set before kairos-agent runs and kept when it fails: it may
-// have moved the running system to the passive slot already.
+// what does says. The written mark is set before kairos-agent runs and kept when it fails having
+// moved a system image (the running system may be the passive one already).
 func (h *Hostd) osJob(j *job, in *Installer, tag, prefix, src string, reboot bool, does string, mark func() error) {
+	slots := h.slots()
+	staged, serr := readStaging(in.O.Dir)
 	err := os.WriteFile(filepath.Join(h.Run, osWritten), []byte(tag+"\n"), 0o600)
 	if err == nil {
-		err = mark()
+		// Marks staged for the boot into it failing, kairos-agent never ran: no slot moved.
+		if err = mark(); err != nil {
+			h.undoOSJob(j, staged, serr, "kairos-agent did not run")
+		}
 	}
 	if err == nil {
-		err = h.writeOS(in, j, prefix, src)
+		var early bool
+		early, err = h.writeOS(in, j, prefix, src)
+		// kairos-agent writes the new system to a transition image, refuses one built by an older
+		// kairos-init, then hands the finalize to the new system (labels, GRUB, hooks) and moves
+		// the systems last (active to passive, the new one to active): one that said it failed
+		// writing the image or refused it, never handing the finalize over, both images as they
+		// were, changed nothing of the slots, and the system running stays the active one. Without
+		// that word from the agent, the mark stays.
+		if err != nil && early && sameSlots(slots, h.slots()) {
+			h.undoOSJob(j, staged, serr, "kairos-agent moved no system")
+		}
 	}
 	if err == nil {
 		err = h.retry(j)
@@ -2571,16 +2591,129 @@ func (h *Hostd) osJob(j *job, in *Installer, tag, prefix, src string, reboot boo
 	h.finish(j, err)
 }
 
+// staging is what a job staged for the boot into the system it writes (osJob's mark): the
+// crossing's mark, the inputs, the first install's mark, each file's content, nil when absent.
+type staging map[string][]byte
+
+// readStaging reads the staging files of the install directory dir as they are.
+func readStaging(dir string) (staging, error) {
+	out := staging{}
+	for _, p := range []string{newBaselineFile(dir), stagedInputsFile(dir), osUpgradeFile(dir)} {
+		raw, err := os.ReadFile(p)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			out[p] = nil
+		case err != nil:
+			return nil, err
+		default:
+			out[p] = raw
+		}
+	}
+	return out, nil
+}
+
+// undoOSJob ends an OS job that moved no system (why): what it staged is put back as it was, so
+// the boot of the system running finds its own marks, and the written mark goes, so the next job
+// needs no reboot. Staging that cannot be put back keeps the mark, logged.
+func (h *Hostd) undoOSJob(j *job, was staging, readErr error, why string) {
+	if readErr != nil {
+		h.logf(j, "%s, but what the job staged for the boot could not be read before it: reboot before the next upgrade or rollback (%v)", why, readErr)
+		return
+	}
+	for _, p := range slices.Sorted(maps.Keys(was)) {
+		var err error
+		if raw := was[p]; raw == nil {
+			if err = os.Remove(p); errors.Is(err, os.ErrNotExist) {
+				err = nil
+			}
+		} else {
+			err = writeAtomic(p, bytes.NewReader(raw), 0o600, nil)
+		}
+		if err != nil {
+			h.logf(j, "%s, but putting %s back failed: reboot before the next upgrade or rollback (%v)", why, p, err)
+			return
+		}
+	}
+	if err := os.Remove(filepath.Join(h.Run, osWritten)); err != nil {
+		h.logf(j, "%s, but removing its mark failed: reboot before the next upgrade or rollback (%v)", why, err)
+		return
+	}
+	h.logf(j, "%s: this system stays the active one, and the next upgrade or rollback needs no reboot", why)
+}
+
+// slots are the state partition's system images (cOS/active.img, cOS/passive.img); nil when
+// either cannot be read.
+func (h *Hostd) slots() []os.FileInfo {
+	dir := h.assessment().dir
+	var out []os.FileInfo
+	for _, img := range []string{"cOS/active.img", passiveImage} {
+		fi, err := os.Stat(filepath.Join(dir, img))
+		if err != nil {
+			return nil
+		}
+		out = append(out, fi)
+	}
+	return out
+}
+
+// sameSlots reports whether the system images are the files they were (a rename moves another
+// file in), of the same size and modification time.
+func sameSlots(was, now []os.FileInfo) bool {
+	if len(was) == 0 || len(now) != len(was) {
+		return false
+	}
+	for i := range was {
+		if !os.SameFile(was[i], now[i]) || was[i].Size() != now[i].Size() || !was[i].ModTime().Equal(now[i].ModTime()) {
+			return false
+		}
+	}
+	return true
+}
+
 // writeOS runs kairos-agent upgrade from src, with a private Docker config holding the pull
-// account (none when the registry is public).
-func (h *Hostd) writeOS(in *Installer, j *job, prefix, src string) error {
+// account (none when the registry is public); early: the agent said it failed writing the new
+// system's image or refused it (agentDeployFailed, agentRefused), and never that it handed the
+// upgrade's finalize to it (agentFinalizes).
+func (h *Hostd) writeOS(in *Installer, j *job, prefix, src string) (early bool, err error) {
 	ctx, cancel := context.WithTimeout(h.ctx, 30*time.Minute)
 	defer cancel()
 	h.logf(j, "writing %s to the passive slot", src)
 	jw := &jobWriter{h: h, j: j}
-	err := writeOSBundle(ctx, in, h.Host, h.Run, prefix, src, jw)
+	fin := &lineSeen{w: jw, line: agentFinalizes}
+	refused := &lineSeen{w: fin, line: agentRefused}
+	deploy := &lineSeen{w: refused, line: agentDeployFailed}
+	err = writeOSBundle(ctx, in, h.Host, h.Run, prefix, src, deploy)
 	jw.flush()
-	return err
+	return (deploy.seen || refused.seen) && !fin.seen, err
+}
+
+// What kairos-agent upgrade says (Kairos 4.6.0's UpgradeAction.Run, runFinalizeStep and
+// RefuseIfTargetIsDowngrade; internal/kairos/testdata): it failed writing the new system's image,
+// it refused that system (built by an older kairos-init), it hands the finalize to that system.
+const (
+	agentDeployFailed = "Failed deploying image to file"
+	agentRefused      = "refusing to upgrade: target KAIROS_INIT_VERSION"
+	agentFinalizes    = "Handing off upgrade finalize to target kairos-agent"
+)
+
+// lineSeen passes what is written to w, and records whether line was in it (across writes).
+type lineSeen struct {
+	w    io.Writer
+	line string
+	tail []byte
+	seen bool
+}
+
+func (l *lineSeen) Write(p []byte) (int, error) {
+	if !l.seen {
+		buf := append(l.tail, p...)
+		l.seen = bytes.Contains(buf, []byte(l.line))
+		if keep := len(l.line) - 1; len(buf) > keep {
+			buf = buf[len(buf)-keep:]
+		}
+		l.tail = append(l.tail[:0], buf...)
+	}
+	return l.w.Write(p)
 }
 
 // writeOSBundle runs kairos-agent upgrade from src (<prefix>/<name>-os@<digest>) through host,

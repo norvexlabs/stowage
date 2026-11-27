@@ -1378,6 +1378,24 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
 
 ## 12. Decisions
 
+- **Nothing of the OS bundle in Kairos's persistent state; every reliance on Kairos pinned** —
+  Kairos keeps `/etc/systemd` and `/etc/ssh` (its `PERSISTENT_STATE_PATHS`) on the persistent
+  partition and fills them from the booted image at every boot with `rsync -u` and no `--delete`:
+  a file an image ships there is never removed nor replaced by an older one, so it outlives its
+  release, a rollback included, and `/etc` overrides `/usr/lib`. The bundle's units, drop-ins,
+  enabling links and SSH settings live in `/usr/lib`, which leaves with the image; what earlier
+  bundles left in `/etc` is parked, not deleted (`/etc/systemd/<name>-retired`), as Kairos parks
+  its own stale units, by exact name and before systemd reads its units (the `initramfs` stage):
+  a rollback to such a bundle gets its copies back from its own image. What stays in `/etc` is the
+  same in every release (the SSH `Include`, an alias and masks of packages' units, whose names a
+  `/usr/lib` file would replace). Kairos's website lags its releases, so what Stowage relies on
+  is read in the pinned releases' source and pinned twice: the kairos-init files the build edits
+  or reads by their sha256 at build time (testdata holds the copies, a test ties the two), and
+  the agent's, immucore's, yip's and auroraboot's behaviour as verbatim excerpts a test asserts,
+  refusing another release until it is read again. An upgrade's job frees the system it runs
+  from the "written, not booted" mark only when `kairos-agent` failed before it handed the
+  finalize to the new system (its own log line, pinned) with both system images as they were:
+  from the handoff on, the new system may have relabelled images or written GRUB's entries.
 - **The publisher says how the chart serves a guarded route** — on Kubernetes the chart's ingress
   serves the front's routes and Stowage enforces none of their guards, so while the chart may
   route lint warns of each guarded route until the publisher answers it: not served

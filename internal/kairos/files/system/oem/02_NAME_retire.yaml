@@ -1,0 +1,53 @@
+name: "{{.Name}}: no file of an earlier bundle is left in Kairos's persistent /etc"
+stages:
+  # /etc/systemd and /etc/ssh are Kairos's persistent state: every boot fills them from its image,
+  # never deleting a file nor overwriting a newer one. The bundle's units, drop-ins and SSH
+  # settings live in its image's /usr/lib, which leaves with the image; earlier bundles put them in
+  # /etc, where a copy would outlive its release and, /etc ahead of /usr/lib, shadow this one's.
+  # This step parks each copy (moves it, as Kairos parks its own stale units) into
+  # /etc/systemd/{{.Name}}-retired, under its own path (numbered beside one parked before), before systemd reads its units: the
+  # initramfs stage runs once the persistent paths are mounted, before the switch to the system.
+  # Exactly the files those bundles shipped are parked: the units by name, the links enabling them,
+  # the ssh unit's drop-ins, the SR-IOV network, the SSH settings and Docker's drop-in when it is
+  # theirs. A rollback to an earlier bundle gets its own back from its image on that boot.
+  initramfs:
+    - name: "Park the files earlier bundles left in the persistent /etc"
+      only_service_manager: "systemd"
+      commands:
+        - |
+          cd / || exit 1
+          park=etc/systemd/{{.Name}}-retired
+          parked= failed=
+          # A copy parked before is never replaced: one the same as a copy parked (the first or
+          # a numbered one) goes, another is parked beside them, numbered.
+          same() {
+            if [ -L "$1" ]; then [ -L "$2" ] && [ "$(readlink "$1")" = "$(readlink "$2")" ]
+            else [ ! -L "$2" ] && [ -f "$2" ] && cmp -s "$1" "$2"; fi
+          }
+          retire() {
+            d=$park/$1
+            if ! mkdir -p "${d%/*}"; then failed="$failed /$1"; return; fi
+            t=$d n=0
+            while [ -e "$t" ] || [ -L "$t" ]; do
+              if same "$1" "$t"; then
+                if rm -f "$1"; then parked="$parked /$1"; else failed="$failed /$1"; fi
+                return
+              fi
+              n=$((n + 1)) t=$d.$n
+            done
+            if mv -T "$1" "$t"; then parked="$parked /$1"; else failed="$failed /$1"; fi
+          }
+          for u in{{range .Units}} {{.}}{{end}}; do
+            l=etc/systemd/system/multi-user.target.wants/$u
+            if [ -L "$l" ] && [ "$(readlink "$l")" = "/etc/systemd/system/$u" ]; then retire "$l"; fi
+            f=etc/systemd/system/$u
+            if [ -f "$f" ] && [ ! -L "$f" ]; then retire "$f"; fi
+          done
+          for f in etc/systemd/system/ssh.service.d/10-{{.Name}}-live.conf etc/systemd/system/ssh.socket.d/10-{{.Name}}-live.conf \
+            etc/systemd/network/00-{{.Name}}-sriov.network etc/ssh/sshd_config.d/10-{{.Name}}.conf; do
+            if [ -f "$f" ] && [ ! -L "$f" ]; then retire "$f"; fi
+          done
+          f=etc/systemd/system/docker.service.d/after-nftables.conf
+          if [ -f "$f" ] && [ ! -L "$f" ] && printf '[Unit]\nAfter=nftables.service\nWants=nftables.service\n' | cmp -s - "$f"; then retire "$f"; fi
+          if [ -n "$parked" ]; then echo "parked in /$park:$parked"; fi
+          if [ -n "$failed" ]; then echo "could not park in /$park:$failed" >&2; exit 1; fi

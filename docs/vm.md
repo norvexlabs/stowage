@@ -20,7 +20,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
           [--json]   # the run's result as one object, for a program (see "Exit status and --json on the VM")
 <short>-stow --version               # (-v) the release this OS carries and the Stowage that built it, as the Docker installer's
 <short>-stow describe [--json]        # what the release this OS carries offers, read with no install: the Docker installer's describe
-<short>-stow status [--json [--values]]   # --values: the recorded values (machine-interface.md), the operator's alone; this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `awaiting its data: made again by --secrets: …` while an install given `--secrets` awaits its data, with the way on (`backup config` with the old install's destination, then `restore OBJECT --unrecorded`; on a release without backups, the data loaded by hand, then `provision`), `"restore_awaited": true`; with it, in the `acme` or `dns-cloudflare` mode, `the front waits for the restore, which brings its certificates back …`, `"front_waits": true`; `"made_again": true` for an install made by `--secrets`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot (until a later boot is judged healthy), the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more, but on a link whose static `address6` has no `gateway6`), the services
+<short>-stow status [--json [--values]]   # --values: the recorded values (machine-interface.md), the operator's alone; this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `awaiting its data: made again by --secrets: …` while an install given `--secrets` awaits its data, with the way on (`backup config` with the old install's destination, then `restore OBJECT --unrecorded`; on a release without backups, the data loaded by hand, then `provision`), `"restore_awaited": true`; with it, in the `acme` or `dns-cloudflare` mode, `the front waits for the restore, which brings its certificates back …`, `"front_waits": true`; `"made_again": true` for an install made by `--secrets`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive — the fallback —, recovery, also while it resets the disk, or live), the last failed boot (until a later boot is judged healthy), the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more, but on a link whose static `address6` has no `gateway6`), the services
 <short>-stow health [--json]          # ready, or fails saying why: the health gate's check, once
 <short>-stow events [--after N] [--follow|-f] [--json]   # the event journal: jobs, reboots, boots and the health gate's verdicts, the first install; --follow waits for more until interrupted, through daemon restarts
 <short>-stow ps [--json]              # the stack's services, state and health, then `down: <service> <why>` for each service down (as on Docker's `status`; the VM's `status` ends with the same); `--json`: each with `exit_code`, and when set (each absent when false, 0 or empty) `id`, `oom_killed`, `mem_limit_bytes` and `restarts` (these three from docker inspect)
@@ -358,7 +358,17 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   before `kairos-agent` runs, and keeps it when the job fails (`kairos-agent` may have moved the
   running system to the passive slot already): until a reboot, another `upgrade` and `rollback`
   are refused (another upgrade would replace the running system's copy in the passive slot), and
-  so are they when the mark cannot be read. When the boot assessment still marks an attempt (after a fallback or a
+  so are they when the mark cannot be read. A job whose `kairos-agent` said it failed writing the
+  new system's image (`Failed deploying image to file`: a pull that failed) or refused that system
+  (`refusing to upgrade: target KAIROS_INIT_VERSION`: built by an older kairos-init), never that it
+  handed the upgrade's finalize to it (`Handing off upgrade finalize to target kairos-agent`), with
+  both system images (`cOS/active.img`, `cOS/passive.img` on COS_STATE) as they were, removes the
+  mark, as does a job that fails staging the marks for the boot into it (`kairos-agent` never
+  run): what it staged is put back as it was (the running release's own pending crossing, its
+  inputs), it logs `kairos-agent moved no system` (or `kairos-agent did not run`) `: this system
+  stays the active one, and the next upgrade or rollback needs no reboot`, and the next job needs
+  no reboot; when what it staged cannot be read first or put back, or the mark cannot be removed,
+  the mark stays, logged with the error and `reboot before the next upgrade or rollback`. When the boot assessment still marks an attempt (after a fallback or a
   `rollback`), the job clears the mark once the new system is written (`boot_assessment_tentative`
   emptied), so the next boot tries it on trial; a failure to clear it fails the job, without a
   reboot. It is refused for a
@@ -1549,7 +1559,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
     scheduled in this same boot — both ids read and equal; a `reboot.scheduled` without one is
     left open).
   - `boot.started` — `boot_id`, `release` (`{"version", "revision"}`: the release of the
-    writer, the OS's), `slot` (`active`, `passive` or `recovery`; absent off Kairos),
+    writer, the OS's), `slot` (as `status`'s `boot`: `active`, `passive`, `recovery`, also while it resets the disk, or `live`; absent off Kairos),
     `fallback`; once per boot id, before any other entry of that boot: whichever writer appends
     first in a boot (the daemon as it starts, the health gate's verdict, the first install's
     end) writes it before its own entries — a starting daemon's `job.lost` and
@@ -1689,7 +1699,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `previous` and `inputs` as `status --json` gives them, above; with `?values=true`, `values` as
   `status --json --values` gives them (the operator's socket alone: the app socket answers any
   `values` query 403);
-  `boot`;
+  `boot`: the system Kairos booted, as immucore marks it in `/run/cos` — `active` (a `kairos.ram`
+  boot too, which Kairos marks so), `passive` (the fallback), `recovery` (also while it resets the
+  disk: `autoreset_mode`) or `live` (an installer's medium) —, absent off Kairos;
   `reset_failed`: on the recovery system, the reset that lays the system out failed in this boot,
   so the VM stays there — a disk's first boot's, once `cos-setup-network.service` (Kairos's
   `network` stage, which runs it) has ended with the reset still due (`/oem/01_reset.yaml`

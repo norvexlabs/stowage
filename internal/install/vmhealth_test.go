@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -953,5 +954,72 @@ func TestARuntimeCommandWithoutEnvIsRefused(t *testing.T) {
 	}
 	if ran != 0 {
 		t.Errorf("the command ran %d times", ran)
+	}
+}
+
+// Kairos's state directory without its file is read as no marks only when it is a mount: else the
+// gate would take every boot as off trial.
+func TestTheAssessmentRefusesAStateThatIsNoMount(t *testing.T) {
+	t.Parallel()
+	if !mountPoint("/proc") || mountPoint(t.TempDir()) || mountPoint(filepath.Join(t.TempDir(), "absent")) {
+		t.Fatal("mountPoint tells /proc and a directory of a test apart wrongly")
+	}
+	dir := t.TempDir()
+	if _, err := (assessment{dir: dir, mounted: true}).read(); err == nil || !strings.Contains(err.Error(), dir+" is not a mounted partition: Kairos mounts COS_STATE") {
+		t.Errorf("no file, no mount: %v", err)
+	}
+	if v, err := (assessment{dir: dir}).read(); err != nil || len(v) != 0 {
+		t.Errorf("a directory given: %v %v", v, err)
+	}
+	if v, err := (assessment{dir: "/proc", mounted: true}).read(); err != nil || len(v) != 0 {
+		t.Errorf("no file, on a mount: %v %v", v, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, assessFile), []byte(assessEnable+"=yes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := (assessment{dir: dir, mounted: true}).read(); err != nil || v[assessEnable] != "yes" {
+		t.Errorf("a file: %v %v", v, err)
+	}
+	if a := assessmentIn("", nil); !a.mounted || a.dir != cosState {
+		t.Errorf("Kairos's assessment: %+v", a)
+	}
+	if a := assessmentIn(dir, nil); a.mounted {
+		t.Errorf("a given directory must be a mount: %+v", a)
+	}
+}
+
+// What the host daemon and the seed rely on in Kairos's source (internal/kairos/testdata): COS_STATE
+// mounted at cosState, the sentinels bootMode reads (a kairos.ram boot marked active), the
+// installer's cloud-configs' names (afterInstallMove), and an upgrade that says it failed writing
+// the image or refused an older kairos-init's system (agentDeployFailed, agentRefused) before it
+// hands the finalize to it (agentFinalizes) and moves the systems last (osJob).
+func TestTheDaemonMatchesKairossContracts(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile("../kairos/testdata/kairos-" + kairos.KairosInitRelease + "-contracts.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := string(raw)
+	for _, want := range []string{
+		`s.path("` + cosState + `"),`,
+		`SentinelDir = "/run/cos"`, "above is already active_mode (kairos-sdk forces BootState=Active\n\t\t\t// when kairos.ram is present)",
+		`u.Error("` + agentDeployFailed + ` '%s': %s", upgradeImg.File, err)`, `"` + agentRefused + ` %q is older than current %q "+`,
+		"Files are named 9<index>_custom.yaml with the index zero-padded to the width\n// of the highest one, so they sort in list order",
+		`u.Info("` + agentFinalizes + ` (%s)", constants.TargetKairosAgentPath)`,
+		"\tif err := RefuseIfTargetIsDowngrade(current, target); err != nil {\n\t\treturn err\n\t}\n\treturn u.handoffFinalizeToTarget(upgradeImg)",
+		"\tif err = u.runFinalizeStep(&upgradeImg); err != nil {\n\t\treturn err\n\t}\n\tif !u.spec.RecoveryUpgrade() && bootedFrom != state.Passive {",
+		`source := filepath.Join(u.spec.Partitions.State.MountPoint, "cOS", constants.ActiveImgFile)`,
+	} {
+		if !strings.Contains(k, want) {
+			t.Errorf("Kairos %s no longer holds %q: check the daemon against it", kairos.KairosInitRelease, want)
+		}
+	}
+	for _, m := range []string{"active", "passive", "recovery", "autoreset", "live"} {
+		if !strings.Contains(k, `sentinel = "`+m+`_mode"`) {
+			t.Errorf("Kairos %s marks no %s system", kairos.KairosInitRelease, m)
+		}
+	}
+	if n := strings.Count(k, `sentinel = "`); n != 5 {
+		t.Errorf("Kairos %s marks %d systems, bootMode reads 5", kairos.KairosInitRelease, n)
 	}
 }

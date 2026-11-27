@@ -293,8 +293,10 @@ over SSH from your machine takes its host key with `--known-hosts-line`.
   the rest of the disk, which must hold the OS and the app's space, the steps' size) and powers
   the server off; the operator takes both sticks out and powers it on, and its first boot installs
   the release, as a VM's. The installer keeps the cloud-config it ran with on the installed system,
-  which an `after-install-chroot` stage moves to `/oem/95_userdata/userdata.yaml` (a second
-  source's `9N_custom.yaml` beside it; the stage fails without one), as a VM's first boot keeps it: no
+  which an `after-install-chroot` stage moves to `/oem/95_userdata/userdata.yaml` (the
+  installer names its sources' copies `9<index>_custom.yaml`, zero-padded to the widest index:
+  the first becomes `userdata.yaml`, the others keep their names beside it; the stage fails
+  without one), as a VM's first boot keeps it: no
   boot pulls the seed again, its stick left in or not, nor runs its stages twice. The machine's
   network is the seed's (its NICs as below).
 - **The NICs** (`host.interfaces`): a release that names none has one NIC, whatever its name

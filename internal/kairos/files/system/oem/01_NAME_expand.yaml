@@ -10,6 +10,8 @@ stages:
         total=$(cat "/sys/block/$disk/size")
         start=$(cat "/sys/block/$disk/$pn/start")
         size=$(cat "/sys/block/$disk/$pn/size")
+        # yip grows the disk's last partition: none starts after this one.
+        for p in /sys/block/"$disk"/*/start; do [ "$(cat "$p")" -le "$start" ]; done
         [ $(( total - start - size )) -gt 32768 ]
       layout:
         device:

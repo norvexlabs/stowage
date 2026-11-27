@@ -134,7 +134,7 @@ func TestTheDaemonsStopCoversABackupsCleanup(t *testing.T) {
 	if worst := runnerCutWait(runnerGrace) + 2*(rcloneTimeout+runnerCutWait(0)) + rollbackStopWait; backupStopWait < worst {
 		t.Errorf("backupStopWait %s, a cleanup takes up to %s", backupStopWait, worst)
 	}
-	unit, err := os.ReadFile("../kairos/files/etc/systemd/system/NAME-hostd.service")
+	unit, err := os.ReadFile("../kairos/files/usr/lib/systemd/system/NAME-hostd.service")
 	if err != nil {
 		t.Fatal(err)
 	}
